@@ -30,7 +30,11 @@
 - **多版本支持**：PostgreSQL 12.x ~ 18.x
 - **多架构支持**：x86_64、ARM64
 - **双安装模式**：在线安装、离线安装
-- **插件系统**：openssl、perl、python、tcl、uuid、xml、icu、ldap、pam、systemd
+- **镜像源选择**：官网镜像、腾讯云镜像（国内加速）
+- **下载重试机制**：自动重试、文件完整性验证
+- **插件依赖检查**：自动检查并安装插件依赖
+- **插件系统**：openssl、perl、python、tcl、uuid、xml、icu、ldap、pam、systemd、bonjour
+- **临时文件清理**：安装完成后自动清理临时文件
 - **WAL归档**：完整归档配置、自动清理、定时清理、智能清理
 
 ---
@@ -80,9 +84,13 @@ sudo ./uninstall_postgresql.sh -y
 │              PostgreSQL 安装向导                             │
 ├─────────────────────────────────────────────────────────────┤
 │  ✅ 在线下载安装 - 从 PostgreSQL FTP 下载源码               │
+│  ✅ 镜像源选择 - 官网镜像/腾讯云镜像（国内加速）             │
+│  ✅ 下载重试机制 - 自动重试、文件完整性验证                  │
 │  ✅ 离线安装 - 使用本地 tar.gz 包                            │
+│  ✅ 插件依赖检查 - 自动检查并安装插件依赖                    │
 │  ✅ 插件选择 - 10+ 可选插件                                  │
 │  ✅ 自动配置 - systemd 服务、环境变量                        │
+│  ✅ 临时文件清理 - 安装完成后自动清理                        │
 │  ✅ 远程访问 - Navicat 连接配置                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -100,13 +108,35 @@ sudo ./install_postgresql.sh
 # 2. 直接初始化数据库（已编译）
 # 3. 安装 contrib 扩展
 # 4. 离线安装
+# m. 选择下载镜像源（当前: 官网镜像）
 ```
 
 **安装流程**：
 
 ```
-选择版本 → 下载源码 → 安装依赖 → 编译安装 → 初始化数据库 → 启动服务
+选择镜像源 → 选择版本 → 下载源码 → 安装依赖 → 编译安装 → 初始化数据库 → 启动服务
 ```
+
+##### 1️⃣1️⃣ 镜像源选择
+
+```bash
+# 在主菜单选择 m 进入镜像源选择
+sudo ./install_postgresql.sh
+# 选择: m
+
+# 可选镜像源：
+# 1. 官网镜像 (https://ftp.postgresql.org)
+# 2. 腾讯云镜像 (https://mirrors.cloud.tencent.com) - 国内推荐
+```
+
+**镜像源说明**：
+
+| 镜像源 | 地址 | 推荐场景 |
+|-------|------|---------|
+| 官网镜像 | https://ftp.postgresql.org | 国外服务器 |
+| 腾讯云镜像 | https://mirrors.cloud.tencent.com | 国内服务器（推荐） |
+
+> 💡 **提示**：首次安装时会提示选择镜像源，也可在配置确认阶段更换镜像源。
 
 ##### 2️⃣ 离线安装模式
 
@@ -130,12 +160,15 @@ sudo ./install_postgresql.sh
 | perl | Perl 存储过程 | perl-devel |
 | python | Python 存储过程 | python3-devel |
 | tcl | Tcl 存储过程 | tcl-devel |
-| uuid | UUID 生成 | libossp-uuid-devel |
+| uuid | UUID 生成 | uuid-devel / libossp-uuid-devel |
 | xml | XML 数据类型 | libxml2-devel |
 | icu | 国际化支持 | libicu-devel |
 | ldap | LDAP 认证 | openldap-devel |
 | pam | PAM 认证 | pam-devel |
 | systemd | systemd 集成 | systemd-devel |
+| bonjour | Bonjour 服务发现 | avahi-devel |
+
+> ⚠️ **UUID插件说明**：脚本会自动检测系统中可用的UUID库（e2fsprogs或OSSP），优先使用e2fsprogs。如两者都未安装，会尝试自动安装。
 
 #### 默认配置
 
@@ -426,22 +459,36 @@ su - postgres -c "crontab -l"
 
 **解决方案**：
 
-1. **使用代理**：
+1. **切换镜像源**（推荐国内用户）：
+   ```bash
+   sudo ./install_postgresql.sh
+   # 在主菜单选择: m
+   # 选择: 2. 腾讯云镜像
+   ```
+
+2. **使用代理**：
    ```bash
    export http_proxy=http://proxy_host:port
    export https_proxy=http://proxy_host:port
    sudo ./install_postgresql.sh
    ```
 
-2. **使用离线安装**：
+3. **使用离线安装**：
    ```bash
    # 提前下载源码包
    wget https://ftp.postgresql.org/pub/source/v18.1/postgresql-18.1.tar.gz
-   
+
    # 上传后运行离线安装
    sudo ./install_postgresql.sh
    # 选择: 4. 离线安装
    ```
+
+4. **下载失败后处理**：
+   下载失败时，脚本会提供以下选项：
+   - 重新尝试下载
+   - 切换镜像源后重试
+   - 返回主菜单
+   - 退出安装
 
 ---
 
@@ -632,4 +679,56 @@ psql -U postgres -c "SELECT version();"
 1. 系统日志：`journalctl -u postgresql18 -n 100`
 2. PostgreSQL 日志：`/mnt/data/postgresql/data/log/`
 3. 清理日志：`/mnt/data/postgresql/cleanup_wal.log`
+
+---
+
+## 📌 版本更新信息
+
+### v2.1.0 (最新)
+
+#### 新增功能
+
+- **镜像源选择**
+  - 新增下载镜像源选择功能
+  - 支持官网镜像和腾讯云镜像
+  - 配置确认界面显示当前镜像源
+  - 支持在配置过程中切换镜像源
+
+- **下载功能增强**
+  - 下载失败自动重试机制（最多3次）
+  - 下载超时时间延长至600秒
+  - 新增文件完整性验证功能
+  - 新增文件大小检查（最小20MB）
+  - 下载失败后提供多种处理选项
+
+- **插件依赖管理**
+  - 新增插件依赖自动检查功能
+  - 新增单个包自动安装函数
+  - 新增UUID库智能安装（支持e2fsprogs和OSSP）
+  - 优先使用系统已有UUID库，自动安装缺失依赖
+
+- **临时文件清理**
+  - 新增临时文件自动清理功能
+  - 清理源码包、解压目录、配置日志等
+  - 安装完成后自动执行
+
+#### 功能优化
+
+- 修正编译核心数选择逻辑
+- 优化UUID库依赖安装提示
+- 新增bonjour插件支持
+- 优化解压错误处理
+- 添加更详细的下载错误提示
+
+#### 依赖更新
+
+- UUID插件依赖更新为：`uuid-devel` / `libossp-uuid-devel`
+
+### v2.0.0
+
+- 初始版本发布
+- 支持PostgreSQL 12.x ~ 18.x
+- 在线/离线安装模式
+- WAL归档管理
+- 完全卸载功能
 

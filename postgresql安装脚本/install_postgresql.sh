@@ -39,27 +39,33 @@ PROXY_PASS=""
 OFFLINE_MODE=""
 OFFLINE_TARBALL_PATH=""
 
+# 镜像地址配置
+PG_MIRROR=""
+MIRROR_NAME=""
+
 # 用户输入确认函数
 confirm_configuration() {
     while true; do
         echo -e "${YELLOW}请确认PostgreSQL安装配置:${NC}"
         echo -e "PostgreSQL版本: ${GREEN}$PG_VERSION${NC}"
+        echo -e "下载镜像: ${GREEN}${MIRROR_NAME:-官网镜像}${NC}"
         echo -e "用户名: ${GREEN}$DEFAULT_PG_USER${NC}"
         echo -e "用户组: ${GREEN}$DEFAULT_PG_GROUP${NC}"
         echo -e "安装目录: ${GREEN}$DEFAULT_PG_HOME${NC}"
         echo -e "端口号: ${GREEN}$DEFAULT_PG_PORT${NC}"
         echo -e "密码: ${GREEN}$DEFAULT_PG_PASSWORD${NC}"
         echo ""
-        
+
         echo "1. 使用默认配置"
         echo "2. 自定义配置"
         echo "3. 重新选择版本"
+        echo "4. 更换下载镜像源"
         echo "b. 返回上级菜单"
         echo "q. 退出安装"
         echo ""
         
-        read -p "请选择 [1/2/3/b/q]: " config_choice
-        
+        read -p "请选择 [1/2/3/4/b/q]: " config_choice
+
         case $config_choice in
             "b"|"B")
                 echo -e "${YELLOW}返回上级菜单...${NC}"
@@ -80,16 +86,16 @@ confirm_configuration() {
             "2")
                 read -p "请输入用户名 [$DEFAULT_PG_USER]: " input_user
                 PG_USER=${input_user:-$DEFAULT_PG_USER}
-                
+
                 read -p "请输入用户组 [$DEFAULT_PG_GROUP]: " input_group
                 PG_GROUP=${input_group:-$DEFAULT_PG_GROUP}
-                
+
                 read -p "请输入安装目录 [$DEFAULT_PG_HOME]: " input_home
                 PG_HOME=${input_home:-$DEFAULT_PG_HOME}
-                
+
                 read -p "请输入端口号 [$DEFAULT_PG_PORT]: " input_port
                 PG_PORT=${input_port:-$DEFAULT_PG_PORT}
-                
+
                 read -s -p "请输入密码 [默认: postgres]: " input_password
                 echo ""
                 if [ -z "$input_password" ]; then
@@ -102,6 +108,11 @@ confirm_configuration() {
             "3")
                 echo -e "${YELLOW}重新选择版本...${NC}"
                 select_version
+                continue
+                ;;
+            "4")
+                echo -e "${YELLOW}更换下载镜像源...${NC}"
+                select_mirror
                 continue
                 ;;
             *)
@@ -117,6 +128,7 @@ confirm_configuration() {
     echo ""
     echo -e "${GREEN}最终配置:${NC}"
     echo -e "PostgreSQL版本: $PG_VERSION"
+    echo -e "下载镜像: ${MIRROR_NAME:-官网镜像}"
     echo -e "用户名: $PG_USER"
     echo -e "用户组: $PG_GROUP"
     echo -e "安装目录: $PG_INSTALL_DIR"
@@ -124,17 +136,18 @@ confirm_configuration() {
     echo -e "端口号: $PG_PORT"
     echo -e "密码: $PG_PASSWORD"
     echo ""
-    
+
     while true; do
         echo "1. 确认开始安装"
         echo "2. 重新配置"
         echo "3. 重新选择版本"
+        echo "4. 更换下载镜像源"
         echo "b. 返回上级菜单"
         echo "q. 退出安装"
         echo ""
         
-        read -p "请选择 [1/2/3/b/q]: " final_choice
-        
+        read -p "请选择 [1/2/3/4/b/q]: " final_choice
+
         case $final_choice in
             "b"|"B")
                 echo -e "${YELLOW}返回上级菜单...${NC}"
@@ -157,6 +170,12 @@ confirm_configuration() {
             "3")
                 echo -e "${YELLOW}重新选择版本...${NC}"
                 select_version
+                confirm_configuration
+                return
+                ;;
+            "4")
+                echo -e "${YELLOW}更换下载镜像源...${NC}"
+                select_mirror
                 confirm_configuration
                 return
                 ;;
@@ -479,6 +498,46 @@ setup_proxy() {
 cleanup_proxy() {
     unset http_proxy
     unset https_proxy
+}
+
+# 镜像源选择函数
+select_mirror() {
+    echo -e "${YELLOW}请选择PostgreSQL下载镜像源:${NC}"
+    echo "1. 官网镜像 (https://ftp.postgresql.org)"
+    echo "2. 腾讯云镜像 (https://mirrors.cloud.tencent.com)"
+    echo "b. 返回上级菜单"
+    echo "q. 退出安装"
+    echo ""
+
+    read -p "请选择 [1/2/b/q]: " mirror_choice
+
+    case $mirror_choice in
+        "b"|"B")
+            echo -e "${YELLOW}返回上级菜单...${NC}"
+            return 1
+            ;;
+        "q"|"Q")
+            echo -e "${RED}安装已取消${NC}"
+            exit 0
+            ;;
+        "1")
+            PG_MIRROR="https://ftp.postgresql.org/pub/source"
+            MIRROR_NAME="官网镜像"
+            echo -e "${GREEN}已选择官网镜像源${NC}"
+            return 0
+            ;;
+        "2")
+            PG_MIRROR="https://mirrors.cloud.tencent.com/postgresql/source"
+            MIRROR_NAME="腾讯云镜像"
+            echo -e "${GREEN}已选择腾讯云镜像源${NC}"
+            return 0
+            ;;
+        *)
+            echo -e "${RED}无效选择，请重新输入${NC}"
+            select_mirror
+            return $?
+            ;;
+    esac
 }
 
 # 版本选择函数
@@ -890,15 +949,18 @@ select_plugins() {
     echo -e "${CYAN}系统信息:${NC}"
     echo "  可用CPU核心数: $cpu_cores"
     read -p "请输入要使用的核心数 (1-$cpu_cores) [默认: $cpu_cores]: " manual_cores
-    
+
     # 验证输入
-    if [ -n "$manual_cores" ]; then
+    if [ -z "$manual_cores" ]; then
+        # 用户直接按回车，使用默认值
         parallel_jobs=$cpu_cores
         echo -e "${YELLOW}使用默认核心数: $parallel_jobs${NC}"
     elif [[ "$manual_cores" =~ ^[0-9]+$ ]] && [ "$manual_cores" -ge 1 ] && [ "$manual_cores" -le $cpu_cores ]; then
+        # 用户输入了有效的数字
         parallel_jobs=$manual_cores
         echo -e "${GREEN}使用指定核心数: $parallel_jobs${NC}"
     else
+        # 用户输入了无效值
         echo -e "${RED}无效输入，使用默认核心数: $parallel_jobs${NC}"
         parallel_jobs=$cpu_cores
     fi
@@ -977,6 +1039,8 @@ select_plugins() {
         echo -e "${RED}编译配置已取消${NC}"
         exit 0
     fi
+
+    return 0
 }
 
 # 显示自定义选项示例
@@ -1044,7 +1108,7 @@ install_plugin_dependencies() {
                         if [ "$UUID_LIBRARY" = "ossp" ]; then
                             echo "    - yum install libossp-uuid-devel (可能需要EPEL源)"
                         else
-                            echo "    - yum install util-linux-devel libuuid-devel"
+                            echo "    - yum install util-linux-devel libuuid-devel uuid-devel"
                         fi
                         ;;
                     "xml")
@@ -1147,6 +1211,7 @@ install_plugin_dependencies() {
                         if ! rpm -q libossp-uuid-devel &>/dev/null; then
                             yum install -y epel-release
                             yum install -y libossp-uuid-devel
+							yum install -y uuid-devel
                         fi
                     else
                         # e2fs UUID库依赖
@@ -1850,47 +1915,135 @@ extract_offline_tarbll() {
 # 下载和解压PostgreSQL
 download_and_extract() {
     echo -e "${YELLOW}下载PostgreSQL ${PG_VERSION}...${NC}"
-    
+
     cd /tmp
-    
-    # 检查是否已有源码包
-    if [ -f "postgresql-${PG_VERSION}.tar.gz" ]; then
-        echo -e "${YELLOW}发现已有源码包，跳过下载${NC}"
-    else
-        # 下载地址
-        DOWNLOAD_URL="https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.gz"
-        
+
+    # 使用选定的镜像源，默认使用官网镜像
+    local mirror_base="${PG_MIRROR:-https://ftp.postgresql.org/pub/source}"
+    local mirror_display="${MIRROR_NAME:-官网镜像}"
+
+    # 构建下载URL
+    DOWNLOAD_URL="${mirror_base}/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.gz"
+
+    # 最大重试次数
+    local max_retries=3
+    local retry_count=0
+    local download_success=0
+
+    while [ $retry_count -lt $max_retries ]; do
+        # 检查是否已有源码包，如果是第一次或需要重新下载则删除旧文件
+        if [ -f "postgresql-${PG_VERSION}.tar.gz" ] && [ $retry_count -eq 0 ]; then
+            echo -e "${YELLOW}发现已有源码包，验证完整性...${NC}"
+            # 验证现有文件
+            if verify_tar_file "postgresql-${PG_VERSION}.tar.gz"; then
+                echo -e "${GREEN}现有源码包完整，跳过下载${NC}"
+                download_success=1
+                break
+            else
+                echo -e "${YELLOW}现有源码包损坏，将重新下载${NC}"
+                rm -f "postgresql-${PG_VERSION}.tar.gz"
+            fi
+        elif [ $retry_count -gt 0 ]; then
+            echo -e "${YELLOW}第 $((retry_count + 1)) 次尝试下载...${NC}"
+        fi
+
+        echo -e "${CYAN}使用镜像源: ${mirror_display}${NC}"
+        echo -e "${CYAN}下载地址: ${DOWNLOAD_URL}${NC}"
+        echo ""
+
         # 设置下载超时时间（秒）
-        local download_timeout=300
-        
+        local download_timeout=600
+
         if command -v wget &> /dev/null; then
-            local wget_opts="--timeout=$download_timeout --tries=3 --progress=bar"
+            local wget_opts="--timeout=$download_timeout --tries=1 --progress=bar"
             if [ -n "$http_proxy" ]; then
                 wget_opts="$wget_opts -e use_proxy=yes -e http_proxy=$http_proxy -e https_proxy=$https_proxy"
             fi
             wget $wget_opts $DOWNLOAD_URL
+            local wget_result=$?
+            if [ $wget_result -ne 0 ]; then
+                echo -e "${RED}wget下载失败 (错误码: $wget_result)${NC}"
+                rm -f "postgresql-${PG_VERSION}.tar.gz"
+                ((retry_count++))
+                continue
+            fi
         elif command -v curl &> /dev/null; then
-            local curl_opts="-L --connect-timeout $download_timeout --max-time $download_timeout --progress-bar"
+            local curl_opts="-L --connect-timeout $download_timeout --max-time $download_timeout --progress-bar -f"
             if [ -n "$http_proxy" ]; then
                 curl_opts="$curl_opts --proxy $http_proxy"
             fi
             curl $curl_opts -O $DOWNLOAD_URL
+            local curl_result=$?
+            if [ $curl_result -ne 0 ]; then
+                echo -e "${RED}curl下载失败 (错误码: $curl_result)${NC}"
+                rm -f "postgresql-${PG_VERSION}.tar.gz"
+                ((retry_count++))
+                continue
+            fi
         else
             echo -e "${RED}需要安装wget或curl来下载PostgreSQL${NC}"
             return 1
         fi
+
+        # 验证下载的文件
+        if [ ! -f "postgresql-${PG_VERSION}.tar.gz" ]; then
+            echo -e "${RED}下载失败：文件不存在${NC}"
+            ((retry_count++))
+            continue
+        fi
+
+        # 检查文件大小（PostgreSQL源码包通常大于20MB）
+        local file_size=$(stat -f%z "postgresql-${PG_VERSION}.tar.gz" 2>/dev/null || stat -c%s "postgresql-${PG_VERSION}.tar.gz" 2>/dev/null)
+        local min_size=20971520  # 20MB
+        if [ "$file_size" -lt "$min_size" ]; then
+            echo -e "${RED}下载的文件大小异常 (${file_size} bytes)，可能不完整${NC}"
+            rm -f "postgresql-${PG_VERSION}.tar.gz"
+            ((retry_count++))
+            continue
+        fi
+
+        # 验证tar文件完整性
+        if verify_tar_file "postgresql-${PG_VERSION}.tar.gz"; then
+            echo -e "${GREEN}文件完整性验证通过${NC}"
+            download_success=1
+            break
+        else
+            echo -e "${RED}文件完整性验证失败，文件可能已损坏${NC}"
+            rm -f "postgresql-${PG_VERSION}.tar.gz"
+            ((retry_count++))
+        fi
+    done
+
+    if [ $download_success -ne 1 ]; then
+        echo -e "${RED}下载失败，已重试 $max_retries 次${NC}"
+        echo -e "${YELLOW}建议:${NC}"
+        echo "1. 检查网络连接"
+        echo "2. 尝试切换镜像源（选择其他镜像或使用代理）"
+        echo "3. 手动下载后放置到 /tmp 目录"
+        return 1
     fi
-    
+
     echo -e "${YELLOW}解压PostgreSQL...${NC}"
-    
+
     # 检查是否已解压
     if [ -d "postgresql-${PG_VERSION}" ]; then
         echo -e "${YELLOW}发现已解压的源码，删除后重新解压${NC}"
         rm -rf postgresql-${PG_VERSION}
     fi
-    
-    tar -zvxf postgresql-${PG_VERSION}.tar.gz
-    
+
+    # 解压文件
+    if ! tar -zxf postgresql-${PG_VERSION}.tar.gz; then
+        echo -e "${RED}解压失败${NC}"
+        rm -f "postgresql-${PG_VERSION}.tar.gz"
+        return 1
+    fi
+
+    # 检查解压是否成功
+    if [ ! -d "postgresql-${PG_VERSION}" ]; then
+        echo -e "${RED}解压后目录不存在，解压可能失败${NC}"
+        return 1
+    fi
+
     # 检查是否需要移动文件
     if [ -d "$PG_INSTALL_DIR" ] && [ "$(ls -A $PG_INSTALL_DIR 2>/dev/null)" ]; then
         echo -e "${YELLOW}目标目录已存在文件，使用cp覆盖${NC}"
@@ -1903,8 +2056,25 @@ download_and_extract() {
         mv postgresql-${PG_VERSION}/* $PG_INSTALL_DIR/
         rm -rf postgresql-${PG_VERSION}
     fi
-    
+
     echo -e "${GREEN}源码准备完成${NC}"
+    return 0
+}
+
+# 验证tar文件完整性
+verify_tar_file() {
+    local tar_file="$1"
+
+    if [ ! -f "$tar_file" ]; then
+        return 1
+    fi
+
+    # 使用tar的 -t 选项测试文件完整性（不解压）
+    if tar -tzf "$tar_file" > /dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # 编译安装PostgreSQL
@@ -3438,8 +3608,327 @@ configure_remote_access() {
         echo "  service iptables save"
     fi
     echo ""
-    
+
     return 0
+}
+
+# 检查插件依赖是否已安装
+check_plugin_dependencies() {
+    local selected_plugins="$1"
+    local total_failed=0
+
+    echo -e "${CYAN}检查插件依赖...${NC}"
+    echo ""
+
+    for plugin in $selected_plugins; do
+        echo -e "${CYAN}[$plugin] 检查依赖...${NC}"
+
+        case $plugin in
+            "openssl")
+                if pkg-config --exists openssl 2>/dev/null || [ -f "/usr/include/openssl/ssl.h" ]; then
+                    echo -e "${GREEN}✓ openssl 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ openssl 依赖缺失${NC}"
+                    install_package "openssl-devel" "libssl-dev" "openssl"
+                fi
+                ;;
+            "perl")
+                if command -v perl &>/dev/null && ([ -d "/usr/lib/perl5" ] || [ -d "/usr/lib64/perl5" ]); then
+                    echo -e "${GREEN}✓ perl 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ perl 依赖缺失${NC}"
+                    install_package "perl-devel" "perl" "perl"
+                fi
+                ;;
+            "python")
+                if pkg-config --exists python3 2>/dev/null || [ -f "/usr/include/python3.9/Python.h" ] || [ -f "/usr/include/python3.11/Python.h" ] || [ -f "/usr/include/python3.12/Python.h" ]; then
+                    echo -e "${GREEN}✓ python 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ python 依赖缺失${NC}"
+                    install_package "python3-devel" "python3-dev" "python"
+                fi
+                ;;
+            "tcl")
+                if pkg-config --exists tcl 2>/dev/null || [ -f "/usr/include/tcl.h" ] || [ -f "/usr/include/tcl8/tcl.h" ] || [ -f "/usr/include/tcl8.6/tcl.h" ] || [ -f "/usr/include/tcl9/tcl.h" ]; then
+                    echo -e "${GREEN}✓ tcl 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ tcl 依赖缺失${NC}"
+                    install_package "tcl-devel" "tcl-dev" "tcl"
+                fi
+                ;;
+            "uuid")
+                # 检查UUID库（多种可能的实现）
+                local uuid_found=false
+                local uuid_type=""
+
+                # 检查各种UUID实现
+                if pkg-config --exists ossp-uuid 2>/dev/null || [ -f "/usr/include/ossp/uuid.h" ]; then
+                    uuid_found=true
+                    uuid_type="ossp-uuid"
+                elif pkg-config --exists uuid 2>/dev/null || [ -f "/usr/include/uuid/uuid.h" ]; then
+                    uuid_found=true
+                    uuid_type="e2fsprogs"
+                elif [ -f "/usr/include/uuid.h" ]; then
+                    uuid_found=true
+                    uuid_type="system"
+                fi
+
+                if $uuid_found; then
+                    echo -e "${GREEN}✓ uuid 依赖已安装 ($uuid_type)${NC}"
+                else
+                    echo -e "${YELLOW}✗ uuid 依赖缺失${NC}"
+                    echo ""
+                    # 调用专门的UUID库安装函数
+                    if ! install_uuid_library "auto"; then
+                        echo ""
+                        echo -e "${RED}✗ UUID 依赖安装失败${NC}"
+                        echo -e "${YELLOW}请手动安装 UUID 库后重试${NC}"
+                        return 1
+                    fi
+                fi
+                ;;
+            "xml")
+                if pkg-config --exists libxml-2.0 2>/dev/null || [ -f "/usr/include/libxml2/libxml/parser.h" ]; then
+                    echo -e "${GREEN}✓ xml 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ xml 依赖缺失${NC}"
+                    install_package "libxml2-devel" "libxml2-dev" "libxml2"
+                fi
+                ;;
+            "icu")
+                if pkg-config --exists icu-uc 2>/dev/null || pkg-config --exists icu-i18n 2>/dev/null || [ -f "/usr/include/unicode/ucol.h" ]; then
+                    echo -e "${GREEN}✓ icu 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ icu 依赖缺失${NC}"
+                    install_package "libicu-devel" "libicu-dev" "icu"
+                fi
+                ;;
+            "ldap")
+                if pkg-config --exists ldap 2>/dev/null || [ -f "/usr/include/ldap.h" ]; then
+                    echo -e "${GREEN}✓ ldap 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ ldap 依赖缺失${NC}"
+                    install_package "openldap-devel" "libldap2-dev" "ldap"
+                fi
+                ;;
+            "pam")
+                if [ -f "/usr/include/security/pam_appl.h" ]; then
+                    echo -e "${GREEN}✓ pam 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ pam 依赖缺失${NC}"
+                    install_package "pam-devel" "libpam-dev" "pam"
+                fi
+                ;;
+            "bonjour")
+                if pkg-config --exists avahi-client 2>/dev/null || [ -f "/usr/include/avahi-client/client.h" ]; then
+                    echo -e "${GREEN}✓ bonjour 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ bonjour 依赖缺失${NC}"
+                    install_package "avahi-devel" "libavahi-client-dev" "avahi"
+                fi
+                ;;
+            "systemd")
+                if pkg-config --exists libsystemd 2>/dev/null || [ -f "/usr/include/systemd/sd-daemon.h" ]; then
+                    echo -e "${GREEN}✓ systemd 依赖已安装${NC}"
+                else
+                    echo -e "${YELLOW}✗ systemd 依赖缺失${NC}"
+                    install_package "systemd-devel" "libsystemd-dev" "systemd"
+                fi
+                ;;
+            *)
+                echo -e "${YELLOW}⚠ 未知插件 '$plugin'，跳过依赖检查${NC}"
+                ;;
+        esac
+        echo ""
+    done
+
+    echo -e "${GREEN}依赖检查完成!${NC}"
+    return 0
+}
+
+# 安装单个包或多个包（逐个尝试）
+install_package() {
+    local yum_package="$1"
+    local apt_package="$2"
+    local display_name="$3"
+    local show_prompt="${4:-true}"
+
+    if [ "$show_prompt" = "true" ]; then
+        read -p "是否安装 $display_name 依赖? [y/N]: " install_choice
+        if [[ ! $install_choice =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}跳过安装${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${CYAN}正在安装 $display_name 依赖...${NC}"
+
+    if command -v dnf &>/dev/null; then
+        # 使用 dnf (Fedora/RHEL 8+)
+        dnf install -y $yum_package 2>/dev/null
+        local result=$?
+    elif command -v yum &>/dev/null; then
+        # 使用 yum (CentOS/RHEL 7及以下)
+        yum install -y $yum_package 2>/dev/null
+        local result=$?
+    elif command -v apt-get &>/dev/null; then
+        # 使用 apt-get (Debian/Ubuntu)
+        apt-get update -qq && apt-get install -y $apt_package 2>/dev/null
+        local result=$?
+    else
+        echo -e "${RED}无法检测包管理器，请手动安装${NC}"
+        return 1
+    fi
+
+    if [ $result -eq 0 ]; then
+        echo -e "${GREEN}✓ $display_name 依赖安装成功${NC}"
+        return 0
+    else
+        echo -e "${RED}✗ $display_name 依赖安装失败${NC}"
+        echo -e "${CYAN}请手动执行: yum install $yum_package 或 apt-get install $apt_package${NC}"
+        return 1
+    fi
+}
+
+# 安装UUID库（支持多种实现）
+install_uuid_library() {
+    local uuid_mode="${1:-auto}"  # auto, e2fs, ossp
+
+    echo -e "${YELLOW}检测和安装UUID库...${NC}"
+    echo ""
+
+    # 检测已安装的UUID库
+    local has_e2fs=false
+    local has_ossp=false
+
+    # 检查 e2fsprogs UUID
+    if pkg-config --exists uuid 2>/dev/null; then
+        has_e2fs=true
+        echo -e "${GREEN}✓ 检测到 e2fsprogs UUID (pkg-config)${NC}"
+    elif [ -f "/usr/include/uuid/uuid.h" ]; then
+        has_e2fs=true
+        echo -e "${GREEN}✓ 检测到 e2fsprogs UUID (头文件)${NC}"
+    elif [ -f "/usr/include/uuid.h" ]; then
+        has_e2fs=true
+        echo -e "${GREEN}✓ 检测到系统 UUID (头文件)${NC}"
+    fi
+
+    # 检查 OSSP UUID
+    if pkg-config --exists ossp-uuid 2>/dev/null; then
+        has_ossp=true
+        echo -e "${GREEN}✓ 检测到 OSSP UUID (pkg-config)${NC}"
+    elif [ -f "/usr/include/ossp/uuid.h" ]; then
+        has_ossp=true
+        echo -e "${GREEN}✓ 检测到 OSSP UUID (头文件)${NC}"
+    fi
+
+    echo ""
+
+    # 根据模式决定使用哪种UUID
+    if [ "$uuid_mode" = "ossp" ]; then
+        if $has_ossp; then
+            echo -e "${GREEN}使用 OSSP UUID${NC}"
+            UUID_LIBRARY="ossp"
+            return 0
+        else
+            echo -e "${YELLOW}需要安装 OSSP UUID${NC}"
+            return 1
+        fi
+    elif [ "$uuid_mode" = "e2fs" ]; then
+        if $has_e2fs; then
+            echo -e "${GREEN}使用 e2fsprogs UUID${NC}"
+            UUID_LIBRARY="e2fs"
+            return 0
+        else
+            echo -e "${YELLOW}需要安装 e2fsprogs UUID${NC}"
+            return 1
+        fi
+    fi
+
+    # 自动模式：优先使用 e2fsprogs，回退到 OSSP
+    if $has_e2fs; then
+        echo -e "${GREEN}使用 e2fsprogs UUID${NC}"
+        UUID_LIBRARY="e2fs"
+        return 0
+    elif $has_ossp; then
+        echo -e "${GREEN}使用 OSSP UUID${NC}"
+        UUID_LIBRARY="ossp"
+        return 0
+    fi
+
+    # 没有检测到UUID库，尝试安装
+    echo -e "${YELLOW}未检测到UUID库，尝试安装...${NC}"
+    echo ""
+
+    # 检测系统类型
+    if [ -f /etc/redhat-release ]; then
+        # RedHat/CentOS/Fedora
+        echo -e "${CYAN}检测到 RedHat 系统${NC}"
+
+        # 尝试安装 e2fsprogs UUID
+        echo -e "${YELLOW}尝试安装 uuid-devel...${NC}"
+        if command -v dnf &>/dev/null; then
+            dnf install -y uuid-devel 2>/dev/null
+        elif command -v yum &>/dev/null; then
+            yum install -y uuid-devel 2>/dev/null
+        fi
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ uuid-devel 安装成功${NC}"
+            UUID_LIBRARY="e2fs"
+            return 0
+        fi
+
+        # 尝试从 EPEL 或其他源安装
+        echo -e "${YELLOW}尝试安装 util-linux-devel...${NC}"
+        if command -v dnf &>/dev/null; then
+            dnf install -y util-linux-devel 2>/dev/null
+        elif command -v yum &>/dev/null; then
+            yum install -y util-linux-devel 2>/dev/null
+        fi
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ util-linux-devel 安装成功${NC}"
+            UUID_LIBRARY="e2fs"
+            return 0
+        fi
+
+        echo -e "${RED}✗ UUID 库安装失败${NC}"
+        echo -e "${CYAN}请尝试手动安装:${NC}"
+        echo "  dnf install uuid-devel"
+        echo "  或"
+        echo "  yum install uuid-devel"
+        echo ""
+        echo -e "${CYAN}如果包不存在，可能需要启用 EPEL 或 PowerTools 仓库:${NC}"
+        echo "  dnf install epel-release"
+        echo "  dnf config-manager --set-enabled crb"
+        echo "  dnf install uuid-devel"
+
+    elif [ -f /etc/debian_version ]; then
+        # Debian/Ubuntu
+        echo -e "${CYAN}检测到 Debian/Ubuntu 系统${NC}"
+
+        # 尝试安装 e2fsprogs UUID
+        echo -e "${YELLOW}尝试安装 uuid-dev...${NC}"
+        apt-get update -qq && apt-get install -y uuid-dev 2>/dev/null
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ uuid-dev 安装成功${NC}"
+            UUID_LIBRARY="e2fs"
+            return 0
+        fi
+
+        echo -e "${RED}✗ UUID 库安装失败${NC}"
+        echo -e "${CYAN}请尝试手动安装:${NC}"
+        echo "  apt-get install uuid-dev"
+    else
+        echo -e "${RED}无法识别系统类型${NC}"
+        echo -e "${CYAN}请手动安装 UUID 开发库:${NC}"
+        echo "  RedHat/CentOS: uuid-devel 或 util-linux-devel"
+        echo "  Debian/Ubuntu: uuid-dev"
+    fi
+
+    return 1
 }
 
 # 安装外部插件
@@ -3515,6 +4004,17 @@ install_external_plugins() {
         return 0
     fi
 
+    echo ""
+    echo -e "${CYAN}选择的插件: $selected_plugins${NC}"
+    echo ""
+
+    # 检查插件依赖
+    if ! check_plugin_dependencies "$selected_plugins"; then
+        echo -e "${YELLOW}已取消插件安装${NC}"
+        return 1
+    fi
+
+    echo ""
     # 生成configure选项
     CONFIGURE_OPTIONS="--prefix=$PG_INSTALL_DIR"
     for plugin in $selected_plugins; do
@@ -3532,18 +4032,65 @@ install_external_plugins() {
                 CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-tcl"
                 ;;
             "uuid")
+                # 检测可用的UUID库
+                local has_e2fs=false
+                local has_ossp=false
+
+                if pkg-config --exists uuid 2>/dev/null || [ -f "/usr/include/uuid/uuid.h" ] || [ -f "/usr/include/uuid.h" ]; then
+                    has_e2fs=true
+                fi
+                if pkg-config --exists ossp-uuid 2>/dev/null || [ -f "/usr/include/ossp/uuid.h" ]; then
+                    has_ossp=true
+                fi
+
                 echo -e "${YELLOW}请选择UUID实现方式:${NC}"
-                echo "1. ossp (OSSP UUID库)"
-                echo "2. e2fs (util-linux UUID库)"
-                read -p "请选择 [1/2]: " uuid_choice
-                case $uuid_choice in
-                    "2")
-                        CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=e2fs"
-                        ;;
-                    *)
-                        CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=ossp"
-                        ;;
-                esac
+
+                # 根据可用库显示选项
+                if $has_e2fs && ! $has_ossp; then
+                    echo "1. e2fs (util-linux UUID库) [推荐，已安装]"
+                    echo "2. ossp (OSSP UUID库) [未安装，需要手动安装]"
+                    echo ""
+                    echo -e "${GREEN}默认选择: e2fs${NC}"
+                    CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=e2fs"
+                    UUID_LIBRARY="e2fs"
+                elif ! $has_e2fs && $has_ossp; then
+                    echo "1. e2fs (util-linux UUID库) [未安装，需要手动安装]"
+                    echo "2. ossp (OSSP UUID库) [已安装]"
+                    echo ""
+                    echo -e "${GREEN}默认选择: ossp${NC}"
+                    CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=ossp"
+                    UUID_LIBRARY="ossp"
+                elif $has_e2fs && $has_ossp; then
+                    echo "1. e2fs (util-linux UUID库) [已安装]"
+                    echo "2. ossp (OSSP UUID库) [已安装]"
+                    echo ""
+                    read -p "请选择 [1/2，默认: 1]: " uuid_choice
+                    case $uuid_choice in
+                        "2")
+                            CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=ossp"
+                            UUID_LIBRARY="ossp"
+                            ;;
+                        *)
+                            CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=e2fs"
+                            UUID_LIBRARY="e2fs"
+                            ;;
+                    esac
+                else
+                    # 两者都没有，尝试安装
+                    echo -e "${YELLOW}未检测到UUID库，尝试自动安装...${NC}"
+                    if install_uuid_library "auto"; then
+                        if [ "$UUID_LIBRARY" = "e2fs" ]; then
+                            CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=e2fs"
+                        else
+                            CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-uuid=ossp"
+                        fi
+                    else
+                        echo -e "${RED}UUID库安装失败，请手动安装后重试${NC}"
+                        echo -e "${CYAN}CentOS/RHEL: yum install uuid-devel${NC}"
+                        echo -e "${CYAN}Debian/Ubuntu: apt-get install uuid-dev${NC}"
+                        return 1
+                    fi
+                fi
                 ;;
             "xml")
                 CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-libxml"
@@ -4152,6 +4699,92 @@ verify_installation() {
     fi
 }
 
+# 清理安装过程中产生的临时文件
+cleanup_temp_files() {
+    echo ""
+    echo -e "${CYAN}清理安装过程中的临时文件...${NC}"
+
+    local cleaned_count=0
+    local cleaned_files=()
+
+    # 清理下载的源码包
+    if [ -n "$PG_VERSION" ]; then
+        local tarball="/tmp/postgresql-${PG_VERSION}.tar.gz"
+        if [ -f "$tarball" ]; then
+            rm -f "$tarball"
+            cleaned_files+=("$(basename "$tarball")")
+            ((cleaned_count++))
+        fi
+    fi
+
+    # 清理解压后的源码目录
+    if [ -n "$PG_VERSION" ] && [ -d "/tmp/postgresql-${PG_VERSION}" ]; then
+        rm -rf "/tmp/postgresql-${PG_VERSION}"
+        cleaned_files+=("postgresql-${PG_VERSION}/")
+        ((cleaned_count++))
+    fi
+
+    # 清理配置日志
+    if [ -f "/tmp/postgres_configure.log" ]; then
+        rm -f "/tmp/postgres_configure.log"
+        cleaned_files+=("postgres_configure.log")
+        ((cleaned_count++))
+    fi
+
+    # 清理contrib模块编译日志
+    for log in /tmp/postgres_contrib_*_compile.log; do
+        if [ -f "$log" ]; then
+            rm -f "$log"
+            cleaned_files+=("$(basename "$log")")
+            ((cleaned_count++))
+        fi
+    done 2>/dev/null
+
+    # 清理版本查询临时文件
+    for html in /tmp/pg_versions_*.html /tmp/pg_verify_*.html; do
+        if [ -f "$html" ]; then
+            rm -f "$html"
+            cleaned_files+=("$(basename "$html")")
+            ((cleaned_count++))
+        fi
+    done 2>/dev/null
+
+    # 清理ICU临时目录
+    for icu_dir in /tmp/icu_pc_*; do
+        if [ -d "$icu_dir" ]; then
+            rm -rf "$icu_dir"
+            cleaned_files+=("$(basename "$icu_dir")/")
+            ((cleaned_count++))
+        fi
+    done 2>/dev/null
+
+    # 清理临时密码设置脚本
+    if [ -f "/tmp/set_postgres_password.sh" ]; then
+        rm -f "/tmp/set_postgres_password.sh"
+        cleaned_files+=("set_postgres_password.sh")
+        ((cleaned_count++))
+    fi
+
+    # 清理PostgreSQL临时日志文件
+    if [ -n "$PG_DATA_DIR" ] && [ -f "$PG_DATA_DIR/postgresql.log" ]; then
+        # 保留日志文件但清空内容（或选择保留）
+        # 这里选择保留，不做处理
+        :
+    fi
+
+    if [ $cleaned_count -gt 0 ]; then
+        echo -e "${GREEN}✓ 已清理 $cleaned_count 个临时文件${NC}"
+        echo -e "${CYAN}已清理的文件:${NC}"
+        for file in "${cleaned_files[@]}"; do
+            echo "  - $file"
+        done
+    else
+        echo -e "${YELLOW}没有找到需要清理的临时文件${NC}"
+    fi
+
+    echo ""
+}
+
 # 显示安装信息
 show_installation_info() {
     # 获取版本号
@@ -4243,8 +4876,11 @@ EOF
     export PATH="$PG_INSTALL_DIR/bin:$PATH"
     export MANPATH="$PG_INSTALL_DIR/share/man:$MANPATH"
     echo -e "${GREEN}✓ 当前会话环境变量已生效${NC}"
-    
+
     echo -e "${GREEN}=====================================${NC}"
+
+    # 清理临时文件
+    cleanup_temp_files
 }
 
 # 离线安装主流程
@@ -4649,15 +5285,30 @@ main() {
     echo "2. 直接初始化数据库（需要PostgreSQL已编译安装）"
     echo "3. 安装内置扩展（contrib）"
     echo "4. 离线安装PostgreSQL（使用本地tar.gz包）"
+    echo "m. 选择下载镜像源（当前: ${MIRROR_NAME:-官网镜像}）"
     echo "q. 退出"
     echo ""
-    read -p "请选择 [1/2/3/4/q]: " main_choice
+    read -p "请选择 [1/2/3/4/m/q]: " main_choice
 
     case $main_choice in
+        "m"|"M")
+            # 选择镜像源
+            select_mirror
+            main "$@"
+            exit 0
+            ;;
         "1")
             # 全新安装流程
             local version_result=""
             local config_result=""
+
+            # 如果未选择镜像源，提示用户选择
+            if [ -z "$PG_MIRROR" ]; then
+                echo ""
+                echo -e "${CYAN}首次使用，请选择下载镜像源:${NC}"
+                select_mirror
+                echo ""
+            fi
 
             while true; do
                 select_version
@@ -4942,10 +5593,41 @@ main() {
             else
                 # 需要重新安装
                 download_and_extract
-                if [ $? -ne 0 ]; then
+                local download_result=$?
+                if [ $download_result -ne 0 ]; then
                     echo -e "${RED}下载解压失败${NC}"
-                    echo -e "${YELLOW}重新开始安装流程...${NC}"
-                    continue
+                    echo ""
+                    echo -e "${YELLOW}请选择操作:${NC}"
+                    echo "1. 重新尝试下载"
+                    echo "2. 切换镜像源后重试"
+                    echo "3. 返回主菜单"
+                    echo "4. 退出安装"
+                    read -p "请选择 [1-4]: " download_fail_choice
+
+                    case $download_fail_choice in
+                        "1")
+                            echo -e "${YELLOW}重新尝试下载...${NC}"
+                            continue
+                            ;;
+                        "2")
+                            echo -e "${YELLOW}切换镜像源...${NC}"
+                            select_mirror
+                            continue
+                            ;;
+                        "3")
+                            echo -e "${YELLOW}返回主菜单...${NC}"
+                            main "$@"
+                            exit 0
+                            ;;
+                        "4")
+                            echo -e "${RED}退出安装${NC}"
+                            exit 1
+                            ;;
+                        *)
+                            echo -e "${YELLOW}重新尝试下载...${NC}"
+                            continue
+                            ;;
+                    esac
                 fi
             fi
             
@@ -4961,11 +5643,11 @@ main() {
                 echo -e "${RED}UUID库检查失败${NC}"
                 echo -e "${YELLOW}请确保已安装正确的UUID库:${NC}"
                 if [ "$UUID_LIBRARY" = "ossp" ]; then
-                    echo "- CentOS/RHEL: yum install libossp-uuid-devel"
-                    echo "- Ubuntu/Debian: apt-get install libossp-uuid-dev"
+                    echo "- CentOS/RHEL: yum install libossp-uuid-devel uuid-devel"
+                    echo "- Ubuntu/Debian: apt-get install libossp-uuid-dev uuid-devel"
                 else
-                    echo "- CentOS/RHEL: yum install util-linux-devel libuuid-devel"
-                    echo "- Ubuntu/Debian: apt-get install uuid-dev libuuid-dev"
+                    echo "- CentOS/RHEL: yum install util-linux-devel libuuid-devel uuid-devel"
+                    echo "- Ubuntu/Debian: apt-get install uuid-dev libuuid-dev uuid-devel"
                 fi
                 echo ""
                 read -p "是否继续编译? [y/N]: " continue_compile
