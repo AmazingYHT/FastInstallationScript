@@ -15,10 +15,15 @@ FastInstallationScript/
 │       │   └── docker-compose-linux-x86_64-2.39.2
 │       └── package/
 │           └── docker-28.3.3.tgz      # Docker二进制包
-└── postgresql安装脚本/
-    ├── install_postgresql.sh          # PostgreSQL安装脚本
-    ├── uninstall_postgresql.sh        # PostgreSQL卸载脚本
-    └── postgresql_wal_archive_manager.sh  # WAL归档管理脚本
+├── postgresql安装脚本/
+│   ├── install_postgresql.sh          # PostgreSQL安装脚本
+│   ├── uninstall_postgresql.sh        # PostgreSQL卸载脚本
+│   └── postgresql_wal_archive_manager.sh  # WAL归档管理脚本
+└── EasyVoice有声助手/
+    ├── clean_novel.py                 # 小说文本处理工具主程序
+    ├── clean_novel操作指南.md          # 使用说明文档
+    ├── docker-compose.yml             # TTS服务Docker配置
+    └── requirements.txt               # Python依赖列表
 ```
 
 ## Docker 安装脚本
