@@ -148,6 +148,58 @@ bash uninstall_postgresql.sh
 
 ---
 
+## EasyVoice 有声助手
+
+### 功能特性
+
+- **文本清理与切分**: 清理小说文本中的多余符号，按章节自动切分
+- **生成有声**: 调用 TTS API 为章节生成音频
+- 图形界面操作，简单易用
+- 支持自定义清理字符和语音参数
+
+### 安装步骤
+
+1. 确保已安装 Python 3.7+
+2. 安装依赖：
+```bash
+pip install -r requirements.txt
+```
+
+### 启动程序
+
+```bash
+python clean_novel.py
+```
+
+### 功能说明
+
+#### 文本清理与切分
+- 清理小说文本中的多余符号和分隔符
+- 按章节自动切分小说
+- 自定义清理字符（特殊符号、广告词等）
+- 自动检测章节标题格式
+
+#### 生成有声
+- 调用 TTS API 为章节生成音频
+- 支持文件夹批量处理或多选文件处理
+- 可调节语速、音调、音量参数
+- 支持暂停/继续/停止控制
+
+### Docker 部署 TTS 服务
+
+使用提供的 docker-compose.yml 快速启动 TTS 服务：
+
+```bash
+cd EasyVoice有声助手/
+docker-compose up -d
+```
+
+服务将在 `http://localhost:3110` 启动。
+
+详细使用说明请查看 [clean_novel操作指南.md](EasyVoice有声助手/clean_novel操作指南.md)
+
+---
+
 ## PostgreSQL WAL归档管理脚本
 
 ### 功能特性

@@ -1,0 +1,13 @@
+services:
+ easyvoice:
+  image: cosincox/easyvoice:latest
+  container_name: easyvoice
+  ports:
+   - 3110:3000
+  environment:
+   - RATE_LIMIT_WINDOW=2
+   - RATE_LIMIT=50
+   - EDGE_API_LIMIT=10
+  volumes:
+   - $(pwd)/audio:/app/audio
+  restart: always
