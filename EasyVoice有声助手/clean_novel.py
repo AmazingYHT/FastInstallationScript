@@ -236,7 +236,7 @@ class NovelCleanerGUI:
 
         ttk.Label(api_frame, text="API地址:").grid(row=0, column=0, sticky=tk.W, pady=3)
         self.api_url_entry = ttk.Entry(api_frame)
-        self.api_url_entry.insert(0, "http://127.0.0.1:3000/api/v1/tts/generateJson")
+        self.api_url_entry.insert(0, "http://127.0.0.1:3110/api/v1/tts/generateJson")
         self.api_url_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=3)
         api_frame.columnconfigure(1, weight=1)
 
@@ -482,18 +482,21 @@ class NovelCleanerGUI:
         return content, removed
 
     def detect_chapter_pattern(self, content):
-        """检测章节标题模式"""
+        """检测章节标题模式（增强版）"""
+        # 输出前20行用于调试（看看实际文本内容）
+        lines = content.split('\n')[:20]
+        self.log("文件前20行（原始格式）：")
+        for i, line in enumerate(lines):
+            self.log(f"{i+1}: {repr(line)}")  # repr 可以显示不可见字符
+
+        # 更宽松的模式列表
         patterns = [
-            # 第X章（支持空格：第1章、第 1 章、第  1  章）
-            (r'^第\s*[零一二三四五六七八九十百千万0-9]+\s*[章回卷节集部篇].*$', "第X章"),
-            # 数字、标题
-            (r'^[零一二三四五六七八九十百千万0-9]+\s*、.*$', "数字、"),
-            # Chapter X
-            (r'^Chapter\s+\d+.*$', "Chapter"),
-            # 卷X
-            (r'^卷\s*[零一二三四五六七八九十百千万0-9]+.*$', "卷X"),
-            # 序章/番外
-            (r'^(序言|前言|引言|楔子|尾声|后记|番外|目录|正文)$', "序章/番外"),
+            (r'^\s*第\s*[零一二三四五六七八九十百千万0-9]+\s*[章回卷节集部篇].*$', "第X章"),
+            (r'^\s*第\s*[0-9]+\s*[章回卷节集部篇].*$', "第X章(阿拉伯数字)"),
+            (r'^\s*[零一二三四五六七八九十百千万0-9]+\s*、.*$', "数字、"),
+            (r'^\s*Chapter\s+\d+.*$', "Chapter"),
+            (r'^\s*卷\s*[零一二三四五六七八九十百千万0-9]+.*$', "卷X"),
+            (r'^\s*(序言|前言|引言|楔子|尾声|后记|番外|目录|正文)$', "序章/番外"),
         ]
 
         best_pattern = None
@@ -502,10 +505,21 @@ class NovelCleanerGUI:
 
         for pattern, name in patterns:
             matches = len(re.findall(pattern, content, re.MULTILINE))
+            self.log(f"  模式「{name}」匹配到 {matches} 个")
             if matches > max_matches:
                 max_matches = matches
                 best_pattern = pattern
                 best_name = name
+
+        if max_matches == 0:
+            # 终极备用：只要包含“第”和“章”就认为是标题（谨慎使用）
+            pattern = r'^.*第\s*[零一二三四五六七八九十百千万0-9]+\s*章.*$'
+            matches = len(re.findall(pattern, content, re.MULTILINE))
+            self.log(f"  终极备用模式匹配到 {matches} 个")
+            if matches > 0:
+                best_pattern = pattern
+                best_name = "终极备用(包含'第'和'章')"
+                max_matches = matches
 
         return best_pattern, max_matches, best_name
 
@@ -808,9 +822,51 @@ class NovelCleanerGUI:
                 with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                     return f.read()
 
-    def call_tts_api(self, text, api_url, voice, rate, pitch, volume):
-        """调用TTS API生成音频（流式接口格式）"""
-        # 构建请求体（新接口格式）
+    def split_long_text(self, text, max_len=2500):
+        """
+        将长文本按段落分割成多个短文本，每段不超过 max_len 字符。
+        如果段落本身超过 max_len，则按句子分割。
+        """
+        paragraphs = text.split('\n')
+        chunks = []
+        current_chunk = ""
+
+        for para in paragraphs:
+            # 如果当前段落加上当前块超过最大长度，先保存当前块
+            if len(current_chunk) + len(para) + 1 > max_len and current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+
+            # 如果段落本身超过 max_len，则按句子进一步分割
+            if len(para) > max_len:
+                # 简单按句号、感叹号、问号分割
+                sentences = re.split(r'([。！？])', para)
+                # re.split 会保留分隔符，需要合并
+                temp_sentences = []
+                for i in range(0, len(sentences)-1, 2):
+                    temp_sentences.append(sentences[i] + sentences[i+1])
+                if len(sentences) % 2 == 1:
+                    temp_sentences.append(sentences[-1])
+
+                for sent in temp_sentences:
+                    if len(current_chunk) + len(sent) + 1 > max_len and current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = ""
+                    current_chunk += sent + "\n"
+            else:
+                # 正常段落
+                if current_chunk:
+                    current_chunk += "\n" + para
+                else:
+                    current_chunk = para
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        return chunks
+
+    def call_tts_api(self, text, api_url, voice, rate, pitch, volume, retries=3):
+        """调用TTS API生成音频（带重试和超时）"""
         payload = {
             "data": [
                 {
@@ -823,68 +879,68 @@ class NovelCleanerGUI:
                 }
             ]
         }
+        headers = {"Content-Type": "application/json"}
 
-        # 打印请求详情（便于调试）
-        self.log(f"  请求URL: {api_url}")
-        #self.log(f"  请求体: {json.dumps(payload, ensure_ascii=False)[:300]}...")
+        for attempt in range(1, retries + 1):
+            try:
+                self.log(f"  尝试第 {attempt} 次请求...")
+                # 增加超时到 300 秒（5分钟）
+                response = requests.post(api_url, json=payload, headers=headers, timeout=300)
 
-        try:
-            # 设置正确的Content-Type头
-            headers = {
-                "Content-Type": "application/json"
-            }
+                self.log(f"  响应状态: {response.status_code} {response.reason}")
+                self.log(f"  响应类型: {response.headers.get('Content-Type', 'unknown')}")
 
-            # 发送请求（流式接口直接返回音频）
-            response = requests.post(api_url, json=payload, headers=headers, timeout=120)
+                if not response.ok:
+                    # 尝试解析错误详情
+                    try:
+                        error_detail = response.json()
+                        self.log(f"  错误详情: {json.dumps(error_detail, ensure_ascii=False)}")
+                    except:
+                        self.log(f"  错误详情: {response.text[:500]}")
+                    # 如果不是最后一次尝试，则等待后重试
+                    if attempt < retries:
+                        wait = 2 ** attempt  # 指数退避：2,4,8秒...
+                        self.log(f"  等待 {wait} 秒后重试...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        response.raise_for_status()
 
-            # 打印响应状态和内容（便于调试）
-            self.log(f"  响应状态: {response.status_code} {response.reason}")
-            self.log(f"  响应类型: {response.headers.get('Content-Type', 'unknown')}")
+                content_type = response.headers.get('Content-Type', '')
 
-            # 如果请求失败，打印响应内容
-            if not response.ok:
-                try:
-                    error_detail = response.json()
-                    self.log(f"  错误详情: {json.dumps(error_detail, ensure_ascii=False)}")
-                except:
-                    self.log(f"  错误详情: {response.text[:500]}")
-                response.raise_for_status()
+                # 成功处理返回数据
+                if 'audio' in content_type or 'octet-stream' in content_type or 'mpeg' in content_type:
+                    self.log(f"  ✓ 音频生成完成，大小: {len(response.content)} 字节")
+                    return response.content, 'audio'
 
-            content_type = response.headers.get('Content-Type', '')
-
-            # 如果直接返回音频二进制数据（流式接口）
-            if 'audio' in content_type or 'octet-stream' in content_type or 'mpeg' in content_type:
-                self.log(f"  ✓ 音频生成完成，大小: {len(response.content)} 字节")
-                return response.content, 'audio'
-
-            # 如果返回JSON（可能包含错误或其他信息）
-            if 'application/json' in content_type:
-                data = response.json()
-                self.log(f"  响应数据: {json.dumps(data, ensure_ascii=False)[:300]}")
-
-                # 检查是否有错误
-                if 'error' in data or 'err' in data:
-                    error_msg = data.get('error') or data.get('err') or data.get('message', 'Unknown error')
-                    raise Exception(f"API返回错误: {error_msg}")
-
-                # 如果包含音频URL
-                if 'url' in data or 'audio_url' in data or 'download_url' in data:
-                    audio_url = data.get('url') or data.get('audio_url') or data.get('download_url')
-                    self.log(f"  从URL下载音频: {audio_url}")
-                    return self._download_audio_from_url(audio_url)
-
-                # 如果包含base64音频数据
-                if 'audio' in data or 'data' in data:
+                if 'application/json' in content_type:
+                    data = response.json()
+                    self.log(f"  响应数据: {json.dumps(data, ensure_ascii=False)[:300]}")
+                    if 'error' in data or 'err' in data:
+                        error_msg = data.get('error') or data.get('err') or data.get('message', 'Unknown error')
+                        raise Exception(f"API返回错误: {error_msg}")
+                    if 'url' in data or 'audio_url' in data or 'download_url' in data:
+                        audio_url = data.get('url') or data.get('audio_url') or data.get('download_url')
+                        self.log(f"  从URL下载音频: {audio_url}")
+                        return self._download_audio_from_url(audio_url)
+                    if 'audio' in data or 'data' in data:
+                        return data, 'json'
                     return data, 'json'
 
-                return data, 'json'
+                self.log(f"  响应大小: {len(response.content)} 字节")
+                return response.content, 'unknown'
 
-            # 其他格式直接返回
-            self.log(f"  响应大小: {len(response.content)} 字节")
-            return response.content, 'unknown'
+            except requests.exceptions.RequestException as e:
+                self.log(f"  请求异常: {e}")
+                if attempt < retries:
+                    wait = 2 ** attempt
+                    self.log(f"  等待 {wait} 秒后重试...")
+                    time.sleep(wait)
+                else:
+                    raise Exception(f"API请求失败，已重试{retries}次: {e}")
 
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"API请求失败: {e}")
+        # 不应该执行到这里
+        raise Exception("未知错误")
 
     def _download_audio_from_url(self, audio_url):
         """从URL下载音频"""
@@ -948,7 +1004,6 @@ class NovelCleanerGUI:
                 # 检查暂停状态
                 while self.audio_paused and not self.audio_stopped:
                     self.root.after(100, lambda: None)
-                    import time
                     time.sleep(0.1)
 
                 # 再次检查是否被停止
@@ -967,39 +1022,58 @@ class NovelCleanerGUI:
                         self.log(f"  跳过空文件: {chapter_file.name}")
                         continue
 
-                    # 调用API生成音频
-                    self.log(f"  正在调用API... (文本长度: {len(content)} 字符)")
-                    result, result_type = self.call_tts_api(
-                        content, api_url, voice, rate, pitch, volume
-                    )
+                    # 分割长文本（避免超过600秒限制）
+                    text_chunks = self.split_long_text(content, max_len=2500)
+                    if len(text_chunks) > 1:
+                        self.log(f"  文本较长，已分割为 {len(text_chunks)} 段")
 
-                    # 保存音频文件
-                    audio_filename = chapter_file.stem + ".mp3"
-                    audio_filepath = output_path / audio_filename
+                    # 处理每个分段
+                    for chunk_idx, chunk in enumerate(text_chunks, 1):
+                        self.log(f"  处理第 {chunk_idx} 段 (长度 {len(chunk)} 字符)")
 
-                    if result_type == 'audio':
-                        with open(audio_filepath, 'wb') as f:
-                            f.write(result)
-                        self.log(f"  ✓ 已保存: {audio_filename}")
-                        success_count += 1
-                    elif result_type == 'json':
-                        # 如果API返回JSON，可能包含音频数据的base64编码或URL
-                        json_path = output_path / (chapter_file.stem + ".json")
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(result, f, ensure_ascii=False, indent=2)
-                        self.log(f"  ✓ 已保存JSON响应: {json_path.name}")
-                        success_count += 1
-                    else:
-                        # 保存原始响应
-                        with open(audio_filepath, 'wb') as f:
-                            f.write(result)
-                        self.log(f"  ✓ 已保存响应: {audio_filename}")
-                        success_count += 1
+                        # 调用API生成音频
+                        result, result_type = self.call_tts_api(
+                            chunk, api_url, voice, rate, pitch, volume
+                        )
+
+                        # 保存音频文件
+                        if len(text_chunks) == 1:
+                            audio_filename = chapter_file.stem + ".mp3"
+                        else:
+                            audio_filename = f"{chapter_file.stem}_part{chunk_idx}.mp3"
+                        audio_filepath = output_path / audio_filename
+
+                        if result_type == 'audio':
+                            with open(audio_filepath, 'wb') as f:
+                                f.write(result)
+                            self.log(f"  ✓ 已保存: {audio_filename}")
+                        elif result_type == 'json':
+                            json_filename = audio_filename.replace('.mp3', '.json')
+                            json_path = output_path / json_filename
+                            with open(json_path, 'w', encoding='utf-8') as f:
+                                json.dump(result, f, ensure_ascii=False, indent=2)
+                            self.log(f"  ✓ 已保存JSON响应: {json_filename}")
+                        else:
+                            with open(audio_filepath, 'wb') as f:
+                                f.write(result)
+                            self.log(f"  ✓ 已保存响应: {audio_filename}")
+
+                        # 每段之间稍作休息
+                        time.sleep(1)
+
+                    success_count += 1  # 整个章节处理成功（可能有多段）
 
                 except Exception as e:
                     self.log(f"  ✗ 处理失败: {e}")
                     fail_count += 1
-                    continue
+                finally:
+                    # 每次请求后等待1秒，避免过载（已在段间处理）
+                    pass
+
+                # 每处理10个文件，休息30秒
+                if i % 10 == 0:
+                    self.log(f"已处理 {i} 个文件，休息30秒让服务恢复...")
+                    time.sleep(30)
 
             # 输出统计信息
             self.log(f"\n{'='*50}")
