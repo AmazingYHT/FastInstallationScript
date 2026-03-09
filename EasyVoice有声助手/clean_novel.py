@@ -11,10 +11,18 @@ import threading
 import json
 import requests
 import time
+import shutil
+import os
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
+
+# 获取系统 CPU 核心数作为最大可用线程数
+MAX_AVAILABLE_WORKERS = os.cpu_count() or 4
+# 默认线程数（不超过 CPU 核心数）
+DEFAULT_WORKERS = min(4, MAX_AVAILABLE_WORKERS)
 
 
 class NovelCleanerGUI:
@@ -23,7 +31,7 @@ class NovelCleanerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("小说文本清理与切分工具")
-        self.root.geometry("800x800")
+        self.root.geometry("900x900")  # 增大窗口高度
         self.root.resizable(True, True)
 
         # 文本清理模式的变量
@@ -34,11 +42,17 @@ class NovelCleanerGUI:
         # 有声生成模式的变量
         self.novel_folder = None
         self.selected_files = []  # 多选的文件列表
-        self.audio_output_dir = None
         self.audio_processing = False
         self.audio_paused = False
         self.audio_stopped = False
-        self.current_index = 0  # 记录当前处理到第几个章节
+
+        # 多线程标志
+        self.use_multithreading = tk.BooleanVar(value=True)
+        # 线程数选择（默认值为 CPU 核心数和4之间的较小值）
+        self.worker_count = tk.IntVar(value=DEFAULT_WORKERS)
+
+        # 日志文件锁（线程安全）
+        self.log_lock = threading.Lock()
 
         self.setup_ui()
 
@@ -166,7 +180,7 @@ class NovelCleanerGUI:
         self.progress.pack(fill=tk.X, padx=5, pady=(0, 5))
 
     def setup_audio_tab(self):
-        """设置有声生成选项卡"""
+        """设置有声生成选项卡（在原基础上增加多线程复选框）"""
         # 使用PanedWindow实现可拖动调整
         audio_paned = ttk.PanedWindow(self.audio_tab, orient=tk.VERTICAL)
         audio_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -223,7 +237,8 @@ class NovelCleanerGUI:
 
         # 音频输出目录
         ttk.Label(file_frame, text="音频输出目录:").grid(row=5, column=0, sticky=tk.W, pady=3)
-        self.audio_output_entry = ttk.Entry(file_frame)
+        self.audio_output_var = tk.StringVar()  # 绑定变量
+        self.audio_output_entry = ttk.Entry(file_frame, textvariable=self.audio_output_var)
         self.audio_output_entry.grid(row=5, column=1, sticky=tk.EW, padx=5, pady=3)
         ttk.Button(file_frame, text="浏览...", width=8, command=self.select_audio_output_dir).grid(row=5, column=2, pady=3)
 
@@ -310,6 +325,59 @@ class NovelCleanerGUI:
 
         params_frame.columnconfigure(1, weight=1)
 
+        # --- 多线程选项（放在 params_frame 后面，操作按钮上方）---
+        # 创建一个新的框架，确保它独立且可见
+        thread_frame = ttk.LabelFrame(scrollable_frame, text="处理加速", padding="5")
+        thread_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # 标题和最大线程数显示
+        header_frame = ttk.Frame(thread_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(header_frame, text="⚙️ 多线程加速选项", foreground="blue").pack(side=tk.LEFT)
+        ttk.Label(header_frame, text=f"(系统最大可用线程: {MAX_AVAILABLE_WORKERS})", foreground="gray", font=("", 8)).pack(side=tk.RIGHT)
+
+        # 多线程启用复选框和线程数选择
+        control_frame = ttk.Frame(thread_frame)
+        control_frame.pack(fill=tk.X, pady=5)
+
+        self.multithread_cb = ttk.Checkbutton(
+            control_frame,
+            text="启用多线程加速",
+            variable=self.use_multithreading,
+            command=self.on_multithread_toggle
+        )
+        self.multithread_cb.pack(side=tk.LEFT, padx=(0, 15))
+
+        # 线程数选择区域
+        worker_frame = ttk.Frame(control_frame)
+        worker_frame.pack(side=tk.LEFT)
+
+        ttk.Label(worker_frame, text="线程数:").pack(side=tk.LEFT, padx=(0, 5))
+
+        # 线程数下拉框
+        worker_values = list(range(1, MAX_AVAILABLE_WORKERS + 1))
+        self.worker_combo = ttk.Combobox(
+            worker_frame,
+            textvariable=self.worker_count,
+            values=worker_values,
+            width=5,
+            state="readonly"
+        )
+        self.worker_combo.pack(side=tk.LEFT)
+        self.worker_combo.bind("<<ComboboxSelected>>", self.on_worker_count_changed)
+
+        # 当前线程数显示标签
+        self.worker_label = ttk.Label(worker_frame, text=f"(当前: {self.worker_count.get()})", foreground="green", font=("", 9))
+        self.worker_label.pack(side=tk.LEFT, padx=(5, 0))
+
+        # 初始化时设置初始状态
+        self.on_multithread_toggle()
+
+        # 强制更新滚动区域（多次确保）
+        scrollable_frame.update_idletasks()
+        top_canvas.configure(scrollregion=top_canvas.bbox("all"))
+        self.root.after(100, lambda: top_canvas.configure(scrollregion=top_canvas.bbox("all")))
+
         # 下部区域（操作按钮和进度）
         bottom_panel = ttk.Frame(audio_paned)
         audio_paned.add(bottom_panel, weight=0)
@@ -337,22 +405,59 @@ class NovelCleanerGUI:
         self.audio_progress = ttk.Progressbar(bottom_panel, mode='indeterminate')
         self.audio_progress.pack(fill=tk.X, padx=5, pady=(0, 5))
 
-        # 鼠标滚轮支持 - 只在配置区域绑定，不影响日志区域
+        # 鼠标滚轮支持 - 绑定到所有子框架，确保滚轮事件能正确传递
         def _on_mousewheel(event):
             top_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
-        # 绑定到canvas和scrollable_frame，不使用bind_all
+        # 绑定到canvas和scrollable_frame，以及所有子框架
         top_canvas.bind("<MouseWheel>", _on_mousewheel)
         scrollable_frame.bind("<MouseWheel>", _on_mousewheel)
+
+        # 递归绑定滚轮事件到所有子组件
+        def bind_mousewheel(widget):
+            try:
+                widget.bind("<MouseWheel>", _on_mousewheel)
+            except:
+                pass
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        # 对所有配置框架应用滚轮绑定
+        bind_mousewheel(file_frame)
+        bind_mousewheel(api_frame)
+        bind_mousewheel(params_frame)
+        bind_mousewheel(thread_frame)
 
         # 初始化输入模式状态（默认文件夹模式，禁用多选文件）
         self.on_input_mode_changed()
 
     def log(self, message):
-        """添加日志"""
-        self.log_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
+        """添加日志（同时写入文件和界面）"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        log_line = f"[{timestamp}] {message}\n"
+
+        # 界面显示
+        self.log_text.insert(tk.END, log_line)
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+
+        # 写入日志文件
+        try:
+            # 确保 logs 目录存在
+            log_dir = Path(__file__).parent / "logs"
+            log_dir.mkdir(exist_ok=True)
+
+            # 以当前日期命名的日志文件
+            today = datetime.now().strftime('%Y%m%d')
+            log_file = log_dir / f"{today}.log"
+
+            with self.log_lock:
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(log_line)
+        except Exception as e:
+            # 如果文件写入失败，只在界面提示（避免递归）
+            self.log_text.insert(tk.END, f"[{timestamp}] 日志文件写入失败: {e}\n")
+            self.log_text.see(tk.END)
 
     def clear_log(self):
         """清空日志"""
@@ -663,6 +768,23 @@ class NovelCleanerGUI:
         self.pitch_var.set("0Hz")
         self.volume_var.set("0%")
 
+    def on_multithread_toggle(self):
+        """多线程复选框切换回调"""
+        if self.use_multithreading.get():
+            # 启用多线程：启用线程数选择
+            self.worker_combo.config(state="readonly")
+            self.worker_label.config(text=f"(当前: {self.worker_count.get()})", foreground="green")
+        else:
+            # 禁用多线程：禁用线程数选择
+            self.worker_combo.config(state="disabled")
+            self.worker_label.config(text="(当前: 1)", foreground="gray")
+
+    def on_worker_count_changed(self, event=None):
+        """线程数变化回调"""
+        count = self.worker_count.get()
+        if self.use_multithreading.get():
+            self.worker_label.config(text=f"(当前: {count})", foreground="green")
+
     def on_input_mode_changed(self):
         """输入模式切换回调"""
         mode = self.input_mode_var.get()
@@ -672,12 +794,24 @@ class NovelCleanerGUI:
             self.folder_btn.config(state=tk.NORMAL)
             self.files_entry.config(state=tk.DISABLED)
             self.files_btn.config(state=tk.DISABLED)
+            # 如果已有选择的文件夹，更新文件数量显示
+            if self.novel_folder:
+                chapter_files = self.get_chapter_files(self.novel_folder)
+                self.selected_files_label.config(
+                    text=f"找到 {len(chapter_files)} 个txt文件",
+                    foreground="green"
+                )
         else:
             # 多选文件模式：禁用文件夹选择，启用文件选择
             self.folder_entry.config(state=tk.DISABLED)
             self.folder_btn.config(state=tk.DISABLED)
             self.files_entry.config(state=tk.NORMAL)
             self.files_btn.config(state=tk.NORMAL)
+            # 清空文件夹模式的文件数量显示
+            self.selected_files_label.config(
+                text="",
+                foreground="gray"
+            )
 
     def select_multiple_files(self):
         """多选txt文件"""
@@ -704,12 +838,11 @@ class NovelCleanerGUI:
             # 更新标签
             self.selected_files_label.config(text=f"已选择 {len(self.selected_files)} 个文件")
 
-            # 自动设置音频输出目录
-            if not self.audio_output_dir and len(folder_paths) == 1:
-                default_output = str(list(folder_paths)[0]) + "_audio"
-                self.audio_output_entry.delete(0, tk.END)
-                self.audio_output_entry.insert(0, default_output)
-                self.audio_output_dir = default_output
+            # 自动设置音频输出目录（跨平台兼容）
+            if not self.audio_output_var.get() and len(folder_paths) == 1:
+                folder_path = Path(list(folder_paths)[0])
+                default_output = str(folder_path.parent / f"{folder_path.name}_audio")
+                self.audio_output_var.set(default_output)
 
     def select_novel_folder(self):
         """选择小说文件夹（章节txt所在目录）"""
@@ -719,19 +852,21 @@ class NovelCleanerGUI:
             self.folder_entry.delete(0, tk.END)
             self.folder_entry.insert(0, dirname)
             # 自动设置音频输出目录
-            if not self.audio_output_dir:
+            if not self.audio_output_var.get():
                 default_output = str(Path(dirname) / "audio")
-                self.audio_output_entry.delete(0, tk.END)
-                self.audio_output_entry.insert(0, default_output)
-                self.audio_output_dir = default_output
+                self.audio_output_var.set(default_output)
+            # 扫描并显示文件夹中的txt文件数量
+            chapter_files = self.get_chapter_files(dirname)
+            self.selected_files_label.config(
+                text=f"找到 {len(chapter_files)} 个txt文件",
+                foreground="green"
+            )
 
     def select_audio_output_dir(self):
         """选择音频输出目录"""
         dirname = filedialog.askdirectory(title="选择音频输出目录")
         if dirname:
-            self.audio_output_dir = dirname
-            self.audio_output_entry.delete(0, tk.END)
-            self.audio_output_entry.insert(0, dirname)
+            self.audio_output_var.set(dirname)
 
     def start_audio_processing(self):
         """开始生成有声"""
@@ -756,17 +891,22 @@ class NovelCleanerGUI:
                 self.log("错误: 请先选择要处理的txt文件")
                 return
 
+        # 获取音频输出目录（从绑定的变量读取）
+        audio_output_dir = self.audio_output_var.get().strip()
+        if not audio_output_dir:
+            self.log("错误: 请先选择或输入音频输出目录")
+            return
+
         self.audio_processing = True
         self.audio_paused = False
         self.audio_stopped = False
-        self.current_index = 0
         self.audio_process_btn.config(state=tk.DISABLED)
         self.audio_pause_btn.config(state=tk.NORMAL)
         self.audio_stop_btn.config(state=tk.NORMAL)
         self.audio_progress.start()
 
         # 在后台线程处理
-        thread = threading.Thread(target=self.process_audio_generation)
+        thread = threading.Thread(target=self.process_audio_generation, args=(audio_output_dir,))
         thread.daemon = True
         thread.start()
 
@@ -822,7 +962,7 @@ class NovelCleanerGUI:
                 with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                     return f.read()
 
-    def split_long_text(self, text, max_len=2500):
+    def split_long_text(self, text, max_len=3000):
         """
         将长文本按段落分割成多个短文本，每段不超过 max_len 字符。
         如果段落本身超过 max_len，则按句子分割。
@@ -953,8 +1093,106 @@ class NovelCleanerGUI:
         self.log(f"  ✓ 音频下载完成，大小: {len(resp.content)} 字节")
         return resp.content, 'audio'
 
-    def process_audio_generation(self):
-        """处理有声生成（后台线程）"""
+    # ---------- 清理 EasyVoice 临时文件（彻底清空目录） ----------
+    def clean_easyvoice_cache(self, cache_dir):
+        """
+        彻底清空 EasyVoice 缓存目录（删除所有文件，但保留目录本身）。
+        如果文件被占用则跳过（记录日志）。
+        """
+        if not cache_dir.exists():
+            return
+
+        deleted_count = 0
+        failed_count = 0
+        for item in cache_dir.iterdir():
+            try:
+                if item.is_file():
+                    item.unlink()
+                    deleted_count += 1
+                elif item.is_dir():
+                    shutil.rmtree(item)
+                    deleted_count += 1
+            except (PermissionError, OSError) as e:
+                failed_count += 1
+                self.log(f"  无法删除 {item.name}：{e}")
+
+        if deleted_count > 0 or failed_count > 0:
+            self.log(f"清理缓存：成功删除 {deleted_count} 项，失败 {failed_count} 项")
+
+    # ---------- 处理单个章节（供多线程调用）----------
+    def process_one_chapter(self, chapter_file, output_path, api_url, voice, rate, pitch, volume, stop_flag):
+        """
+        处理单个章节：生成分段临时音频，合并，删除临时文件。
+        返回 (success, chapter_name, error_message)
+        """
+        cache_dir = None
+        temp_files = []
+        try:
+            # 如果停止标志被设置，则跳过
+            if stop_flag and stop_flag.is_set():
+                return (False, chapter_file.name, "已停止")
+
+            # 读取章节内容
+            content = self.read_chapter_content(chapter_file)
+            content = content.strip()
+            if not content:
+                return (False, chapter_file.name, "空文件")
+
+            # 分割长文本
+            text_chunks = self.split_long_text(content)
+
+            # 定义并确保缓存目录存在（跨平台兼容）
+            cache_dir = Path(__file__).parent / "audio"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # 生成每个分段的音频
+            for chunk_idx, chunk in enumerate(text_chunks, 1):
+                if stop_flag and stop_flag.is_set():
+                    # 如果停止，则删除已生成的临时文件
+                    for f in temp_files:
+                        try:
+                            f.unlink()
+                        except:
+                            pass
+                    return (False, chapter_file.name, "已停止")
+
+                result, result_type = self.call_tts_api(
+                    chunk, api_url, voice, rate, pitch, volume
+                )
+                # 保存到临时文件（使用缓存目录）
+                temp_filename = f"{chapter_file.stem}_part{chunk_idx}.mp3"
+                temp_path = cache_dir / temp_filename
+                with open(temp_path, 'wb') as f:
+                    f.write(result)
+                temp_files.append(temp_path)
+
+            # 合并所有分段为完整章节 MP3
+            final_filename = chapter_file.stem + ".mp3"
+            final_path = output_path / final_filename
+            with open(final_path, 'wb') as out_f:
+                for temp in temp_files:
+                    # 确保临时文件存在再读取
+                    if temp.exists():
+                        with open(temp, 'rb') as in_f:
+                            shutil.copyfileobj(in_f, out_f)
+                    else:
+                        raise FileNotFoundError(f"临时文件不存在: {temp}")
+
+            return (True, chapter_file.name, "")
+        except Exception as e:
+            return (False, chapter_file.name, str(e))
+        finally:
+            # 无论成功失败，都清理此章节的临时文件
+            for temp in temp_files:
+                try:
+                    if temp.exists():
+                        temp.unlink()
+                except:
+                    pass
+
+    # ---------- 修改 process_audio_generation 方法 ----------
+    def process_audio_generation(self, audio_output_dir):
+        """处理有声生成（后台线程）- 支持多线程"""
         try:
             api_url = self.api_url_entry.get().strip()
             voice = self.voice_var.get()
@@ -965,14 +1203,17 @@ class NovelCleanerGUI:
             self.log(f"API地址: {api_url}")
             self.log(f"语音参数: voice={voice}, rate={rate}, pitch={pitch}, volume={volume}")
 
+            # 定义 EasyVoice 缓存目录（脚本所在目录下的 audio 文件夹）
+            easyvoice_cache = Path(__file__).parent / "audio"
+            # 开始前先彻底清理一次
+            self.clean_easyvoice_cache(easyvoice_cache)
+
             # 根据输入模式获取文件列表
             mode = self.input_mode_var.get()
             if mode == "folder":
-                # 文件夹模式
                 self.log(f"正在扫描文件夹: {self.novel_folder}")
                 chapter_files = self.get_chapter_files(self.novel_folder)
             else:
-                # 多选文件模式
                 chapter_files = [Path(f) for f in self.selected_files]
                 self.log(f"使用多选文件模式，共 {len(chapter_files)} 个文件")
 
@@ -986,110 +1227,127 @@ class NovelCleanerGUI:
             self.log(f"找到 {len(chapter_files)} 个章节文件")
 
             # 创建输出目录
-            output_path = Path(self.audio_output_dir) if self.audio_output_dir else Path(self.novel_folder) / "audio"
+            output_path = Path(audio_output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
 
             self.log(f"音频输出目录: {output_path}")
 
-            # 处理每个章节
-            success_count = 0
-            fail_count = 0
+            # 处理方式选择
+            if self.use_multithreading.get():
+                # 多线程模式
+                worker_count = self.worker_count.get()
+                self.log(f"启用多线程加速，线程数: {worker_count}")
+                # 禁用暂停按钮
+                self.root.after(0, lambda: self.audio_pause_btn.config(state=tk.DISABLED))
+                # 创建一个停止事件
+                stop_event = threading.Event()
 
-            for i, chapter_file in enumerate(chapter_files, 1):
-                # 检查停止状态
-                if self.audio_stopped:
-                    self.log("\n用户停止了生成任务")
-                    break
+                success_count = 0
+                fail_count = 0
+                failed_files = []
 
-                # 检查暂停状态
-                while self.audio_paused and not self.audio_stopped:
-                    self.root.after(100, lambda: None)
-                    time.sleep(0.1)
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    # 提交所有任务
+                    future_to_file = {}
+                    for cf in chapter_files:
+                        future = executor.submit(
+                            self.process_one_chapter,
+                            cf, output_path, api_url, voice, rate, pitch, volume,
+                            stop_event
+                        )
+                        future_to_file[future] = cf
 
-                # 再次检查是否被停止
-                if self.audio_stopped:
-                    self.log("\n用户停止了生成任务")
-                    break
+                    # 实时处理完成结果
+                    for future in as_completed(future_to_file):
+                        if self.audio_stopped:
+                            stop_event.set()
+                            break
+                        success, name, err = future.result()
+                        if success:
+                            success_count += 1
+                            self.log(f"  ✓ 完成: {name}")
+                        else:
+                            fail_count += 1
+                            failed_files.append(name)
+                            self.log(f"  ✗ 失败: {name} - {err}")
 
-                try:
+                    # 如果被停止，取消剩余任务（但已经提交的无法取消，只能等待）
+                    if self.audio_stopped:
+                        self.log("用户停止了生成任务")
+
+                # 统计信息
+                self.log(f"\n{'='*50}")
+                self.log(f"生成完成! 成功: {success_count}/{len(chapter_files)}")
+                if fail_count > 0:
+                    self.log(f"失败: {fail_count}")
+                    self.log("失败文件列表:")
+                    for fname in failed_files:
+                        self.log(f"  - {fname}")
+                self.log(f"输出目录: {output_path}")
+                self.log(f"{'='*50}")
+
+            else:
+                # 单线程模式（保留原逻辑，但改为合并临时文件方式）
+                self.log("单线程模式")
+                # 复用原有的串行处理逻辑，但改为新的处理函数
+                success_count = 0
+                fail_count = 0
+                failed_files = []
+
+                for i, chapter_file in enumerate(chapter_files, 1):
+                    # 检查停止状态
+                    if self.audio_stopped:
+                        self.log("\n用户停止了生成任务")
+                        break
+
+                    # 检查暂停状态
+                    while self.audio_paused and not self.audio_stopped:
+                        self.root.after(100, lambda: None)
+                        time.sleep(0.1)
+
+                    if self.audio_stopped:
+                        break
+
                     self.log(f"\n[{i}/{len(chapter_files)}] 正在处理: {chapter_file.name}")
 
-                    # 读取章节内容
-                    content = self.read_chapter_content(chapter_file)
-                    content = content.strip()
+                    success, name, err = self.process_one_chapter(
+                        chapter_file, output_path, api_url, voice, rate, pitch, volume,
+                        None  # 无停止事件
+                    )
+                    if success:
+                        success_count += 1
+                        self.log(f"  ✓ 完成: {name}")
+                    else:
+                        fail_count += 1
+                        failed_files.append(name)
+                        self.log(f"  ✗ 失败: {name} - {err}")
 
-                    if not content:
-                        self.log(f"  跳过空文件: {chapter_file.name}")
-                        continue
+                    # 每处理10个文件，休息30秒
+                    if i % 10 == 0:
+                        self.log(f"已处理 {i} 个文件，休息30秒让服务恢复...")
+                        time.sleep(30)
 
-                    # 分割长文本（避免超过600秒限制）
-                    text_chunks = self.split_long_text(content, max_len=2500)
-                    if len(text_chunks) > 1:
-                        self.log(f"  文本较长，已分割为 {len(text_chunks)} 段")
-
-                    # 处理每个分段
-                    for chunk_idx, chunk in enumerate(text_chunks, 1):
-                        self.log(f"  处理第 {chunk_idx} 段 (长度 {len(chunk)} 字符)")
-
-                        # 调用API生成音频
-                        result, result_type = self.call_tts_api(
-                            chunk, api_url, voice, rate, pitch, volume
-                        )
-
-                        # 保存音频文件
-                        if len(text_chunks) == 1:
-                            audio_filename = chapter_file.stem + ".mp3"
-                        else:
-                            audio_filename = f"{chapter_file.stem}_part{chunk_idx}.mp3"
-                        audio_filepath = output_path / audio_filename
-
-                        if result_type == 'audio':
-                            with open(audio_filepath, 'wb') as f:
-                                f.write(result)
-                            self.log(f"  ✓ 已保存: {audio_filename}")
-                        elif result_type == 'json':
-                            json_filename = audio_filename.replace('.mp3', '.json')
-                            json_path = output_path / json_filename
-                            with open(json_path, 'w', encoding='utf-8') as f:
-                                json.dump(result, f, ensure_ascii=False, indent=2)
-                            self.log(f"  ✓ 已保存JSON响应: {json_filename}")
-                        else:
-                            with open(audio_filepath, 'wb') as f:
-                                f.write(result)
-                            self.log(f"  ✓ 已保存响应: {audio_filename}")
-
-                        # 每段之间稍作休息
-                        time.sleep(1)
-
-                    success_count += 1  # 整个章节处理成功（可能有多段）
-
-                except Exception as e:
-                    self.log(f"  ✗ 处理失败: {e}")
-                    fail_count += 1
-                finally:
-                    # 每次请求后等待1秒，避免过载（已在段间处理）
-                    pass
-
-                # 每处理10个文件，休息30秒
-                if i % 10 == 0:
-                    self.log(f"已处理 {i} 个文件，休息30秒让服务恢复...")
-                    time.sleep(30)
-
-            # 输出统计信息
-            self.log(f"\n{'='*50}")
-            if self.audio_stopped:
-                self.log(f"生成已停止!")
-            else:
-                self.log(f"生成完成!")
-            self.log(f"成功: {success_count}/{len(chapter_files)}")
-            if fail_count > 0:
-                self.log(f"失败: {fail_count}/{len(chapter_files)}")
-            self.log(f"输出目录: {output_path}")
-            self.log(f"{'='*50}")
+                # 输出统计信息
+                self.log(f"\n{'='*50}")
+                if self.audio_stopped:
+                    self.log(f"生成已停止!")
+                else:
+                    self.log(f"生成完成!")
+                self.log(f"成功: {success_count}/{len(chapter_files)}")
+                if fail_count > 0:
+                    self.log(f"失败: {fail_count}")
+                    self.log("失败文件列表:")
+                    for fname in failed_files:
+                        self.log(f"  - {fname}")
+                self.log(f"输出目录: {output_path}")
+                self.log(f"{'='*50}")
 
         except Exception as e:
             self.log(f"\n✗ 生成出错: {e}")
         finally:
+            # 最后再彻底清理一次缓存目录
+            easyvoice_cache = Path(__file__).parent / "audio"
+            self.clean_easyvoice_cache(easyvoice_cache)
             self.audio_processing = False
             self.root.after(0, self.process_audio_done)
 
