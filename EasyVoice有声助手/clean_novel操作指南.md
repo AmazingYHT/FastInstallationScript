@@ -6,7 +6,214 @@
 |------|------|----------|
 | v1.0 | 2026-02-26 | 初始版本，支持文本清理、章节切分、有声生成 |
 | v1.1 | 2026-03-04 | 功能增强：API端口修正、章节检测增强、长文本分割、重试机制 |
-| v1.2 | 2026-03-09 | 性能优化：多线程加速、日志持久化、缓存自动清理、分段长度优化、UI修复、跨平台兼容、文件数量显示、代码优化 |
+| v1.2 | 2026-04-08 | 渠道扩展：新增SpeechMa渠道、多线程加速、线程安全日志、25种中文语音 |
+
+---
+
+## 📝 v1.2 版本更新详情
+
+### 1. 新增 SpeechMa TTS 渠道
+**修改位置**: `TTS_CHANNELS` 配置 (第29-79行)
+
+```python
+TTS_CHANNELS = {
+    "easyvoice": {
+        "name": "EasyVoice",
+        "api_url": "https://vo.zt.yonght.top:2026/api/v1/tts/generateJson",
+        "max_chars": 3000,
+        "voices": [...],
+    },
+    "speechma": {
+        "name": "SpeechMa",
+        "api_url": "https://speechma.com/com.api/tts-api.php",
+        "max_chars": 2000,
+        "voices": [
+            ("voice-53", "女声-晓晓(推荐)"),
+            ("voice-54", "女声-晓伊"),
+            ("voice-55", "男声-云健"),
+            ("voice-56", "男声-云希"),
+            ("voice-57", "男声-云夏"),
+            ("voice-58", "男声-云扬"),
+            ("voice-59", "女声-东北话-晓北"),
+            ("voice-60", "女声-陕西话-晓妮"),
+            ("voice-61", "女声-粤语-晓佳"),
+            ("voice-62", "女声-粤语-晓曼"),
+            ("voice-63", "男声-粤语-云龙"),
+            ("voice-64", "女声-台湾-晓臻"),
+            ("voice-65", "女声-台湾-晓雨"),
+            ("voice-66", "男声-台湾-云哲"),
+            ("voice-386", "男声-美式中文-Andrew"),
+            ("voice-387", "女声-美式中文-Ava"),
+            ("voice-388", "男声-美式中文-Brian"),
+            ("voice-389", "女声-美式中文-Emma"),
+            ("voice-390", "男声-法式中文-Remy"),
+            ("voice-391", "女声-法式中文-Vivienne"),
+            ("voice-392", "男声-德式中文-Florian"),
+            ("voice-393", "女声-德式中文-Seraphina"),
+            ("voice-394", "男声-意式中文-Giuseppe"),
+            ("voice-395", "男声-韩式中文-Hyunsu"),
+            ("voice-396", "女声-巴西中文-Thalita"),
+        ],
+    }
+}
+```
+
+**功能说明**:
+- 支持两个 TTS 渠道切换：EasyVoice（本地/自建）和 SpeechMa（云端）
+- SpeechMa 支持最多 2000 字符/请求
+- EasyVoice 支持最多 3000 字符/请求
+- 渠道切换时自动更新语音列表和 API 地址
+
+---
+
+### 2. SpeechMa 中文语音列表（25种）
+
+| ID | 名称 | 性别 | 地区/口音 |
+|---|------|------|----------|
+| voice-53 | 晓晓 | 女 | 中国内地(推荐) |
+| voice-54 | 晓伊 | 女 | 中国内地 |
+| voice-55 | 云健 | 男 | 中国内地 |
+| voice-56 | 云希 | 男 | 中国内地 |
+| voice-57 | 云夏 | 男 | 中国内地 |
+| voice-58 | 云扬 | 男 | 中国内地 |
+| voice-59 | 晓北 | 女 | 东北话 |
+| voice-60 | 晓妮 | 女 | 陕西话 |
+| voice-61 | 晓佳 | 女 | 粤语(香港) |
+| voice-62 | 晓曼 | 女 | 粤语(香港) |
+| voice-63 | 云龙 | 男 | 粤语(香港) |
+| voice-64 | 晓臻 | 女 | 台湾 |
+| voice-65 | 晓雨 | 女 | 台湾 |
+| voice-66 | 云哲 | 男 | 台湾 |
+| voice-386 | Andrew | 男 | 美式中文 |
+| voice-387 | Ava | 女 | 美式中文 |
+| voice-388 | Brian | 男 | 美式中文 |
+| voice-389 | Emma | 女 | 美式中文 |
+| voice-390 | Remy | 男 | 法式中文 |
+| voice-391 | Vivienne | 女 | 法式中文 |
+| voice-392 | Florian | 男 | 德式中文 |
+| voice-393 | Seraphina | 女 | 德式中文 |
+| voice-394 | Giuseppe | 男 | 意式中文 |
+| voice-395 | Hyunsu | 男 | 韩式中文 |
+| voice-396 | Thalita | 女 | 巴西中文 |
+
+---
+
+### 3. SpeechMa API 调用格式
+**修改位置**: `call_tts_api()` 方法
+
+```python
+if channel_key == "speechma":
+    # SpeechMa 使用不同的参数格式
+    rate_val = int(rate.replace('%', '').replace('+', '').replace('-', '')) if '%' in rate else 0
+    pitch_val = int(pitch.replace('Hz', '').replace('+', '').replace('-', '')) if 'Hz' in pitch else 0
+    
+    payload = {
+        "text": text,
+        "voice": voice,      # 如 "voice-53"
+        "pitch": pitch_val,  # 整数值
+        "rate": rate_val     # 整数值
+    }
+else:
+    # EasyVoice 格式
+    payload = {
+        "data": [{
+            "desc": "有声小说",
+            "text": text,
+            "voice": voice,
+            "rate": rate,
+            "pitch": pitch,
+            "volume": volume
+        }]
+    }
+```
+
+---
+
+### 4. 多线程加速支持
+**新增功能**: ThreadPoolExecutor 多线程并行处理
+
+```python
+if self.use_multithreading.get():
+    worker_count = self.worker_count.get()
+    self.log(f"启用多线程加速，线程数: {worker_count}")
+    
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_file = {}
+        for cf in chapter_files:
+            future = executor.submit(
+                self.process_one_chapter,
+                cf, output_path, api_url, voice, rate, pitch, volume,
+                channel_key, max_chars, stop_event
+            )
+            future_to_file[future] = cf
+```
+
+**配置选项**:
+- 勾选"启用多线程"开启并行处理
+- 可设置线程数（建议 2-8 个）
+- 单线程模式保留暂停/继续功能
+
+---
+
+### 5. 线程安全日志机制
+**新增方法**: `_start_log_consumer()` 和队列日志
+
+```python
+import queue
+
+log_queue = queue.Queue()
+log_file_lock = threading.Lock()
+
+def _start_log_consumer(self):
+    """在主线程消费日志队列，避免GUI跨线程问题"""
+    def consume():
+        try:
+            while True:
+                log_line = self.log_queue.get_nowait()
+                self.log_text.insert(tk.END, log_line)
+                self.log_text.see(tk.END)
+        except queue.Empty:
+            pass
+        self.root.after(100, consume)
+    self.root.after(100, consume)
+
+def log(self, message):
+    """线程安全的日志输出"""
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    log_line = f"[{timestamp}] {message}\n"
+    self.log_queue.put(log_line)
+    # 文件写入使用锁保护
+    with self.log_file_lock:
+        with open(self.log_file_path, 'a', encoding='utf-8') as f:
+            f.write(log_line)
+```
+
+---
+
+### 6. 渠道切换 UI
+**新增控件**: 渠道下拉选择框
+
+```python
+ttk.Label(api_frame, text="TTS渠道:").grid(row=0, column=0, sticky=tk.W, pady=3)
+channel_values = [TTS_CHANNELS[k]["name"] for k in TTS_CHANNELS]
+self.channel_combo = ttk.Combobox(api_frame, values=channel_values, width=15, state="readonly")
+self.channel_combo.set(TTS_CHANNELS["easyvoice"]["name"])
+self.channel_combo.bind("<<ComboboxSelected>>", self.on_channel_changed)
+
+def on_channel_changed(self, event):
+    """渠道切换时更新语音列表和API地址"""
+    selected_name = self.channel_combo.get()
+    for key, config in TTS_CHANNELS.items():
+        if config["name"] == selected_name:
+            self.tts_channel.set(key)
+            self.api_url_entry.delete(0, tk.END)
+            self.api_url_entry.insert(0, config["api_url"])
+            # 更新语音下拉框
+            self.voice_combo['values'] = [v[1] for v in config["voices"]]
+            self.voice_combo.set(config["default_voice_desc"])
+            self.voice_var.set(config["default_voice"])
+            break
+```
 
 ---
 
@@ -25,15 +232,14 @@
 ---
 
 ### 2. 章节检测增强
-**修改位置**: `detect_chapter_pattern()` 方法 (第484-524行)
+**修改位置**: `detect_chapter_pattern()` 方法
 
 #### 2.1 添加调试输出
 ```python
-# 新增：输出前20行用于调试
 lines = content.split('\n')[:20]
 self.log("文件前20行（原始格式）：")
 for i, line in enumerate(lines):
-    self.log(f"{i+1}: {repr(line)}")  # repr 可以显示不可见字符
+    self.log(f"{i+1}: {repr(line)}")
 ```
 
 #### 2.2 正则模式更宽松
@@ -44,24 +250,10 @@ for i, line in enumerate(lines):
 
 **说明**: 添加 `\s*` 前缀，支持章节标题前有空格的情况。
 
-#### 2.3 新增终极备用模式
-```python
-if max_matches == 0:
-    # 终极备用：只要包含"第"和"章"就认为是标题（谨慎使用）
-    pattern = r'^.*第\s*[零一二三四五六七八九十百千万0-9]+\s*章.*$'
-    matches = len(re.findall(pattern, content, re.MULTILINE))
-    self.log(f"  终极备用模式匹配到 {matches} 个")
-    if matches > 0:
-        best_pattern = pattern
-        best_name = "终极备用(包含'第'和'章')"
-```
-
-**说明**: 当标准模式都匹配失败时，使用更宽松的备用模式。
-
 ---
 
 ### 3. 新增长文本分割功能
-**新增方法**: `split_long_text()` (第825-866行)
+**新增方法**: `split_long_text()`
 
 ```python
 def split_long_text(self, text, max_len=2500):
@@ -72,19 +264,19 @@ def split_long_text(self, text, max_len=2500):
 ```
 
 **功能说明**:
-- 每段最大 2500 字符（避免超过 TTS 服务 600 秒限制）
+- 根据渠道自动调整分割长度（EasyVoice: 3000, SpeechMa: 2000）
 - 优先按段落分割
 - 超长段落按句子（。！？）分割
-- 自动保存为 `_part1.mp3`, `_part2.mp3` 等分段文件
+- 分段文件自动合并为完整章节音频
 
 ---
 
 ### 4. TTS API 调用增强
-**修改位置**: `call_tts_api()` 方法 (第868-943行)
+**修改位置**: `call_tts_api()` 方法
 
 #### 4.1 添加重试机制
 ```python
-def call_tts_api(self, text, api_url, voice, rate, pitch, volume, retries=3):
+def call_tts_api(self, text, api_url, voice, rate, pitch, volume, channel_key="easyvoice", retries=3):
     for attempt in range(1, retries + 1):
         try:
             # ... 请求逻辑
@@ -102,378 +294,6 @@ def call_tts_api(self, text, api_url, voice, rate, pitch, volume, retries=3):
 + response = requests.post(api_url, json=payload, headers=headers, timeout=300)
 ```
 
-**说明**: 超时从 120 秒延长到 300 秒（5分钟），适应较长文本的生成时间。
-
-#### 4.3 指数退避重试
-| 重试次数 | 等待时间 |
-|---------|---------|
-| 第1次失败 | 2秒 |
-| 第2次失败 | 4秒 |
-| 第3次失败 | 抛出异常 |
-
----
-
-### 5. 音频生成流程优化
-**修改位置**: `process_audio_generation()` 方法
-
-#### 5.1 长文本分割处理
-```python
-# 分割长文本（避免超过600秒限制）
-text_chunks = self.split_long_text(content, max_len=2500)
-if len(text_chunks) > 1:
-    self.log(f"  文本较长，已分割为 {len(text_chunks)} 段")
-```
-
-#### 5.2 分段保存命名
-```python
-if len(text_chunks) == 1:
-    audio_filename = chapter_file.stem + ".mp3"
-else:
-    audio_filename = f"{chapter_file.stem}_part{chunk_idx}.mp3"
-```
-
-#### 5.3 节流控制
-```python
-# 每段之间稍作休息
-time.sleep(1)
-
-# 每处理10个文件，休息30秒让服务恢复
-if i % 10 == 0:
-    self.log(f"已处理 {i} 个文件，休息30秒让服务恢复...")
-    time.sleep(30)
-```
-
----
-
-## 📝 v1.2 版本更新详情
-
-### 1. 多线程加速支持（可自定义线程数）
-**新增参数**:
-```python
-# 获取系统 CPU 核心数
-MAX_AVAILABLE_WORKERS = os.cpu_count() or 4
-# 默认线程数
-DEFAULT_WORKERS = min(4, MAX_AVAILABLE_WORKERS)
-```
-
-**新增 UI 控件**: "处理加速" 选项卡
-```python
-# 多线程标志
-self.use_multithreading = tk.BooleanVar(value=True)
-# 线程数选择
-self.worker_count = tk.IntVar(value=DEFAULT_WORKERS)
-
-# 线程数下拉框（1~CPU核心数）
-worker_values = list(range(1, MAX_AVAILABLE_WORKERS + 1))
-self.worker_combo = ttk.Combobox(
-    worker_frame,
-    textvariable=self.worker_count,
-    values=worker_values,
-    width=5,
-    state="readonly"
-)
-
-# 当前线程数显示标签
-self.worker_label = ttk.Label(
-    worker_frame,
-    text=f"(当前: {self.worker_count.get()})",
-    foreground="green"
-)
-```
-
-**新增方法**:
-```python
-def on_multithread_toggle(self):
-    """多线程复选框切换回调"""
-    if self.use_multithreading.get():
-        self.worker_combo.config(state="readonly")
-        self.worker_label.config(text=f"(当前: {self.worker_count.get()})", foreground="green")
-    else:
-        self.worker_combo.config(state="disabled")
-        self.worker_label.config(text="(当前: 1)", foreground="gray")
-
-def on_worker_count_changed(self, event=None):
-    """线程数变化回调"""
-    count = self.worker_count.get()
-    if self.use_multithreading.get():
-        self.worker_label.config(text=f"(当前: {count})", foreground="green")
-```
-
-**功能说明**:
-- 自动检测系统 CPU 核心数作为最大可用线程数
-- 用户可通过下拉框自定义选择 1~CPU核心数 之间的线程数
-- 实时显示当前选择的线程数（绿色）和系统最大可用线程数（灰色）
-- 启用多线程后使用 `ThreadPoolExecutor` 并发处理多个章节
-- 多线程模式下禁用"暂停"按钮（仅支持停止）
-- 禁用多线程时线程数选择框变灰，显示当前为单线程模式
-
----
-
-### 2. 日志持久化
-**新增方法**: `log()` 增强版
-
-```python
-def log(self, message):
-    """添加日志（同时写入文件和界面）"""
-    timestamp = datetime.now().strftime('%H:%M:%S')
-    log_line = f"[{timestamp}] {message}\n"
-
-    # 界面显示
-    self.log_text.insert(tk.END, log_line)
-
-    # 写入日志文件（线程安全）
-    log_dir = Path(__file__).parent / "logs"
-    log_dir.mkdir(exist_ok=True)
-    today = datetime.now().strftime('%Y%m%d')
-    log_file = log_dir / f"{today}.log"
-
-    with self.log_lock:
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(log_line)
-```
-
-**新增线程锁**: `self.log_lock = threading.Lock()`
-
-**功能说明**:
-- 日志自动保存到 `logs/` 目录
-- 按日期命名日志文件（格式：`YYYYMMDD.log`）
-- 使用线程锁保证多线程写入安全
-- 便于事后排查问题和回顾处理记录
-
----
-
-### 3. 缓存自动清理
-**新增方法**: `clean_easyvoice_cache()` (第1006-1026行)
-
-```python
-def clean_easyvoice_cache(self, cache_dir):
-    """
-    彻底清空 EasyVoice 缓存目录（删除所有文件，但保留目录本身）。
-    如果文件被占用则跳过（记录日志）。
-    """
-    if not cache_dir.exists():
-        return
-
-    deleted_count = 0
-    failed_count = 0
-    for item in cache_dir.iterdir():
-        try:
-            if item.is_file():
-                item.unlink()
-            elif item.is_dir():
-                shutil.rmtree(item)
-        except (PermissionError, OSError) as e:
-            failed_count += 1
-            self.log(f"  无法删除 {item.name}：{e}")
-```
-
-**清理时机**:
-1. 开始生成前清理一次
-2. 全部生成完成后清理一次
-
-**缓存目录**: `脚本目录/audio/`
-
-**功能说明**:
-- 自动清理临时音频文件，避免磁盘空间占用
-- 文件被占用时跳过并记录日志
-- 处理大量文件时保持磁盘整洁
-
----
-
-### 4. 音频处理逻辑重构
-**新增方法**: `process_one_chapter()` (第1029-1095行)
-
-```python
-def process_one_chapter(
-    self, chapter_file, output_path, api_url,
-    voice, rate, pitch, volume, stop_flag
-):
-    """
-    处理单个章节：生成分段临时音频，合并，删除临时文件。
-    返回 (success, chapter_name, error_message)
-    """
-```
-
-**流程优化**:
-1. 读取章节内容并分割
-2. 并发生成各分段音频（保存到缓存目录）
-3. 合并所有分段为完整章节 MP3
-4. 删除临时文件
-
-**多线程处理**:
-```python
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    future_to_file = {}
-    for cf in chapter_files:
-        future = executor.submit(
-            self.process_one_chapter,
-            cf, output_path, api_url, voice, rate, pitch, volume,
-            stop_event
-        )
-        future_to_file[future] = cf
-
-    # 实时处理完成结果
-    for future in as_completed(future_to_file):
-        if self.audio_stopped:
-            stop_event.set()
-            break
-        success, name, err = future.result()
-        # ... 更新进度
-```
-
----
-
-### 5. 分段长度优化
-**修改位置**: `split_long_text()` 方法 (第875行)
-
-```diff
-- def split_long_text(self, text, max_len=2500):
-+ def split_long_text(self, text, max_len=3000):
-```
-
-**说明**: 每段最大长度从 2500 提升到 3000 字符，减少分段数量。
-
----
-
-### 6. 窗口 UI 优化
-**修改位置**: `__init__()` 方法 (第31行)
-
-```diff
-- self.root.geometry("800x800")
-+ self.root.geometry("900x900")  # 增大窗口高度
-```
-
-**音频输出目录使用变量绑定** (第237-239行):
-```python
-self.audio_output_var = tk.StringVar()  # 绑定变量
-self.audio_output_entry = ttk.Entry(
-    file_frame, textvariable=self.audio_output_var
-)
-```
-
-**说明**: 窗口更大，显示更多内容；目录选择更可靠。
-
----
-
-### 7. 文件数量实时显示
-**新增功能**: 选择文件夹后显示txt文件数量
-
-```python
-# 扫描并显示文件夹中的txt文件数量
-chapter_files = self.get_chapter_files(dirname)
-self.selected_files_label.config(
-    text=f"找到 {len(chapter_files)} 个txt文件",
-    foreground="green"
-)
-```
-
-**功能说明**: 选择文件夹后，立即显示该文件夹内找到的txt文件总数（绿色显示）。
-
----
-
-### 8. 失败记录增强
-**新增功能**: 失败文件列表记录
-
-```python
-failed_files = []
-# ...
-if fail_count > 0:
-    self.log(f"失败: {fail_count}")
-    self.log("失败文件列表:")
-    for fname in failed_files:
-        self.log(f"  - {fname}")
-```
-
-**功能说明**: 任务结束后输出所有失败文件清单，方便重新处理。
-
----
-
-### 9. 代码优化（删除冗余）
-**优化内容**: 移除未使用的变量
-
-```diff
-# 删除未使用的音频输出目录变量（已被 audio_output_var 替代）
-- self.audio_output_dir = None
-
-# 删除未使用的章节索引变量
-- self.current_index = 0
-```
-
-**说明**: 清理冗余代码，提升代码质量和可维护性。
-
----
-
-### 10. UI 修复：滚轮支持增强
-**问题**: 生成有声页面的多线程复选框无法通过滚轮滚动查看
-
-**修复内容**:
-```python
-# 递归绑定滚轮事件到所有子组件
-def bind_mousewheel(widget):
-    try:
-        widget.bind("<MouseWheel>", _on_mousewheel)
-    except:
-        pass
-    for child in widget.winfo_children():
-        bind_mousewheel(child)
-
-# 对所有配置框架应用滚轮绑定
-bind_mousewheel(file_frame)
-bind_mousewheel(api_frame)
-bind_mousewheel(params_frame)
-bind_mousewheel(thread_frame)
-```
-
-**说明**: 递归绑定滚轮事件到所有子组件，确保鼠标滚轮可以正常滚动查看整个配置区域（包括多线程选项）。
-
----
-
-### 11. 跨平台兼容性修复
-**问题**: 临时文件路径错误和路径拼接不支持跨平台
-
-**修复内容**:
-
-1. **缓存目录创建** - 确保目录存在后再使用
-```python
-# 定义并确保缓存目录存在（跨平台兼容）
-cache_dir = Path(__file__).parent / "audio"
-cache_dir.mkdir(parents=True, exist_ok=True)
-```
-
-2. **路径拼接优化** - 使用 Path 对象而非字符串拼接
-```python
-# 修复前（字符串拼接，可能有跨平台问题）
-default_output = str(list(folder_paths)[0]) + "_audio"
-
-# 修复后（使用 Path 对象）
-folder_path = Path(list(folder_paths)[0])
-default_output = str(folder_path.parent / f"{folder_path.name}_audio")
-```
-
-3. **临时文件检查** - 合并前确认文件存在
-```python
-# 确保临时文件存在再读取
-if temp.exists():
-    with open(temp, 'rb') as in_f:
-        shutil.copyfileobj(in_f, out_f)
-else:
-    raise FileNotFoundError(f"临时文件不存在: {temp}")
-```
-
-4. **资源清理优化** - 使用 finally 块确保临时文件被清理
-```python
-finally:
-    # 无论成功失败，都清理此章节的临时文件
-    for temp in temp_files:
-        try:
-            if temp.exists():
-                temp.unlink()
-        except:
-            pass
-```
-
-**说明**: 使用 `pathlib.Path` 确保路径处理在 Windows 和 Linux 上都能正常工作，避免临时文件找不到的错误。
-
 ---
 
 ## 📋 功能概述
@@ -484,18 +304,17 @@ finally:
 - 清理小说文本中的多余符号和分隔符
 - 按章节自动切分小说
 - 自定义清理字符（特殊符号、广告词等）
-- 自动检测章节标题格式（v1.1 增强检测能力）
+- 自动检测章节标题格式
 
 ### 2. 生成有声
-- 调用 TTS API 为章节生成音频
-- 支持文件夹批量处理或多选文件处理
-- 可调节语速、音调、音量参数
-- 支持暂停/继续/停止控制
-- **v1.1 新增**: 长文本自动分割，避免超时
-- **v1.1 新增**: API 请求自动重试，提高成功率
-- **v1.2 新增**: 多线程加速（最多4线程并发）
-- **v1.2 新增**: 日志持久化（自动保存到 logs 目录）
-- **v1.2 新增**: 缓存自动清理，释放磁盘空间
+- **多渠道支持**: EasyVoice（本地）和 SpeechMa（云端）
+- **25种中文语音**: 内地、方言、粤语、台湾、多口音
+- **多线程加速**: 可选并行处理，提升效率
+- 支持暂停/继续/停止控制（单线程模式）
+- 长文本自动分割，避免超时
+- API 请求自动重试，提高成功率
+
+---
 
 ## 📦 环境要求
 
@@ -508,135 +327,93 @@ finally:
 pip install -r requirements.txt
 ```
 
+---
+
 ## 🚀 使用方法
 
 ### 启动程序
 
 ```bash
-# 方法1：直接运行
-python clean_novel.py
-
-# 方法2：切换目录后运行
-cd /d "E:\myself\FastInstallationScript\EasyVoice有声助手"
 python clean_novel.py
 ```
+
+---
 
 ### 功能一：文本清理与切分
 
 #### 步骤说明
 
-1. **选择输入文件**
-   - 点击"浏览"按钮选择待处理的小说txt文件
+1. **选择输入文件** - 点击"浏览"选择待处理的小说txt文件
 
-2. **选择输出目录**
-   - 选择处理后文件的保存位置
-   - 默认为源文件同目录下的 `{文件名}_分章` 文件夹
+2. **选择输出目录** - 选择保存位置，默认为 `{文件名}_分章` 文件夹
 
 3. **配置处理选项**
-   - **处理模式**: 选择"清理并按章节切分"或"仅清理文本"
-   - **文件编码**: 支持 auto/utf-8/gbk/gb18030
-   - **自定义清理字符**: 输入需要删除的字符，用逗号分隔
+   - 处理模式: 清理并切分 / 仅清理
+   - 文件编码: auto/utf-8/gbk/gb18030
+   - 自定义清理字符
 
-4. **快捷预设**
-   - 特殊符号: ※☆★♡♥◆◇■□▲△▼▽
-   - 网络表情: (笑)(哭)(怒)(汗)
-   - 广告词: 本章完,求订阅,求推荐,求收藏,请关注
+4. **开始处理** - 点击"开始处理"
 
-5. **开始处理**
-   - 点击"开始处理"按钮
-   - 查看日志了解处理进度
-
-#### 支持的章节格式（v1.1 增强）
-
-- 第X章 / 第X回 / 第X卷（支持标题前有空格）
-- 数字、标题格式 (如：一、二、三、)
-- Chapter X
-- 序章/番外/前言/尾声等
-- **新增**: 终极备用模式，更宽松的匹配
+---
 
 ### 功能二：生成有声
 
 #### 步骤说明
 
-1. **选择输入源**
-   - **文件夹模式**: 自动处理文件夹内所有txt文件
-   - **多选文件模式**: 手动选择指定txt文件
+1. **选择 TTS 渠道**
+   - **EasyVoice**: 自建/本地 TTS 服务，支持 3000 字符
+   - **SpeechMa**: 云端服务，支持 2000 字符，25 种中文语音
 
-2. **配置音频输出目录**
-   - 选择音频文件的保存位置
+2. **选择输入源**
+   - 文件夹模式: 自动处理所有txt文件
+   - 多选文件模式: 手动选择指定文件
 
-3. **配置API**
-   - API地址: `http://127.0.0.1:3110/api/v1/tts/generateJson`（v1.1 已修正）
-   - 根据你的TTS服务调整地址
+3. **配置音频输出目录**
 
 4. **设置语音参数**
-   - **语音**: 选择中文语音模型
-     - 女声: XiaoxiaoNeural、XiaoyiNeural
-     - 男声: YunjianNeural、YunxiNeural、YunxiaNeural
-     - 方言: 东北话、陕西话、粤语
-   - **语速**: -99% ~ +99%
-   - **音调**: -99Hz ~ +99Hz
-   - **音量**: -99% ~ +99%
+   - 语音: 根据渠道选择（切换渠道自动更新列表）
+   - 语速/音调/音量: 可调节
 
-5. **开始生成**
+5. **多线程设置**（可选）
+   - 勾选"启用多线程"
+   - 设置线程数（建议 2-8）
+   - 注意：多线程模式下暂停功能不可用
+
+6. **开始生成**
    - 点击"开始生成有声"
-   - 可随时暂停/继续/停止
+   - 单线程模式支持暂停/继续/停止
    - 查看日志了解进度
 
-#### v1.1 新特性
-
-- **长文本自动分割**: 超过 2500 字符的章节自动分割为多段处理
-- **智能重试**: API 请求失败自动重试最多 3 次，采用指数退避策略
-- **服务保护**: 每处理 10 个文件自动休息 30 秒，避免服务过载
-
-#### v1.2 新特性
-
-- **多线程加速**: 启用后最多 4 个线程并发处理，大幅提升速度（禁用暂停功能）
-- **日志持久化**: 所有日志自动保存到 `logs/` 目录，按日期命名文件
-- **自动清理缓存**: 开始前和结束后自动清理临时音频文件
-- **分段长度优化**: 提升至 3000 字符/段，减少分段数量
+---
 
 ## 📁 文件说明
 
 | 文件 | 说明 |
 |------|------|
 | `clean_novel.py` | 主程序 |
-| `requirements.txt` | 依赖列表 (requests) |
-| `docker-compose.yml` | TTS 服务 Docker 部署配置 |
-| `clean_novel操作指南.md` | 本文档 |
+| `requirements.txt` | 依赖列表 |
+| `docker-compose.yml` | TTS 服务 Docker 配置 |
 
-### 运行时目录结构
-
-```
-EasyVoice有声助手/
-├── clean_novel.py           # 主程序
-├── requirements.txt         # 依赖列表
-├── docker-compose.yml       # Docker 配置
-├── clean_novel操作指南.md    # 本文档
-├── audio/                   # 临时音频缓存目录（自动创建和清理）
-└── logs/                    # 日志目录（v1.2 新增）
-    └── 20260309.log         # 按日期命名的日志文件
-```
+---
 
 ## ⚠️ 注意事项
 
-1. **TTS API**: 使用生成有声功能前，确保TTS API服务已启动
+1. **渠道选择**: SpeechMa 为云端服务，无需本地部署；EasyVoice 需自建服务
 2. **文件备份**: 建议先备份原始小说文件
-3. **编码问题**: 如果文件读取乱码，尝试手动指定编码
-4. **章节识别**: 章节标题需独占一行才能正确识别
-5. **长文本**: v1.2 已自动分割为 3000 字符段落，无需手动处理
-6. **多线程模式**: 启用多线程后将禁用暂停功能，仅支持停止
-7. **日志目录**: `logs/` 目录会自动创建，可定期清理旧日志
+3. **编码问题**: 乱码时尝试手动指定编码
+4. **章节识别**: 章节标题需独占一行
+5. **多线程**: 多线程模式下不支持暂停，单线程保留完整控制
+6. **长文本**: 自动分割处理，无需手动干预
+
+---
 
 ## 🔧 故障排查
 
 | 问题 | 解决方案 |
 |------|----------|
-| 乱码 | 尝试切换文件编码选项，优先使用 auto |
-| 无法切分 | 检查章节标题是否独占一行，查看日志中的调试输出 |
-| API调用失败 | 已自动重试，检查TTS服务是否运行，确认API地址端口为 3110 |
-| 长文本超时 | v1.2 已自动分割为 3000 字符段落，无需手动处理 |
-| 章节识别不准 | 查看日志中"文件前20行"输出，确认章节格式 |
-| 多线程卡顿 | 关闭多线程模式，使用单线程模式可支持暂停功能 |
-| 临时文件残留 | 检查 `audio/` 缓存目录，程序结束后会自动清理 |
-| 日志文件过大 | 定期清理 `logs/` 目录中的旧日志文件 |
+| 乱码 | 尝试切换文件编码，优先使用 auto |
+| 无法切分 | 检查章节标题是否独占一行 |
+| API调用失败 | 检查TTS服务/渠道选择，查看日志 |
+| 长文本超时 | 已自动分割，无需处理 |
+| SpeechMa无响应 | 检查网络连接，测试语音脚本 |
+| 多线程卡住 | 降低线程数，或切换单线程模式 |

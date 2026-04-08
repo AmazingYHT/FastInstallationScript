@@ -13,6 +13,8 @@ import requests
 import time
 import shutil
 import os
+import uuid
+import queue
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +25,64 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 MAX_AVAILABLE_WORKERS = os.cpu_count() or 4
 # 默认线程数（不超过 CPU 核心数）
 DEFAULT_WORKERS = min(4, MAX_AVAILABLE_WORKERS)
+
+# TTS 渠道配置
+TTS_CHANNELS = {
+    "easyvoice": {
+        "name": "EasyVoice",
+        "api_url": "https://vo.zt.yonght.top:2026/api/v1/tts/generateJson",
+        "max_chars": 3000,
+        "voices": [
+            ("zh-CN-XiaoxiaoNeural", "女声-新闻/小说"),
+            ("zh-CN-XiaoyiNeural", "女声-卡通/小说"),
+            ("zh-CN-YunjianNeural", "男声-体育/小说"),
+            ("zh-CN-YunxiNeural", "男声-小说"),
+            ("zh-CN-YunxiaNeural", "男声-卡通/小说"),
+            ("zh-CN-YunyangNeural", "男声-新闻"),
+            ("zh-CN-liaoning-XiaobeiNeural", "女声-东北话"),
+            ("zh-CN-shaanxi-XiaoniNeural", "女声-陕西话"),
+            ("zh-HK-HiuGaaiNeural", "女声-粤语(香港)"),
+            ("zh-HK-HiuMaanNeural", "女声-粤语(香港)"),
+            ("zh-HK-WanLungNeural", "男声-粤语(香港)"),
+        ],
+        "default_voice": "zh-CN-YunxiNeural",
+        "default_voice_desc": "男声-小说",
+    },
+    "speechma": {
+        "name": "SpeechMa",
+        "api_url": "https://speechma.com/com.api/tts-api.php",
+        "max_chars": 2000,
+        "voices": [
+            ("voice-53", "女声-晓晓(推荐)"),
+            ("voice-54", "女声-晓伊"),
+            ("voice-55", "男声-云健"),
+            ("voice-56", "男声-云希"),
+            ("voice-57", "男声-云夏"),
+            ("voice-58", "男声-云扬"),
+            ("voice-59", "女声-东北话-晓北"),
+            ("voice-60", "女声-陕西话-晓妮"),
+            ("voice-61", "女声-粤语-晓佳"),
+            ("voice-62", "女声-粤语-晓曼"),
+            ("voice-63", "男声-粤语-云龙"),
+            ("voice-64", "女声-台湾-晓臻"),
+            ("voice-65", "女声-台湾-晓雨"),
+            ("voice-66", "男声-台湾-云哲"),
+            ("voice-386", "男声-美式中文-Andrew"),
+            ("voice-387", "女声-美式中文-Ava"),
+            ("voice-388", "男声-美式中文-Brian"),
+            ("voice-389", "女声-美式中文-Emma"),
+            ("voice-390", "男声-法式中文-Remy"),
+            ("voice-391", "女声-法式中文-Vivienne"),
+            ("voice-392", "男声-德式中文-Florian"),
+            ("voice-393", "女声-德式中文-Seraphina"),
+            ("voice-394", "男声-意式中文-Giuseppe"),
+            ("voice-395", "男声-韩式中文-Hyunsu"),
+            ("voice-396", "女声-巴西中文-Thalita"),
+        ],
+        "default_voice": "voice-53",
+        "default_voice_desc": "女声-晓晓(推荐)",
+    }
+}
 
 
 class NovelCleanerGUI:
@@ -46,15 +106,20 @@ class NovelCleanerGUI:
         self.audio_paused = False
         self.audio_stopped = False
 
+        # TTS 渠道选择
+        self.tts_channel = tk.StringVar(value="easyvoice")
+
         # 多线程标志
         self.use_multithreading = tk.BooleanVar(value=True)
         # 线程数选择（默认值为 CPU 核心数和4之间的较小值）
         self.worker_count = tk.IntVar(value=DEFAULT_WORKERS)
 
-        # 日志文件锁（线程安全）
         self.log_lock = threading.Lock()
+        self.log_queue = queue.Queue()
+        self.log_file_lock = threading.Lock()
 
         self.setup_ui()
+        self._start_log_consumer()
 
     def setup_ui(self):
         """设置界面"""
@@ -249,10 +314,17 @@ class NovelCleanerGUI:
         api_frame = ttk.LabelFrame(scrollable_frame, text="API配置", padding="8")
         api_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=3)
 
-        ttk.Label(api_frame, text="API地址:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Label(api_frame, text="TTS渠道:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        channel_values = [TTS_CHANNELS[k]["name"] for k in TTS_CHANNELS]
+        self.channel_combo = ttk.Combobox(api_frame, values=channel_values, width=15, state="readonly")
+        self.channel_combo.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5)
+        self.channel_combo.set(TTS_CHANNELS["easyvoice"]["name"])
+        self.channel_combo.bind("<<ComboboxSelected>>", self.on_channel_changed)
+
+        ttk.Label(api_frame, text="API地址:").grid(row=1, column=0, sticky=tk.W, pady=3)
         self.api_url_entry = ttk.Entry(api_frame)
-        self.api_url_entry.insert(0, "http://127.0.0.1:3110/api/v1/tts/generateJson")
-        self.api_url_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=3)
+        self.api_url_entry.insert(0, TTS_CHANNELS["easyvoice"]["api_url"])
+        self.api_url_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=3)
         api_frame.columnconfigure(1, weight=1)
 
         # 语音参数配置
@@ -261,31 +333,19 @@ class NovelCleanerGUI:
 
         # Voice选择
         ttk.Label(params_frame, text="语音:").grid(row=0, column=0, sticky=tk.W, pady=3)
-        self.voice_var = tk.StringVar(value="zh-CN-YunxiNeural")
+        self.voice_var = tk.StringVar(value=TTS_CHANNELS["easyvoice"]["default_voice"])
 
-        self.voice_list = [
-            ("zh-CN-XiaoxiaoNeural", "女声-新闻/小说"),
-            ("zh-CN-XiaoyiNeural", "女声-卡通/小说"),
-            ("zh-CN-YunjianNeural", "男声-体育/小说"),
-            ("zh-CN-YunxiNeural", "男声-小说"),
-            ("zh-CN-YunxiaNeural", "男声-卡通/小说"),
-            ("zh-CN-YunyangNeural", "男声-新闻"),
-            ("zh-CN-liaoning-XiaobeiNeural", "女声-东北话"),
-            ("zh-CN-shaanxi-XiaoniNeural", "女声-陕西话"),
-            ("zh-HK-HiuGaaiNeural", "女声-粤语(香港)"),
-            ("zh-HK-HiuMaanNeural", "女声-粤语(香港)"),
-            ("zh-HK-WanLungNeural", "男声-粤语(香港)"),
-        ]
+        self.voice_list = TTS_CHANNELS["easyvoice"]["voices"]
 
-        voice_combo = ttk.Combobox(params_frame, textvariable=self.voice_var, width=25,
+        self.voice_combo = ttk.Combobox(params_frame, textvariable=self.voice_var, width=25,
                                   values=[v[0] for v in self.voice_list], state="readonly")
-        voice_combo.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5)
+        self.voice_combo.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5)
 
-        self.voice_desc_var = tk.StringVar(value="男声-小说")
+        self.voice_desc_var = tk.StringVar(value=TTS_CHANNELS["easyvoice"]["default_voice_desc"])
         voice_desc_label = ttk.Label(params_frame, textvariable=self.voice_desc_var,
                                     foreground="gray", font=("Microsoft YaHei", 8))
         voice_desc_label.grid(row=0, column=2, sticky=tk.W, padx=5, pady=3)
-        voice_combo.bind("<<ComboboxSelected>>", self.on_voice_selected)
+        self.voice_combo.bind("<<ComboboxSelected>>", self.on_voice_selected)
 
         # Rate - 滑动条
         ttk.Label(params_frame, text="语速:").grid(row=1, column=0, sticky=tk.W, pady=3)
@@ -417,7 +477,7 @@ class NovelCleanerGUI:
         def bind_mousewheel(widget):
             try:
                 widget.bind("<MouseWheel>", _on_mousewheel)
-            except:
+            except Exception:
                 pass
             for child in widget.winfo_children():
                 bind_mousewheel(child)
@@ -431,33 +491,42 @@ class NovelCleanerGUI:
         # 初始化输入模式状态（默认文件夹模式，禁用多选文件）
         self.on_input_mode_changed()
 
+    def _start_log_consumer(self):
+        """启动日志消费者，定期检查队列并更新GUI"""
+        def consume():
+            try:
+                while True:
+                    try:
+                        log_line = self.log_queue.get_nowait()
+                        self.log_text.insert(tk.END, log_line)
+                        self.log_text.see(tk.END)
+                    except queue.Empty:
+                        break
+            except tk.TclError:
+                pass
+            self.root.after(100, consume)
+
+        self.root.after(100, consume)
+
     def log(self, message):
-        """添加日志（同时写入文件和界面）"""
+        """添加日志（线程安全，同时写入文件和界面）"""
         timestamp = datetime.now().strftime('%H:%M:%S')
         log_line = f"[{timestamp}] {message}\n"
 
-        # 界面显示
-        self.log_text.insert(tk.END, log_line)
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
+        self.log_queue.put(log_line)
 
-        # 写入日志文件
         try:
-            # 确保 logs 目录存在
             log_dir = Path(__file__).parent / "logs"
             log_dir.mkdir(exist_ok=True)
 
-            # 以当前日期命名的日志文件
             today = datetime.now().strftime('%Y%m%d')
             log_file = log_dir / f"{today}.log"
 
-            with self.log_lock:
+            with self.log_file_lock:
                 with open(log_file, 'a', encoding='utf-8') as f:
                     f.write(log_line)
-        except Exception as e:
-            # 如果文件写入失败，只在界面提示（避免递归）
-            self.log_text.insert(tk.END, f"[{timestamp}] 日志文件写入失败: {e}\n")
-            self.log_text.see(tk.END)
+        except Exception:
+            pass
 
     def clear_log(self):
         """清空日志"""
@@ -537,18 +606,19 @@ class NovelCleanerGUI:
         path = Path(filepath)
 
         if encoding == "auto":
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    return f.read()
-            except UnicodeDecodeError:
+            encodings_to_try = ['utf-8', 'gb18030', 'gbk', 'big5']
+            for enc in encodings_to_try:
                 try:
-                    with open(path, 'r', encoding='gbk') as f:
-                        self.log("使用 GBK 编码读取")
-                        return f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                        self.log("使用 UTF-8 (忽略错误) 编码读取")
-                        return f.read()
+                    with open(path, 'r', encoding=enc) as f:
+                        content = f.read()
+                        if enc != 'utf-8':
+                            self.log(f"使用 {enc} 编码读取")
+                        return content
+                except UnicodeDecodeError:
+                    continue
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                self.log("使用 UTF-8 (忽略错误) 编码读取")
+                return f.read()
         else:
             with open(path, 'r', encoding=encoding, errors='ignore') as f:
                 return f.read()
@@ -586,15 +656,15 @@ class NovelCleanerGUI:
         removed = original_size - len(content)
         return content, removed
 
-    def detect_chapter_pattern(self, content):
+    def detect_chapter_pattern(self, content, debug=False):
         """检测章节标题模式（增强版）"""
-        # 输出前20行用于调试（看看实际文本内容）
-        lines = content.split('\n')[:20]
-        self.log("文件前20行（原始格式）：")
-        for i, line in enumerate(lines):
-            self.log(f"{i+1}: {repr(line)}")  # repr 可以显示不可见字符
+        if debug:
+            lines = content.split('\n')[:5]
+            self.log("文件前5行预览：")
+            for i, line in enumerate(lines):
+                if line.strip():
+                    self.log(f"  {i+1}: {line[:60]}...")
 
-        # 更宽松的模式列表
         patterns = [
             (r'^\s*第\s*[零一二三四五六七八九十百千万0-9]+\s*[章回卷节集部篇].*$', "第X章"),
             (r'^\s*第\s*[0-9]+\s*[章回卷节集部篇].*$', "第X章(阿拉伯数字)"),
@@ -610,20 +680,17 @@ class NovelCleanerGUI:
 
         for pattern, name in patterns:
             matches = len(re.findall(pattern, content, re.MULTILINE))
-            self.log(f"  模式「{name}」匹配到 {matches} 个")
             if matches > max_matches:
                 max_matches = matches
                 best_pattern = pattern
                 best_name = name
 
         if max_matches == 0:
-            # 终极备用：只要包含“第”和“章”就认为是标题（谨慎使用）
             pattern = r'^.*第\s*[零一二三四五六七八九十百千万0-9]+\s*章.*$'
             matches = len(re.findall(pattern, content, re.MULTILINE))
-            self.log(f"  终极备用模式匹配到 {matches} 个")
             if matches > 0:
                 best_pattern = pattern
-                best_name = "终极备用(包含'第'和'章')"
+                best_name = "备用模式(包含'第'和'章')"
                 max_matches = matches
 
         return best_pattern, max_matches, best_name
@@ -649,12 +716,12 @@ class NovelCleanerGUI:
 
         return chapter_contents
 
-    def sanitize_filename(self, filename):
-        """清理文件名"""
+    def sanitize_filename(self, filename, max_len=150):
+        """清理文件名，保留章节编号"""
         illegal_chars = r'[<>:"/\\|?*]'
         filename = re.sub(illegal_chars, '_', filename)
-        if len(filename) > 200:
-            filename = filename[:200]
+        if len(filename) > max_len:
+            filename = filename[:max_len].rstrip('_- ')
         return filename.strip()
 
     def clean_novel_text(self, input_file, output_dir, encoding):
@@ -747,6 +814,29 @@ class NovelCleanerGUI:
 
     # ============= 有声生成模式相关方法 =============
 
+    def on_channel_changed(self, event):
+        """渠道选择回调"""
+        channel_name = self.channel_combo.get()
+        channel_key = None
+        for k, v in TTS_CHANNELS.items():
+            if v["name"] == channel_name:
+                channel_key = k
+                break
+        
+        if channel_key:
+            self.tts_channel.set(channel_key)
+            channel_config = TTS_CHANNELS[channel_key]
+            
+            self.api_url_entry.delete(0, tk.END)
+            self.api_url_entry.insert(0, channel_config["api_url"])
+            
+            self.voice_list = channel_config["voices"]
+            self.voice_combo['values'] = [v[0] for v in self.voice_list]
+            self.voice_var.set(channel_config["default_voice"])
+            self.voice_desc_var.set(channel_config["default_voice_desc"])
+            
+            self.log(f"切换到渠道: {channel_config['name']} (最大支持 {channel_config['max_chars']} 字符)")
+
     def on_voice_selected(self, event):
         """语音选择回调"""
         selected = self.voice_var.get()
@@ -757,10 +847,12 @@ class NovelCleanerGUI:
 
     def reset_voice_params(self):
         """重置语音参数为默认值"""
-        # 重置语音选择
-        self.voice_var.set("zh-CN-YunxiNeural")
-        self.voice_desc_var.set("男声-小说")
-        # 重置滑动条
+        channel_key = self.tts_channel.get()
+        channel_config = TTS_CHANNELS[channel_key]
+        
+        self.voice_var.set(channel_config["default_voice"])
+        self.voice_desc_var.set(channel_config["default_voice_desc"])
+        
         self.rate_value.set(0)
         self.pitch_value.set(0)
         self.volume_value.set(0)
@@ -958,7 +1050,7 @@ class NovelCleanerGUI:
             try:
                 with open(filepath, 'r', encoding='gbk') as f:
                     return f.read()
-            except:
+            except Exception:
                 with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                     return f.read()
 
@@ -979,14 +1071,16 @@ class NovelCleanerGUI:
 
             # 如果段落本身超过 max_len，则按句子进一步分割
             if len(para) > max_len:
-                # 简单按句号、感叹号、问号分割
                 sentences = re.split(r'([。！？])', para)
-                # re.split 会保留分隔符，需要合并
                 temp_sentences = []
                 for i in range(0, len(sentences)-1, 2):
-                    temp_sentences.append(sentences[i] + sentences[i+1])
-                if len(sentences) % 2 == 1:
+                    if i+1 < len(sentences):
+                        temp_sentences.append(sentences[i] + sentences[i+1])
+                if len(sentences) % 2 == 1 and sentences[-1]:
                     temp_sentences.append(sentences[-1])
+
+                if not temp_sentences:
+                    temp_sentences = [para]
 
                 for sent in temp_sentences:
                     if len(current_chunk) + len(sent) + 1 > max_len and current_chunk:
@@ -1005,41 +1099,53 @@ class NovelCleanerGUI:
 
         return chunks
 
-    def call_tts_api(self, text, api_url, voice, rate, pitch, volume, retries=3):
+    def call_tts_api(self, text, api_url, voice, rate, pitch, volume, channel_key="easyvoice", retries=3):
         """调用TTS API生成音频（带重试和超时）"""
-        payload = {
-            "data": [
-                {
-                    "desc": "有声小说",
-                    "text": text,
-                    "voice": voice,
-                    "rate": rate,
-                    "pitch": pitch,
-                    "volume": volume
-                }
-            ]
-        }
         headers = {"Content-Type": "application/json"}
+        
+        if channel_key == "speechma":
+            rate_val = int(rate.replace('%', '').replace('+', '').replace('-', '')) if '%' in rate else 0
+            pitch_val = int(pitch.replace('Hz', '').replace('+', '').replace('-', '')) if 'Hz' in pitch else 0
+            
+            payload = {
+                "text": text,
+                "voice": voice,
+                "pitch": pitch_val,
+                "rate": rate_val
+            }
+        else:
+            payload = {
+                "data": [
+                    {
+                        "desc": "有声小说",
+                        "text": text,
+                        "voice": voice,
+                        "rate": rate,
+                        "pitch": pitch,
+                        "volume": volume
+                    }
+                ]
+            }
 
         for attempt in range(1, retries + 1):
             try:
                 self.log(f"  尝试第 {attempt} 次请求...")
-                # 增加超时到 300 秒（5分钟）
                 response = requests.post(api_url, json=payload, headers=headers, timeout=300)
 
                 self.log(f"  响应状态: {response.status_code} {response.reason}")
                 self.log(f"  响应类型: {response.headers.get('Content-Type', 'unknown')}")
 
                 if not response.ok:
-                    # 尝试解析错误详情
-                    try:
-                        error_detail = response.json()
-                        self.log(f"  错误详情: {json.dumps(error_detail, ensure_ascii=False)}")
-                    except:
-                        self.log(f"  错误详情: {response.text[:500]}")
-                    # 如果不是最后一次尝试，则等待后重试
+                    if attempt == retries:
+                        try:
+                            error_detail = response.json()
+                            self.log(f"  错误详情: {json.dumps(error_detail, ensure_ascii=False)[:200]}")
+                        except Exception:
+                            self.log(f"  错误详情: {response.text[:200]}")
+                    else:
+                        self.log(f"  请求失败: {response.status_code}")
                     if attempt < retries:
-                        wait = 2 ** attempt  # 指数退避：2,4,8秒...
+                        wait = 2 ** attempt
                         self.log(f"  等待 {wait} 秒后重试...")
                         time.sleep(wait)
                         continue
@@ -1048,7 +1154,6 @@ class NovelCleanerGUI:
 
                 content_type = response.headers.get('Content-Type', '')
 
-                # 成功处理返回数据
                 if 'audio' in content_type or 'octet-stream' in content_type or 'mpeg' in content_type:
                     self.log(f"  ✓ 音频生成完成，大小: {len(response.content)} 字节")
                     return response.content, 'audio'
@@ -1059,6 +1164,19 @@ class NovelCleanerGUI:
                     if 'error' in data or 'err' in data:
                         error_msg = data.get('error') or data.get('err') or data.get('message', 'Unknown error')
                         raise Exception(f"API返回错误: {error_msg}")
+                    if channel_key == "speechma":
+                        if 'audio' in data:
+                            audio_data = data.get('audio')
+                            if isinstance(audio_data, str) and audio_data.startswith('data:audio'):
+                                import base64
+                                audio_bytes = base64.b64decode(audio_data.split(',')[1])
+                                return audio_bytes, 'audio'
+                            elif isinstance(audio_data, str) and (audio_data.startswith('http') or audio_data.startswith('/')):
+                                return self._download_audio_from_url(audio_data if audio_data.startswith('http') else f"https://speechma.com{audio_data}")
+                        if 'url' in data or 'audio_url' in data or 'download_url' in data or 'mp3' in data:
+                            audio_url = data.get('url') or data.get('audio_url') or data.get('download_url') or data.get('mp3')
+                            self.log(f"  从URL下载音频: {audio_url}")
+                            return self._download_audio_from_url(audio_url)
                     if 'url' in data or 'audio_url' in data or 'download_url' in data:
                         audio_url = data.get('url') or data.get('audio_url') or data.get('download_url')
                         self.log(f"  从URL下载音频: {audio_url}")
@@ -1079,7 +1197,6 @@ class NovelCleanerGUI:
                 else:
                     raise Exception(f"API请求失败，已重试{retries}次: {e}")
 
-        # 不应该执行到这里
         raise Exception("未知错误")
 
     def _download_audio_from_url(self, audio_url):
@@ -1120,7 +1237,7 @@ class NovelCleanerGUI:
             self.log(f"清理缓存：成功删除 {deleted_count} 项，失败 {failed_count} 项")
 
     # ---------- 处理单个章节（供多线程调用）----------
-    def process_one_chapter(self, chapter_file, output_path, api_url, voice, rate, pitch, volume, stop_flag):
+    def process_one_chapter(self, chapter_file, output_path, api_url, voice, rate, pitch, volume, channel_key, max_chars, stop_flag):
         """
         处理单个章节：生成分段临时音频，合并，删除临时文件。
         返回 (success, chapter_name, error_message)
@@ -1128,50 +1245,41 @@ class NovelCleanerGUI:
         cache_dir = None
         temp_files = []
         try:
-            # 如果停止标志被设置，则跳过
             if stop_flag and stop_flag.is_set():
                 return (False, chapter_file.name, "已停止")
 
-            # 读取章节内容
             content = self.read_chapter_content(chapter_file)
             content = content.strip()
             if not content:
                 return (False, chapter_file.name, "空文件")
 
-            # 分割长文本
-            text_chunks = self.split_long_text(content)
+            text_chunks = self.split_long_text(content, max_len=max_chars)
 
-            # 定义并确保缓存目录存在（跨平台兼容）
             cache_dir = Path(__file__).parent / "audio"
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-            # 生成每个分段的音频
             for chunk_idx, chunk in enumerate(text_chunks, 1):
                 if stop_flag and stop_flag.is_set():
-                    # 如果停止，则删除已生成的临时文件
                     for f in temp_files:
                         try:
                             f.unlink()
-                        except:
+                        except Exception:
                             pass
                     return (False, chapter_file.name, "已停止")
 
                 result, result_type = self.call_tts_api(
-                    chunk, api_url, voice, rate, pitch, volume
+                    chunk, api_url, voice, rate, pitch, volume, channel_key
                 )
-                # 保存到临时文件（使用缓存目录）
-                temp_filename = f"{chapter_file.stem}_part{chunk_idx}.mp3"
+                temp_filename = f"{chapter_file.stem}_{threading.current_thread().ident}_part{chunk_idx}.mp3"
                 temp_path = cache_dir / temp_filename
                 with open(temp_path, 'wb') as f:
                     f.write(result)
                 temp_files.append(temp_path)
 
-            # 合并所有分段为完整章节 MP3
             final_filename = chapter_file.stem + ".mp3"
             final_path = output_path / final_filename
             with open(final_path, 'wb') as out_f:
                 for temp in temp_files:
-                    # 确保临时文件存在再读取
                     if temp.exists():
                         with open(temp, 'rb') as in_f:
                             shutil.copyfileobj(in_f, out_f)
@@ -1187,7 +1295,7 @@ class NovelCleanerGUI:
                 try:
                     if temp.exists():
                         temp.unlink()
-                except:
+                except Exception:
                     pass
 
     # ---------- 修改 process_audio_generation 方法 ----------
@@ -1199,16 +1307,18 @@ class NovelCleanerGUI:
             rate = self.rate_var.get()
             pitch = self.pitch_var.get()
             volume = self.volume_var.get()
+            channel_key = self.tts_channel.get()
+            channel_config = TTS_CHANNELS[channel_key]
+            max_chars = channel_config["max_chars"]
 
+            self.log(f"渠道: {channel_config['name']}")
             self.log(f"API地址: {api_url}")
             self.log(f"语音参数: voice={voice}, rate={rate}, pitch={pitch}, volume={volume}")
+            self.log(f"文本切分长度: {max_chars} 字符")
 
-            # 定义 EasyVoice 缓存目录（脚本所在目录下的 audio 文件夹）
-            easyvoice_cache = Path(__file__).parent / "audio"
-            # 开始前先彻底清理一次
-            self.clean_easyvoice_cache(easyvoice_cache)
+            cache_dir = Path(__file__).parent / "audio"
+            self.clean_easyvoice_cache(cache_dir)
 
-            # 根据输入模式获取文件列表
             mode = self.input_mode_var.get()
             if mode == "folder":
                 self.log(f"正在扫描文件夹: {self.novel_folder}")
@@ -1217,7 +1327,6 @@ class NovelCleanerGUI:
                 chapter_files = [Path(f) for f in self.selected_files]
                 self.log(f"使用多选文件模式，共 {len(chapter_files)} 个文件")
 
-            # 按文件名排序
             chapter_files.sort(key=lambda x: x.name)
 
             if not chapter_files:
@@ -1226,20 +1335,15 @@ class NovelCleanerGUI:
 
             self.log(f"找到 {len(chapter_files)} 个章节文件")
 
-            # 创建输出目录
             output_path = Path(audio_output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
 
             self.log(f"音频输出目录: {output_path}")
 
-            # 处理方式选择
             if self.use_multithreading.get():
-                # 多线程模式
                 worker_count = self.worker_count.get()
                 self.log(f"启用多线程加速，线程数: {worker_count}")
-                # 禁用暂停按钮
                 self.root.after(0, lambda: self.audio_pause_btn.config(state=tk.DISABLED))
-                # 创建一个停止事件
                 stop_event = threading.Event()
 
                 success_count = 0
@@ -1247,17 +1351,15 @@ class NovelCleanerGUI:
                 failed_files = []
 
                 with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    # 提交所有任务
                     future_to_file = {}
                     for cf in chapter_files:
                         future = executor.submit(
                             self.process_one_chapter,
                             cf, output_path, api_url, voice, rate, pitch, volume,
-                            stop_event
+                            channel_key, max_chars, stop_event
                         )
                         future_to_file[future] = cf
 
-                    # 实时处理完成结果
                     for future in as_completed(future_to_file):
                         if self.audio_stopped:
                             stop_event.set()
@@ -1302,8 +1404,7 @@ class NovelCleanerGUI:
 
                     # 检查暂停状态
                     while self.audio_paused and not self.audio_stopped:
-                        self.root.after(100, lambda: None)
-                        time.sleep(0.1)
+                        time.sleep(0.2)
 
                     if self.audio_stopped:
                         break
@@ -1312,7 +1413,7 @@ class NovelCleanerGUI:
 
                     success, name, err = self.process_one_chapter(
                         chapter_file, output_path, api_url, voice, rate, pitch, volume,
-                        None  # 无停止事件
+                        channel_key, max_chars, None
                     )
                     if success:
                         success_count += 1
