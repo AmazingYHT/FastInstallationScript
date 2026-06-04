@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# 检查是否使用bash执行（解决Ubuntu/Debian兼容性问题）
+if [ -z "$BASH_VERSION" ]; then
+    echo "错误: 请使用bash执行此脚本，而不是sh"
+    echo "正确用法: bash installDocker.sh 或 ./installDocker.sh"
+    exit 1
+fi
+
 # 定义字体颜色
 RE='\033[1;31m' # Red color code
 GR='\033[1;32m' # Green color code
@@ -100,9 +108,10 @@ cp ./conf/docker-compose* /usr/local/bin/docker-compose && chmod 777 /usr/local/
 echo -e "${PU}######## 验证 Docker 安装结果... ########${NC}"
 if ! command -v docker &>/dev/null; then
     echo -e "${RE}❌ Docker 安装失败！${NC}"
-    exit -1
+    exit 1
 fi
-echo -e "${GR}✅ Docker 安装成功！！！${NC}"
+DOCKER_VERSION=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+echo -e "${GR}✅ Docker 安装成功！版本: ${DOCKER_VERSION}${NC}"
 
 echo -e "${PU}######## 验证 Docker Compose 安装结果... ########${NC}"
 if ! command -v docker-compose &>/dev/null; then
@@ -112,10 +121,11 @@ if ! command -v docker-compose &>/dev/null; then
     source /etc/profile
     if ! command -v docker-compose &>/dev/null; then
         echo -e "${RE}❌ Docker Compose 仍然无法找到！${NC}"
-        exit -1
+        exit 1
     fi
 fi
-echo -e "${GR}✅ Docker Compose 安装成功！！！${NC}"
+COMPOSE_VERSION=$(docker-compose --version 2>/dev/null | awk '{print $NF}' | tr -d 'v')
+echo -e "${GR}✅ Docker Compose 安装成功！版本: ${COMPOSE_VERSION}${NC}"
 
 # =============================
 # 清理临时文件
@@ -123,3 +133,15 @@ echo -e "${GR}✅ Docker Compose 安装成功！！！${NC}"
 rm -rf ./package/docker
 
 echo -e "${GR}🎉 所有操作已完成！${NC}"
+echo ""
+echo -e "${PU}######## 安装摘要 ########${NC}"
+echo -e "${GR}Docker 版本:        ${DOCKER_VERSION}${NC}"
+echo -e "${GR}Docker Compose 版本: ${COMPOSE_VERSION}${NC}"
+echo -e "${GR}数据存储路径:        ${DOCKER_DATA_ROOT}${NC}"
+echo ""
+echo -e "${SK}常用命令:${NC}"
+echo -e "  启动Docker: systemctl start docker"
+echo -e "  停止Docker: systemctl stop docker"
+echo -e "  查看状态:   systemctl status docker"
+echo -e "  查看信息:   docker info"
+echo -e "  查看版本:   docker version"

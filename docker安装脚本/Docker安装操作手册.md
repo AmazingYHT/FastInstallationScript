@@ -45,13 +45,34 @@
 
 ## 🚀 安装 Docker
 
+### 执行方式说明
+
+> ⚠️ **重要提示**：本脚本必须使用 `bash` 执行，不能使用 `sh` 执行。
+> 
+> **原因**：Ubuntu/Debian 系统的默认 `/bin/sh` 是 `dash`，对某些语法支持不完整。
+> 
+> **正确用法**：
+> ```bash
+> # 方式1：直接执行（推荐）
+> chmod +x installDocker.sh
+> ./installDocker.sh
+> 
+> # 方式2：使用bash执行
+> bash installDocker.sh
+> ```
+> 
+> **错误用法**（会导致语法错误）：
+> ```bash
+> sh installDocker.sh  # ❌ 不要用sh执行
+> ```
+
 ### 方式一：脚本自动安装（推荐）
 
 ```bash
 # 1. 赋予执行权限
 chmod +x installDocker.sh
 
-# 2. 执行安装脚本
+# 2. 执行安装脚本（使用bash）
 sudo ./installDocker.sh
 
 # 3. 输入 Docker 数据存储路径
@@ -509,6 +530,43 @@ sudo systemctl daemon-reload
 
 # 5. 重新安装
 sudo ./installDocker.sh
+```
+
+---
+
+### Q9: 使用 sh 执行脚本报错？
+
+**错误信息**：
+```
+installDocker.sh: 103: exit: Illegal number: -1
+```
+
+**原因**：
+- Ubuntu/Debian 系统的默认 `/bin/sh` 是 `dash`
+- `dash` 对 `exit -1` 这种非标准语法不支持
+- CentOS 的默认 `/bin/sh` 是 `bash`，语法更宽松
+
+**解决方案**：
+
+```bash
+# 方式1：使用bash执行（推荐）
+bash installDocker.sh
+
+# 方式2：赋予执行权限后直接运行
+chmod +x installDocker.sh
+./installDocker.sh
+
+# 方式3：使用sudo执行
+sudo bash installDocker.sh
+```
+
+**验证当前shell**：
+```bash
+# 查看当前使用的shell
+echo $SHELL
+
+# 查看/bin/sh指向的shell
+ls -la /bin/sh
 ```
 
 ---
