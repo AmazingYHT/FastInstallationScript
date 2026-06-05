@@ -25,14 +25,16 @@
 
 ### 支持的特性
 
-- **多版本支持**：MySQL 8.0.x ~ 9.0.x
+- **推荐版本**：MySQL 8.4.9 LTS（最新稳定版，支持到2032年）
+- **多版本支持**：MySQL 8.0.x ~ 8.4.x LTS
 - **多架构支持**：x86_64、ARM64
 - **双安装模式**：在线安装、离线安装
-- **镜像源选择**：官网镜像、腾讯云镜像、阿里云镜像（国内加速）
+- **二进制包安装**：无需编译，解压即用
 - **下载重试机制**：自动重试、文件完整性验证
 - **自动配置**：systemd 服务、环境变量、防火墙
 - **临时文件清理**：安装完成后自动清理临时文件
 - **远程访问**：Navicat 连接配置
+- **bash兼容性检查**：避免Ubuntu上用sh执行报错
 
 ---
 
@@ -67,14 +69,15 @@ sudo ./uninstall_mysql.sh
 ┌─────────────────────────────────────────────────────────────┐
 │              MySQL 安装向导                                  │
 ├─────────────────────────────────────────────────────────────┤
-│  ✅ 在线下载安装 - 从 MySQL 官网下载源码                     │
-│  ✅ 镜像源选择 - 官网镜像/腾讯云镜像/阿里云镜像（国内加速）  │
+│  ✅ 二进制包安装 - 从 MySQL 官网下载，无需编译               │
+│  ✅ 推荐版本 - MySQL 8.4.9 LTS（支持到2032年）               │
 │  ✅ 下载重试机制 - 自动重试、文件完整性验证                  │
-│  ✅ 离线安装 - 使用本地 tar.gz 包                            │
+│  ✅ 离线安装 - 使用本地 tar.xz 包                            │
 │  ✅ 自动配置 - systemd 服务、环境变量                        │
 │  ✅ 临时文件清理 - 安装完成后自动清理                        │
 │  ✅ 远程访问 - Navicat 连接配置                              │
 │  ✅ 防火墙配置 - 自动配置防火墙规则                          │
+│  ✅ bash兼容性 - 自动检查并提示                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -87,53 +90,30 @@ sudo ./uninstall_mysql.sh
 sudo ./install_mysql.sh
 
 # 选择菜单：
-# 1. 全新安装MySQL（在线）
-# 2. 直接初始化数据库（需要MySQL已编译安装）
-# 3. 离线安装MySQL（使用本地tar.gz包）
-# m. 选择下载镜像源（当前: 官网镜像）
+# 1. 全新安装MySQL（在线下载二进制包）
+# 2. 离线安装MySQL（使用本地tar.xz包）
+# 3. 直接初始化数据库（MySQL已安装）
+# q. 退出
 ```
 
 **安装流程**：
 
 ```
-选择镜像源 → 选择版本 → 下载源码 → 安装依赖 → 编译安装 → 初始化数据库 → 启动服务
+选择版本 → 下载二进制包 → 安装依赖 → 解压安装 → 配置环境 → 初始化数据库 → 启动服务
 ```
-
-##### 1️⃣1️⃣ 镜像源选择
-
-```bash
-# 在主菜单选择 m 进入镜像源选择
-sudo ./install_mysql.sh
-# 选择: m
-
-# 可选镜像源：
-# 1. 官网镜像 (https://dev.mysql.com)
-# 2. 腾讯云镜像 (https://mirrors.cloud.tencent.com) - 国内推荐
-# 3. 阿里云镜像 (https://mirrors.aliyun.com) - 国内推荐
-```
-
-**镜像源说明**：
-
-| 镜像源 | 地址 | 推荐场景 |
-|-------|------|---------|
-| 官网镜像 | https://dev.mysql.com | 国外服务器 |
-| 腾讯云镜像 | https://mirrors.cloud.tencent.com | 国内服务器（推荐） |
-| 阿里云镜像 | https://mirrors.aliyun.com | 国内服务器（推荐） |
-
-> 💡 **提示**：首次安装时会提示选择镜像源，也可在配置确认阶段更换镜像源。
 
 ##### 2️⃣ 离线安装模式
 
 ```bash
 # 准备离线包
-# 1. 提前下载 mysql-8.0.35.tar.gz
+# 1. 从官网下载二进制包（如 mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz）
 # 2. 上传到服务器
 
 # 运行离线安装
 sudo ./install_mysql.sh
 
-# 选择 "3. 离线安装"
-# 输入 tar.gz 包路径
+# 选择 "2. 离线安装MySQL（使用本地tar.xz包）"
+# 输入 tar.xz 包路径
 ```
 
 #### 默认配置
@@ -141,23 +121,26 @@ sudo ./install_mysql.sh
 ```
 配置项              默认值
 ─────────────────────────────────
-MySQL 版本         8.0.35
+MySQL 版本         8.4.9 LTS [推荐]
 用户/组            mysql / mysql
-安装目录           /mnt/data/mysql/mysql-8.0.35
+安装目录           /mnt/data/mysql/mysql-8.4.9
 数据目录           /mnt/data/mysql/data
 临时目录           /mnt/data/mysql/tmp
 日志目录           /mnt/data/mysql/log
 端口               3306
-密码               mysql
 Root密码           root
 ```
+
+**版本说明**：
+- MySQL 8.4 LTS：标准支持到2029年，扩展支持到2032年，生产首选
+- MySQL 8.0：2026年4月已停止维护，不推荐新装
 
 #### 常用安装示例
 
 ```bash
-# 1. 使用默认配置快速安装
+# 1. 使用默认配置快速安装（推荐）
 sudo ./install_mysql.sh
-# 选择: 1 → 1 → 1
+# 选择: 1 → 1 (MySQL 8.4.9 LTS) → 1 (默认配置)
 
 # 2. 自定义安装路径
 sudo ./install_mysql.sh
@@ -166,11 +149,11 @@ sudo ./install_mysql.sh
 
 # 3. 选择特定版本
 sudo ./install_mysql.sh
-# 选择: 2 → 查询8.0.x版本
+# 选择: 1 → 2 (MySQL 8.4.5 LTS) 或其他版本
 
 # 4. 离线安装
 sudo ./install_mysql.sh
-# 选择: 3 → 输入包路径
+# 选择: 2 → 输入 tar.xz 包路径
 ```
 
 ---
@@ -243,7 +226,7 @@ sudo ./uninstall_mysql.sh
 tar -czf mysql_data_backup.tar.gz /mnt/data/mysql/data
 
 # 3. 备份配置文件
-cp /mnt/data/mysql/mysql-8.0.35/etc/my.cnf ./my.cnf.bak
+cp /etc/my.cnf ./my.cnf.bak
 ```
 
 ---
@@ -254,28 +237,29 @@ cp /mnt/data/mysql/mysql-8.0.35/etc/my.cnf ./my.cnf.bak
 
 **解决方案**：
 
-1. **切换镜像源**（推荐国内用户）：
-   ```bash
-   sudo ./install_mysql.sh
-   # 在主菜单选择: m
-   # 选择: 2. 腾讯云镜像 或 3. 阿里云镜像
-   ```
-
-2. **使用代理**：
+1. **使用代理**：
    ```bash
    export http_proxy=http://proxy_host:port
    export https_proxy=http://proxy_host:port
    sudo ./install_mysql.sh
    ```
 
-3. **使用离线安装**：
+2. **使用离线安装**：
    ```bash
-   # 提前下载源码包
-   wget https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.35.tar.gz
+   # 提前从官网下载二进制包
+   # https://downloads.mysql.com/archives/community/
+   # 选择 MySQL 8.4.x LTS, Linux - Generic, glibc 2.28
 
    # 上传后运行离线安装
    sudo ./install_mysql.sh
-   # 选择: 3. 离线安装
+   # 选择: 2. 离线安装MySQL（使用本地tar.xz包）
+   ```
+
+3. **手动下载**：
+   ```bash
+   # 访问 MySQL 官网归档下载
+   # https://downloads.mysql.com/archives/community/
+   # 选择对应版本和架构的二进制包
    ```
 
 ---
@@ -315,8 +299,8 @@ ls -la /mnt/data/mysql/data
 cat /mnt/data/mysql/log/error.log
 
 # 5. 手动启动查看错误
-sudo -u mysql /mnt/data/mysql/mysql-8.0.35/bin/mysqld_safe \
-  --defaults-file=/mnt/data/mysql/mysql-8.0.35/etc/my.cnf &
+sudo -u mysql /mnt/data/mysql/mysql-8.4.9/bin/mysqld_safe \
+  --defaults-file=/etc/my.cnf &
 ```
 
 ---
@@ -432,7 +416,7 @@ systemctl status mysql
 
 ```bash
 # 1. 编辑配置文件
-vi /mnt/data/mysql/mysql-8.0.35/etc/my.cnf
+vi /etc/my.cnf
 
 # 2. 修改端口
 port = 3307
@@ -453,7 +437,7 @@ firewall-cmd --reload
 
 ```bash
 # 编辑配置文件
-vi /mnt/data/mysql/mysql-8.0.35/etc/my.cnf
+vi /etc/my.cnf
 
 # 根据服务器配置调整以下参数：
 [mysqld]
@@ -465,10 +449,6 @@ max_connections = 1000
 
 # 日志文件大小
 innodb_log_file_size = 256M
-
-# 查询缓存（MySQL 8.0已移除）
-# query_cache_size = 0
-# query_cache_type = 0
 ```
 
 ---
@@ -495,14 +475,12 @@ sudo rm -rf --no-preserve-root /path/to/dir
 
 ```
 /mnt/data/mysql/
-├── mysql-8.0.35/             # 安装目录
+├── mysql-8.4.9/              # 安装目录
 │   ├── bin/                  # 可执行文件
 │   ├── lib/                  # 库文件
 │   ├── share/                # 共享文件
 │   ├── include/              # 头文件
-│   ├── etc/                  # 配置文件
-│   │   └── my.cnf            # 主配置文件
-│   └── boost/                # Boost库
+│   └── support-files/        # 服务脚本
 ├── data/                     # 数据目录
 │   ├── ibdata1               # InnoDB数据文件
 │   ├── ib_logfile0           # InnoDB日志文件
@@ -517,6 +495,13 @@ sudo rm -rf --no-preserve-root /path/to/dir
 └── log/                      # 日志目录
     ├── error.log             # 错误日志
     └── slow.log              # 慢查询日志
+
+/etc/
+├── my.cnf                    # MySQL主配置文件
+├── systemd/system/
+│   └── mysql.service         # systemd服务文件
+└── init.d/
+    └── mysql                 # init.d服务脚本
 ```
 
 ### 服务管理
