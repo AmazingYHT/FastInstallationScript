@@ -2,7 +2,7 @@
 
 # MySQL 自动化安装脚本（二进制包安装方式）
 # 支持 x86_64 和 ARM64 架构
-# 兼容 CentOS 7/8/9、Ubuntu 20/22/24
+# 兼容 Ubuntu 22/24、Debian 12、CentOS Stream/Rocky/AlmaLinux 8/9；CentOS 7 需使用 glibc2.17 安装包
 
 # 检查是否使用bash执行（解决Ubuntu/Debian兼容性问题）
 if [ -z "$BASH_VERSION" ]; then
@@ -59,9 +59,9 @@ detect_system() {
     echo -e "${GREEN}检测到系统 glibc 版本: $GLIBC_VERSION${NC}"
 
     # MySQL官方二进制包glibc版本选择（依赖MySQL版本，在select_version后调用）：
-    # MySQL 8.4+: 只提供 glibc2.28（x86_64 和 aarch64）
-    # MySQL 8.0:  x86_64 提供 glibc2.17，aarch64 提供 glibc2.28
-    # glibc 向下兼容，高版本系统可以运行低版本编译的二进制包
+    # x86_64 部分版本提供 glibc2.17 包，可在 CentOS 7 运行，例如 MySQL 8.4.4
+    # 新版本如 MySQL 8.4.9 通常使用 glibc2.28 包，不适合 CentOS 7
+    # aarch64 通常使用 glibc2.28 包
     # 此处仅设置默认值，select_version 会根据实际版本更新
     GLIBC_PKG="2.17"
 }
@@ -69,10 +69,11 @@ detect_system() {
 # 根据MySQL版本和系统架构更新glibc包版本和tarball文件名
 update_tarball_name() {
     local major_minor="${MYSQL_VERSION%.*}"
-    if [[ "$major_minor" == "8.4" ]] || [[ "${MYSQL_VERSION%%.*}" -ge 9 ]]; then
-        # MySQL 8.4+ 只提供 glibc2.28
+    if [[ $ARCH_TYPE == "aarch64" ]]; then
         GLIBC_PKG="2.28"
-    elif [[ $ARCH_TYPE == "aarch64" ]]; then
+    elif [[ "$MYSQL_VERSION" == "8.4.4" ]]; then
+        GLIBC_PKG="2.17"
+    elif [[ "$major_minor" == "8.4" ]] || [[ "${MYSQL_VERSION%%.*}" -ge 9 ]]; then
         GLIBC_PKG="2.28"
     else
         GLIBC_PKG="2.17"
@@ -88,6 +89,122 @@ fi
 
 # 初始化系统检测
 detect_system
+
+# ======================== 安装前环境检测 ========================
+
+parse_tarball_glibc_pkg() {
+    local tarball_path="$1"
+    local tarball_name=$(basename "$tarball_path")
+    if [[ "$tarball_name" =~ glibc([0-9]+\.[0-9]+) ]]; then
+        GLIBC_PKG="${BASH_REMATCH[1]}"
+        TARBALL_NAME="$tarball_name"
+    else
+        update_tarball_name
+    fi
+}
+
+resolve_compatible_mysql_package() {
+    update_tarball_name
+
+    if [[ "$OFFLINE_MODE" == "1" ]]; then
+        return 0
+    fi
+
+    if [[ "$ARCH_TYPE" == "x86_64" && "$GLIBC_NUM" -lt 228 && "$GLIBC_PKG" == "2.28" ]]; then
+        local major_minor="${MYSQL_VERSION%.*}"
+        if [[ "$major_minor" == "8.4" ]]; then
+            echo -e "${YELLOW}当前系统 glibc $GLIBC_VERSION 不支持 $MYSQL_VERSION 的 glibc2.28 包${NC}"
+            echo -e "${YELLOW}已自动切换到 CentOS 7 可用的 MySQL 8.4.4 glibc2.17 x86_64 包${NC}"
+            MYSQL_VERSION="8.4.4"
+            GLIBC_PKG="2.17"
+            TARBALL_NAME="mysql-${MYSQL_VERSION}-linux-glibc${GLIBC_PKG}-${ARCH_TYPE}.tar.xz"
+            return 0
+        fi
+    fi
+
+    return 0
+}
+
+show_version_advice() {
+    echo -e "${CYAN}版本适配建议:${NC}"
+    echo "  - CentOS 7: 在线安装会自动把 8.4 glibc2.28 包切换为 8.4.4 glibc2.17 包"
+    echo "  - MySQL 8.4.9 LTS / 9.x: 通常需要 glibc >= 2.28，推荐 Ubuntu 22+/Debian 12/CentOS Stream 8+/Rocky 8+/AlmaLinux 8+"
+    echo "  - MySQL 8.0 x86_64: 可使用 glibc2.17 包，适合 CentOS 7，但 8.0 已停止维护，不推荐新生产环境使用"
+    echo "  - ARM64: 通常需要 glibc >= 2.28，不适合 CentOS 7 这类老系统"
+}
+
+pre_install_check() {
+    echo -e "${YELLOW}执行安装前环境检测...${NC}"
+
+    local os_name="未知系统"
+    local os_id="unknown"
+    local os_version="unknown"
+    if [ -f /etc/os-release ]; then
+        os_name=$(grep '^PRETTY_NAME=' /etc/os-release | cut -d'=' -f2- | tr -d '"')
+        os_id=$(grep '^ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+        os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+    fi
+
+    echo -e "${CYAN}系统: $os_name${NC}"
+    echo -e "${CYAN}架构: $ARCH_TYPE${NC}"
+    echo -e "${CYAN}glibc: $GLIBC_VERSION${NC}"
+    resolve_compatible_mysql_package
+    echo -e "${CYAN}MySQL版本: ${MYSQL_VERSION:-未知}${NC}"
+    echo -e "${CYAN}安装包: ${TARBALL_NAME:-已安装版本}${NC}"
+
+    local required_glibc_num=217
+    local required_glibc_text="2.17"
+    if [[ "$GLIBC_PKG" == "2.28" ]]; then
+        required_glibc_num=228
+        required_glibc_text="2.28"
+    fi
+
+    if [ "$GLIBC_NUM" -lt "$required_glibc_num" ]; then
+        echo -e "${RED}环境不兼容: 当前 glibc $GLIBC_VERSION，小于所选安装包要求的 glibc $required_glibc_text${NC}"
+        show_version_advice
+        return 1
+    fi
+    echo -e "${GREEN}✓ glibc 版本满足要求${NC}"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${RED}环境不兼容: 未检测到 systemctl，当前脚本依赖 systemd 管理 MySQL 服务${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ systemd 可用${NC}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ 包管理器: apt-get${NC}"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ 包管理器: dnf${NC}"
+    elif command -v yum >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ 包管理器: yum${NC}"
+    else
+        echo -e "${YELLOW}警告: 未检测到 apt-get/dnf/yum，请手动确认 libaio、numa、ncurses 兼容库已安装${NC}"
+    fi
+
+    if [[ "$os_id" =~ ^(centos|rhel|rocky|almalinux|ol|fedora)$ ]]; then
+        if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+            echo -e "${YELLOW}警告: SELinux 当前为 Enforcing，非默认目录 $MYSQL_HOME 可能导致 MySQL 启动被拦截${NC}"
+            echo -e "${YELLOW}建议测试时先执行: setenforce 0；生产环境请配置正确的 SELinux 上下文${NC}"
+        fi
+
+        local major_version="${os_version%%.*}"
+        if [[ "$os_id" == "centos" && "$major_version" == "7" && "$GLIBC_PKG" == "2.28" ]]; then
+            echo -e "${RED}CentOS 7 不支持当前 glibc2.28 安装包${NC}"
+            show_version_advice
+            return 1
+        fi
+        if [[ "$major_version" == "8" ]]; then
+            echo -e "${YELLOW}提示: RHEL/CentOS/Rocky/Alma 8 如缺少 ncurses-compat-libs，可能需要启用 powertools/PowerTools 仓库${NC}"
+        elif [[ "$major_version" == "9" ]]; then
+            echo -e "${YELLOW}提示: RHEL/CentOS/Rocky/Alma 9 如缺少 ncurses-compat-libs，可能需要启用 crb 仓库${NC}"
+        fi
+    fi
+
+    echo -e "${GREEN}安装前环境检测通过${NC}"
+    echo ""
+    return 0
+}
 
 # ======================== 版本选择 ========================
 
@@ -153,8 +270,8 @@ select_version() {
                 ;;
         esac
 
-        # 根据版本更新glibc包版本和tarball文件名
-        update_tarball_name
+        # 根据系统环境和版本更新glibc包版本和tarball文件名
+        resolve_compatible_mysql_package
         echo -e "${GREEN}已选择版本: $MYSQL_VERSION${NC}"
         echo -e "${GREEN}安装包: $TARBALL_NAME${NC}"
         echo ""
@@ -167,7 +284,9 @@ select_version() {
 confirm_configuration() {
     while true; do
         echo -e "${YELLOW}请确认MySQL安装配置:${NC}"
+        resolve_compatible_mysql_package
         echo -e "  MySQL版本:     ${GREEN}$MYSQL_VERSION${NC}"
+        echo -e "  安装包:        ${GREEN}$TARBALL_NAME${NC}"
         echo -e "  下载源:        ${GREEN}MySQL官网归档${NC}"
         echo -e "  安装目录:      ${GREEN}$MYSQL_HOME/mysql-${MYSQL_VERSION}${NC}"
         echo -e "  数据目录:      ${GREEN}$MYSQL_HOME/data${NC}"
@@ -228,7 +347,6 @@ confirm_configuration() {
     # 计算派生路径
     MYSQL_INSTALL_DIR="${MYSQL_HOME}/mysql-${MYSQL_VERSION}"
     MYSQL_DATA_DIR="${MYSQL_HOME}/data"
-    MYSQL_TMP_DIR="${MYSQL_HOME}/tmp"
     MYSQL_LOG_DIR="${MYSQL_HOME}/log"
 
     echo ""
@@ -313,14 +431,20 @@ download_binary() {
 
     cd /tmp
 
-    # MySQL二进制包仅支持官网归档下载（国内镜像站无二进制包）
-    local tarball="mysql-${MYSQL_VERSION}-linux-glibc${GLIBC_PKG}-${ARCH_TYPE}.tar.xz"
-    local download_url="https://downloads.mysql.com/archives/get/p/23/file/${tarball}"
+    # 优先使用当前版本下载地址，失败后回退到官网归档地址
+    resolve_compatible_mysql_package
+    local tarball="$TARBALL_NAME"
+    local major_minor="${MYSQL_VERSION%.*}"
+    local current_url="https://cdn.mysql.com/Downloads/MySQL-${major_minor}/${tarball}"
+    local archive_url="https://downloads.mysql.com/archives/get/p/23/file/${tarball}"
+    local download_url=""
 
-    echo -e "${CYAN}下载地址: ${download_url}${NC}"
+    echo -e "${CYAN}下载地址:${NC}"
+    echo "  1. $current_url"
+    echo "  2. $archive_url"
     echo ""
 
-    # 检查是否已有安装包
+    # 检查是否已有安装包；未下载完成的文件保留用于断点续传
     local tarball_file="/tmp/${TARBALL_NAME}"
     if [ -f "$tarball_file" ] && [ -s "$tarball_file" ]; then
         echo -e "${YELLOW}发现已有安装包，验证完整性...${NC}"
@@ -328,53 +452,55 @@ download_binary() {
             echo -e "${GREEN}现有安装包完整，跳过下载${NC}"
             return 0
         else
-            echo -e "${YELLOW}现有安装包损坏，将重新下载${NC}"
-            rm -f "$tarball_file"
+            echo -e "${YELLOW}现有安装包未完整或校验失败，将尝试断点续传${NC}"
         fi
     fi
 
     # 最大重试次数
     local max_retries=3
-    local retry_count=0
+    local urls=("$current_url" "$archive_url")
 
-    while [ $retry_count -lt $max_retries ]; do
-        if [ $retry_count -gt 0 ]; then
-            echo -e "${YELLOW}第 $retry_count 次重试...${NC}"
-        fi
+    for download_url in "${urls[@]}"; do
+        echo -e "${CYAN}正在尝试: ${download_url}${NC}"
+        local retry_count=0
 
-        if command -v wget &> /dev/null; then
-            local wget_opts="--timeout=300 --tries=1 --progress=bar:force:noscroll"
-            if [ -n "$http_proxy" ]; then
-                wget_opts="$wget_opts -e use_proxy=yes -e http_proxy=$http_proxy -e https_proxy=$https_proxy"
+        while [ $retry_count -lt $max_retries ]; do
+            if [ $retry_count -gt 0 ]; then
+                echo -e "${YELLOW}第 $retry_count 次重试...${NC}"
             fi
-            wget $wget_opts -O "$tarball_file" "$download_url"
-        elif command -v curl &> /dev/null; then
-            local curl_opts="-L --connect-timeout 30 --max-time 600 --progress-bar"
-            if [ -n "$http_proxy" ]; then
-                curl_opts="$curl_opts --proxy $http_proxy"
-            fi
-            curl $curl_opts -o "$tarball_file" "$download_url"
-        else
-            echo -e "${RED}需要安装wget或curl来下载MySQL${NC}"
-            return 1
-        fi
 
-        local result=$?
-
-        if [ $result -eq 0 ] && [ -f "$tarball_file" ] && [ -s "$tarball_file" ]; then
-            if tar -tJf "$tarball_file" > /dev/null 2>&1; then
-                echo -e "${GREEN}✓ 下载成功${NC}"
-                return 0
+            if command -v wget &> /dev/null; then
+                local wget_opts="-4 -c --timeout=60 --read-timeout=60 --tries=1 --progress=bar:force:noscroll"
+                if [ -n "$http_proxy" ]; then
+                    wget_opts="$wget_opts -e use_proxy=yes -e http_proxy=$http_proxy -e https_proxy=$https_proxy"
+                fi
+                wget $wget_opts "$download_url"
+            elif command -v curl &> /dev/null; then
+                local curl_opts="-4 -L -C - --connect-timeout 30 --max-time 0 --speed-limit 10240 --speed-time 60 --progress-bar"
+                if [ -n "$http_proxy" ]; then
+                    curl_opts="$curl_opts --proxy $http_proxy"
+                fi
+                curl $curl_opts -o "$tarball_file" "$download_url"
             else
-                echo -e "${YELLOW}文件完整性验证失败，重新下载...${NC}"
-                rm -f "$tarball_file"
+                echo -e "${RED}需要安装wget或curl来下载MySQL${NC}"
+                return 1
             fi
-        else
-            echo -e "${YELLOW}下载失败${NC}"
-            rm -f "$tarball_file"
-        fi
 
-        ((retry_count++))
+            local result=$?
+
+            if [ $result -eq 0 ] && [ -f "$tarball_file" ] && [ -s "$tarball_file" ]; then
+                if tar -tJf "$tarball_file" > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓ 下载成功${NC}"
+                    return 0
+                else
+                    echo -e "${YELLOW}文件完整性验证失败，将继续尝试断点续传${NC}"
+                fi
+            else
+                echo -e "${YELLOW}下载失败，将保留已下载部分用于断点续传${NC}"
+            fi
+
+            ((retry_count++))
+        done
     done
 
     echo ""
@@ -382,9 +508,11 @@ download_binary() {
     echo -e "${YELLOW}请手动下载以下文件并放到 /tmp/${TARBALL_NAME}${NC}"
     echo ""
     echo -e "${CYAN}手动下载地址:${NC}"
-    echo "  $download_url"
+    echo "  $current_url"
+    echo "  $archive_url"
     echo ""
     echo -e "${CYAN}也可以在浏览器打开以下页面手动选择下载:${NC}"
+    echo "  https://dev.mysql.com/downloads/mysql/"
     echo "  https://downloads.mysql.com/archives/community/"
     echo ""
     return 1
@@ -425,6 +553,9 @@ extract_and_install() {
     mkdir -p "$MYSQL_HOME"
     mv "$extract_dir" "$MYSQL_INSTALL_DIR"
 
+    chown -R $MYSQL_USER:$MYSQL_GROUP "$MYSQL_INSTALL_DIR"
+    chmod -R u+rwX,go+rX "$MYSQL_INSTALL_DIR"
+
     echo -e "${GREEN}解压安装完成${NC}"
     echo -e "${CYAN}安装目录: $MYSQL_INSTALL_DIR${NC}"
 
@@ -439,8 +570,12 @@ extract_and_install() {
 install_dependencies() {
     echo -e "${YELLOW}安装MySQL运行依赖...${NC}"
 
-    if command -v yum &> /dev/null; then
-        yum install -y libaio numactl-libs ncurses-compat-libs 2>/dev/null
+    if command -v dnf &> /dev/null; then
+        dnf install -y libaio numactl-libs ncurses-compat-libs 2>/dev/null || \
+            dnf install -y libaio numactl-libs ncurses-libs 2>/dev/null
+    elif command -v yum &> /dev/null; then
+        yum install -y libaio numactl-libs ncurses-compat-libs 2>/dev/null || \
+            yum install -y libaio numactl-libs ncurses-libs 2>/dev/null
     elif command -v apt-get &> /dev/null; then
         apt-get update -qq
         apt-get install -y libaio1 libnuma1 libncurses5 2>/dev/null
@@ -485,7 +620,7 @@ create_user_and_dirs() {
     fi
 
     # 创建目录
-    mkdir -p $MYSQL_DATA_DIR $MYSQL_TMP_DIR $MYSQL_LOG_DIR
+    mkdir -p $MYSQL_DATA_DIR $MYSQL_LOG_DIR
 
     # 授权
     chown -R $MYSQL_USER:$MYSQL_GROUP $MYSQL_HOME
@@ -532,8 +667,10 @@ user = $MYSQL_USER
 basedir = $MYSQL_INSTALL_DIR
 datadir = $MYSQL_DATA_DIR
 port = $MYSQL_PORT
-socket = $MYSQL_TMP_DIR/mysql.sock
-pid-file = $MYSQL_TMP_DIR/mysql.pid
+socket = $MYSQL_INSTALL_DIR/mysql.sock
+pid-file = $MYSQL_INSTALL_DIR/mysql.pid
+mysqlx_socket = $MYSQL_INSTALL_DIR/mysqlx.sock
+mysqlx_port = $((MYSQL_PORT + 10000))
 
 # 日志配置
 log-error = $MYSQL_LOG_DIR/error.log
@@ -565,7 +702,7 @@ sql_mode = STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_B
 
 [client]
 port = $MYSQL_PORT
-socket = $MYSQL_TMP_DIR/mysql.sock
+socket = $MYSQL_INSTALL_DIR/mysql.sock
 default-character-set = utf8mb4
 
 [mysql]
@@ -616,7 +753,9 @@ init_database() {
     fi
 
     # 安装libaio（必需依赖）
-    if command -v yum &> /dev/null; then
+    if command -v dnf &> /dev/null; then
+        dnf install -y libaio 2>/dev/null
+    elif command -v yum &> /dev/null; then
         yum install -y libaio 2>/dev/null
     elif command -v apt-get &> /dev/null; then
         apt-get install -y libaio1 2>/dev/null
@@ -654,6 +793,8 @@ create_systemd_service() {
     # 方式1: 使用support-files中的服务脚本（参考博客推荐方式）
     if [ -f "$MYSQL_INSTALL_DIR/support-files/mysql.server" ]; then
         cp $MYSQL_INSTALL_DIR/support-files/mysql.server /etc/init.d/mysql
+        sed -i "s|^basedir=.*|basedir=$MYSQL_INSTALL_DIR|" /etc/init.d/mysql
+        sed -i "s|^datadir=.*|datadir=$MYSQL_DATA_DIR|" /etc/init.d/mysql
         chmod +x /etc/init.d/mysql
 
         # 添加到系统服务
@@ -673,12 +814,10 @@ After=network.target
 
 [Service]
 Type=forking
-User=$MYSQL_USER
-Group=$MYSQL_GROUP
-PIDFile=$MYSQL_TMP_DIR/mysql.pid
-ExecStart=$MYSQL_INSTALL_DIR/support-files/mysql.server start
-ExecStop=$MYSQL_INSTALL_DIR/support-files/mysql.server stop
-ExecReload=$MYSQL_INSTALL_DIR/support-files/mysql.server restart
+PIDFile=$MYSQL_INSTALL_DIR/mysql.pid
+ExecStart=/etc/init.d/mysql start
+ExecStop=/etc/init.d/mysql stop
+ExecReload=/etc/init.d/mysql restart
 Restart=on-failure
 RestartSec=5s
 
@@ -689,11 +828,21 @@ EOF
     chmod 644 /etc/systemd/system/mysql.service
     systemctl daemon-reload
 
-    # 启动服务（优先使用service命令，兼容性更好）
-    if [ -f "/etc/init.d/mysql" ]; then
-        service mysql start
-    else
-        systemctl start mysql
+    # 确保运行时文件目录有写权限，并清理异常退出残留文件
+    chown -R $MYSQL_USER:$MYSQL_GROUP "$MYSQL_INSTALL_DIR"
+    chmod u+rwx "$MYSQL_INSTALL_DIR"
+    if [ -f "$MYSQL_INSTALL_DIR/mysql.pid" ] && ! pgrep -F "$MYSQL_INSTALL_DIR/mysql.pid" >/dev/null 2>&1; then
+        rm -f "$MYSQL_INSTALL_DIR/mysql.pid"
+    fi
+    rm -f "$MYSQL_INSTALL_DIR/mysql.sock" "$MYSQL_INSTALL_DIR/mysql.sock.lock" \
+        "$MYSQL_INSTALL_DIR/mysqlx.sock" "$MYSQL_INSTALL_DIR/mysqlx.sock.lock"
+
+    # 启动服务
+    if ! systemctl start mysql; then
+        echo -e "${RED}MySQL服务启动失败${NC}"
+        echo -e "${YELLOW}请查看日志: journalctl -u mysql -n 50 --no-pager${NC}"
+        echo -e "${YELLOW}或查看错误日志: cat $MYSQL_LOG_DIR/error.log${NC}"
+        return 1
     fi
 
     systemctl enable mysql
@@ -701,12 +850,13 @@ EOF
     # 等待服务启动
     sleep 3
 
-    if service mysql status > /dev/null 2>&1 || systemctl is-active --quiet mysql; then
+    if systemctl is-active --quiet mysql; then
         echo -e "${GREEN}MySQL服务已启动并设置为开机自启${NC}"
     else
         echo -e "${RED}MySQL服务启动失败${NC}"
-        echo -e "${YELLOW}请查看日志: journalctl -u mysql -n 20${NC}"
+        echo -e "${YELLOW}请查看日志: journalctl -u mysql -n 50 --no-pager${NC}"
         echo -e "${YELLOW}或查看错误日志: cat $MYSQL_LOG_DIR/error.log${NC}"
+        return 1
     fi
 
     # 创建mysql命令软链接（方便全局使用）
@@ -723,7 +873,7 @@ wait_for_mysql() {
     local count=0
     echo -e "${YELLOW}等待MySQL服务就绪...${NC}"
     while [ $count -lt $max_wait ]; do
-        if $MYSQL_INSTALL_DIR/bin/mysqladmin ping -u root --silent 2>/dev/null; then
+        if $MYSQL_INSTALL_DIR/bin/mysqladmin --socket="$MYSQL_INSTALL_DIR/mysql.sock" ping -u root --silent 2>/dev/null; then
             echo -e "${GREEN}MySQL已就绪${NC}"
             return 0
         fi
@@ -765,7 +915,7 @@ set_password() {
         while [ $retry -lt 3 ]; do
             $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_TEMP_PASSWORD" \
                 --connect-expired-password \
-                -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;" 2>&1
+                -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;" 2>&1
             if [ $? -eq 0 ]; then
                 password_set=true
                 echo -e "${GREEN}✓ 密码设置成功${NC}"
@@ -798,7 +948,7 @@ set_password() {
             while [ $retry -lt 3 ]; do
                 $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$temp_pass" \
                     --connect-expired-password \
-                    -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;" 2>/dev/null
+                    -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;" 2>/dev/null
                 if [ $? -eq 0 ]; then
                     password_set=true
                     echo -e "${GREEN}✓ 密码设置成功${NC}"
@@ -819,24 +969,38 @@ set_password() {
         sleep 2
 
         # 以skip-grant-tables模式启动
-        $MYSQL_INSTALL_DIR/bin/mysqld_safe --skip-grant-tables --skip-networking &
+        $MYSQL_INSTALL_DIR/bin/mysqld_safe --defaults-file=/etc/my.cnf --skip-grant-tables --skip-networking >"$MYSQL_LOG_DIR/mysql_skip_grant.log" 2>&1 &
         local safe_pid=$!
-        sleep 5
 
-        # 修改密码
-        $MYSQL_INSTALL_DIR/bin/mysql -u root << EOSQL 2>/dev/null
+        local wait_count=0
+        while [ $wait_count -lt 30 ]; do
+            if $MYSQL_INSTALL_DIR/bin/mysqladmin --socket="$MYSQL_INSTALL_DIR/mysql.sock" -u root ping --silent 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            ((wait_count++))
+        done
+
+        if [ $wait_count -lt 30 ]; then
+            # 修改密码
+            $MYSQL_INSTALL_DIR/bin/mysql --socket="$MYSQL_INSTALL_DIR/mysql.sock" -u root << EOSQL 2>/dev/null
 FLUSH PRIVILEGES;
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD';
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';
 FLUSH PRIVILEGES;
 EOSQL
-        if [ $? -eq 0 ]; then
-            password_set=true
-            echo -e "${GREEN}✓ 密码设置成功${NC}"
+            if [ $? -eq 0 ]; then
+                password_set=true
+                echo -e "${GREEN}✓ 密码设置成功${NC}"
+            fi
+        else
+            echo -e "${YELLOW}skip-grant-tables 模式启动超时，跳过自动修改密码${NC}"
+            echo -e "${YELLOW}请查看日志: $MYSQL_LOG_DIR/mysql_skip_grant.log 或 $MYSQL_LOG_DIR/error.log${NC}"
         fi
 
         # 停止安全模式的mysqld_safe
+        $MYSQL_INSTALL_DIR/bin/mysqladmin --socket="$MYSQL_INSTALL_DIR/mysql.sock" -u root shutdown 2>/dev/null
         kill $safe_pid 2>/dev/null
-        $MYSQL_INSTALL_DIR/bin/mysqladmin -u root -p"$MYSQL_ROOT_PASSWORD" shutdown 2>/dev/null
+        pkill -f "$MYSQL_INSTALL_DIR/bin/mysqld.*skip-grant-tables" 2>/dev/null
         sleep 2
 
         # 正常重启服务
@@ -851,7 +1015,7 @@ EOSQL
         echo ""
         echo -e "${CYAN}--- 方法1: 使用临时密码 ---${NC}"
         echo "  $MYSQL_INSTALL_DIR/bin/mysql -u root -p'$MYSQL_TEMP_PASSWORD' --connect-expired-password"
-        echo "  ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD';"
+        echo "  ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';"
         echo "  FLUSH PRIVILEGES;"
         echo "  EXIT;"
         echo ""
@@ -860,7 +1024,7 @@ EOSQL
         echo "  $MYSQL_INSTALL_DIR/bin/mysqld_safe --skip-grant-tables --skip-networking &"
         echo "  $MYSQL_INSTALL_DIR/bin/mysql -u root"
         echo "  FLUSH PRIVILEGES;"
-        echo "  ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD';"
+        echo "  ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';"
         echo "  EXIT;"
         echo "  $MYSQL_INSTALL_DIR/bin/mysqladmin -u root -p'$MYSQL_ROOT_PASSWORD' shutdown"
         echo "  systemctl start mysql"
@@ -871,7 +1035,7 @@ EOSQL
     # 配置远程访问
     echo -e "${YELLOW}配置远程访问...${NC}"
     $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "
-        CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASSWORD';
+        CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';
         GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
         FLUSH PRIVILEGES;
     " 2>/dev/null
@@ -1014,7 +1178,7 @@ show_installation_info() {
         echo -e "${GREEN}  ✓ 远程访问用户已配置 (root@%)${NC}"
     else
         echo -e "${YELLOW}  ⚠ 远程访问用户未配置，可能需要手动执行:${NC}"
-        echo "    mysql -u root -p -e \"CREATE USER 'root'@'%' IDENTIFIED WITH mysql_native_password BY '密码';\""
+        echo "    mysql -u root -p -e \"CREATE USER 'root'@'%' IDENTIFIED BY '密码';\""
         echo "    mysql -u root -p -e \"GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;\""
     fi
 
@@ -1087,6 +1251,7 @@ find_offline_tarball() {
                     OFFLINE_TARBALL_PATH="$input_path"
                     # 从文件名提取版本号
                     MYSQL_VERSION=$(basename "$input_path" | sed 's/mysql-//' | sed 's/-linux.*//')
+                    parse_tarball_glibc_pkg "$input_path"
                     echo -e "${GREEN}找到安装包: $OFFLINE_TARBALL_PATH${NC}"
                     echo -e "${GREEN}版本: $MYSQL_VERSION${NC}"
                     read -p "是否使用此包? [y/N]: " confirm
@@ -1118,6 +1283,7 @@ find_offline_tarball() {
                 local index=$((choice - 1))
                 OFFLINE_TARBALL_PATH="${tarballs[$index]}"
                 MYSQL_VERSION=$(basename "$OFFLINE_TARBALL_PATH" | sed 's/mysql-//' | sed 's/-linux.*//')
+                parse_tarball_glibc_pkg "$OFFLINE_TARBALL_PATH"
                 echo -e "${GREEN}已选择: $OFFLINE_TARBALL_PATH${NC}"
                 echo -e "${GREEN}版本: $MYSQL_VERSION${NC}"
                 read -p "是否使用此包? [y/N]: " confirm
@@ -1158,6 +1324,9 @@ extract_offline_tarball() {
     mkdir -p "$MYSQL_HOME"
     mv "$extract_dir" "$MYSQL_INSTALL_DIR"
 
+    chown -R $MYSQL_USER:$MYSQL_GROUP "$MYSQL_INSTALL_DIR"
+    chmod -R u+rwX,go+rX "$MYSQL_INSTALL_DIR"
+
     echo -e "${GREEN}解压安装完成${NC}"
     return 0
 }
@@ -1165,6 +1334,7 @@ extract_offline_tarball() {
 # ======================== 离线安装流程 ========================
 
 offline_install_flow() {
+    OFFLINE_MODE="1"
     echo -e "${GREEN}=====================================${NC}"
     echo -e "${GREEN}MySQL 离线安装模式${NC}"
     echo -e "${GREEN}=====================================${NC}"
@@ -1195,7 +1365,6 @@ offline_install_flow() {
     MYSQL_GROUP=$DEFAULT_MYSQL_GROUP
     MYSQL_INSTALL_DIR="${MYSQL_HOME}/mysql-${MYSQL_VERSION}"
     MYSQL_DATA_DIR="${MYSQL_HOME}/data"
-    MYSQL_TMP_DIR="${MYSQL_HOME}/tmp"
     MYSQL_LOG_DIR="${MYSQL_HOME}/log"
 
     echo ""
@@ -1210,13 +1379,14 @@ offline_install_flow() {
         return
     fi
 
+    pre_install_check || return 1
     install_dependencies
     create_user_and_dirs
     extract_offline_tarball
     configure_mysql
     setup_environment
     init_database
-    create_systemd_service
+    create_systemd_service || return 1
     set_password
     configure_firewall
     verify_installation
@@ -1257,6 +1427,7 @@ main() {
             fi
 
             # 开始安装
+            pre_install_check || exit 1
             install_dependencies
             create_user_and_dirs
 
@@ -1276,7 +1447,7 @@ main() {
             configure_mysql
             setup_environment
             init_database
-            create_systemd_service
+            create_systemd_service || exit 1
             set_password
             configure_firewall
             verify_installation
@@ -1301,7 +1472,6 @@ main() {
             MYSQL_USER="${mysql_user:-mysql}"
             MYSQL_GROUP="$MYSQL_USER"
             MYSQL_HOME=$(dirname "$MYSQL_INSTALL_DIR")
-            MYSQL_TMP_DIR="$MYSQL_HOME/tmp"
             MYSQL_LOG_DIR="$MYSQL_HOME/log"
 
             if [ ! -f "$MYSQL_INSTALL_DIR/bin/mysqld" ]; then
@@ -1309,13 +1479,17 @@ main() {
                 exit 1
             fi
 
-            mkdir -p $MYSQL_DATA_DIR $MYSQL_TMP_DIR $MYSQL_LOG_DIR
+            MYSQL_VERSION=$($MYSQL_INSTALL_DIR/bin/mysqld --version | awk '{print $3}' | cut -d- -f1)
+            update_tarball_name
+            pre_install_check || exit 1
+
+            mkdir -p $MYSQL_DATA_DIR $MYSQL_LOG_DIR
             chown -R $MYSQL_USER:$MYSQL_GROUP $MYSQL_HOME
 
             configure_mysql
             setup_environment
             init_database
-            create_systemd_service
+            create_systemd_service || exit 1
             set_password
             configure_firewall
             verify_installation
@@ -1331,6 +1505,9 @@ main() {
             ;;
     esac
 }
+
+# 执行主函数
+main "$@"
 
 # 执行主函数
 main "$@"

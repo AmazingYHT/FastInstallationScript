@@ -25,14 +25,17 @@
 
 ### 支持的特性
 
-- **推荐版本**：MySQL 8.4.9 LTS（最新稳定版，支持到2032年）
+- **推荐版本**：MySQL 8.4.9 LTS（新系统推荐，支持到2032年）
+- **兼容版本**：CentOS 7 / glibc 2.17 自动适配 MySQL 8.4.4 glibc2.17 包
 - **多版本支持**：MySQL 8.0.x ~ 8.4.x LTS
 - **多架构支持**：x86_64、ARM64
 - **双安装模式**：在线安装、离线安装
 - **二进制包安装**：无需编译，解压即用
-- **下载重试机制**：自动重试、文件完整性验证
+- **安装前环境检测**：自动检测 glibc、systemd、包管理器、SELinux 等
+- **智能包选择**：根据系统 glibc 自动选择可运行的 MySQL 二进制包
+- **下载重试机制**：IPv4 下载、断点续传、低速超时、自动重试
 - **自动配置**：systemd 服务、环境变量、防火墙
-- **临时文件清理**：安装完成后自动清理临时文件
+- **运行文件归位**：mysql.sock、mysql.pid、mysqlx.sock 位于安装目录
 - **远程访问**：Navicat 连接配置
 - **bash兼容性检查**：避免Ubuntu上用sh执行报错
 
@@ -70,11 +73,12 @@ sudo ./uninstall_mysql.sh
 │              MySQL 安装向导                                  │
 ├─────────────────────────────────────────────────────────────┤
 │  ✅ 二进制包安装 - 从 MySQL 官网下载，无需编译               │
-│  ✅ 推荐版本 - MySQL 8.4.9 LTS（支持到2032年）               │
-│  ✅ 下载重试机制 - 自动重试、文件完整性验证                  │
+│  ✅ 推荐版本 - MySQL 8.4.9 LTS（新系统推荐）                 │
+│  ✅ 兼容适配 - CentOS 7 自动使用 8.4.4 glibc2.17 包          │
+│  ✅ 环境检测 - glibc、systemd、SELinux、包管理器检测         │
+│  ✅ 下载重试机制 - IPv4、断点续传、低速超时                  │
 │  ✅ 离线安装 - 使用本地 tar.xz 包                            │
 │  ✅ 自动配置 - systemd 服务、环境变量                        │
-│  ✅ 临时文件清理 - 安装完成后自动清理                        │
 │  ✅ 远程访问 - Navicat 连接配置                              │
 │  ✅ 防火墙配置 - 自动配置防火墙规则                          │
 │  ✅ bash兼容性 - 自动检查并提示                              │
@@ -99,14 +103,16 @@ sudo ./install_mysql.sh
 **安装流程**：
 
 ```
-选择版本 → 下载二进制包 → 安装依赖 → 解压安装 → 配置环境 → 初始化数据库 → 启动服务
+选择版本 → 安装前环境检测 → 自动匹配二进制包 → 下载二进制包 → 安装依赖 → 解压安装 → 配置环境 → 初始化数据库 → 启动服务
 ```
 
 ##### 2️⃣ 离线安装模式
 
 ```bash
 # 准备离线包
-# 1. 从官网下载二进制包（如 mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz）
+# 1. 从官网下载与系统 glibc/架构匹配的二进制包
+#    新系统示例：mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz
+#    CentOS 7 示例：mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz
 # 2. 上传到服务器
 
 # 运行离线安装
@@ -121,11 +127,13 @@ sudo ./install_mysql.sh
 ```
 配置项              默认值
 ─────────────────────────────────
-MySQL 版本         8.4.9 LTS [推荐]
+MySQL 版本         8.4.9 LTS [新系统推荐]
 用户/组            mysql / mysql
 安装目录           /mnt/data/mysql/mysql-8.4.9
 数据目录           /mnt/data/mysql/data
-临时目录           /mnt/data/mysql/tmp
+Socket文件         /mnt/data/mysql/mysql-8.4.9/mysql.sock
+PID文件            /mnt/data/mysql/mysql-8.4.9/mysql.pid
+MySQL X Socket     /mnt/data/mysql/mysql-8.4.9/mysqlx.sock
 日志目录           /mnt/data/mysql/log
 端口               3306
 Root密码           root
@@ -134,6 +142,27 @@ Root密码           root
 **版本说明**：
 - MySQL 8.4 LTS：标准支持到2029年，扩展支持到2032年，生产首选
 - MySQL 8.0：2026年4月已停止维护，不推荐新装
+
+#### 安装前环境检测与版本适配
+
+脚本会在正式安装前自动检测：
+
+- 操作系统发行版与版本
+- CPU 架构：`x86_64` / `aarch64`
+- glibc 版本
+- systemd 是否可用
+- 包管理器：`apt-get` / `dnf` / `yum`
+- SELinux 状态（CentOS/RHEL/Rocky/Alma 系）
+
+二进制包选择规则：
+
+| 系统环境 | 自动选择/建议安装包 |
+|---------|--------------------|
+| Ubuntu 22/24、Debian 12、CentOS Stream 8/9、Rocky/AlmaLinux 8/9 | `mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz` |
+| CentOS 7 / glibc 2.17 / x86_64 | 自动切换为 `mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz` |
+| ARM64 / aarch64 | 通常需要 `glibc2.28` 包，不建议用于 CentOS 7 |
+
+说明：CentOS 7 不是不能安装 MySQL 8.4，而是只能安装 `glibc2.17` 编译的二进制包。在线安装时，如果系统是 glibc 2.17 且选择了需要 glibc2.28 的 8.4 版本，脚本会自动切换到 MySQL 8.4.4 glibc2.17 包。离线安装不会自动切换包，只会按你提供的文件名解析并检测兼容性。
 
 #### 常用安装示例
 
@@ -248,7 +277,8 @@ cp /etc/my.cnf ./my.cnf.bak
    ```bash
    # 提前从官网下载二进制包
    # https://downloads.mysql.com/archives/community/
-   # 选择 MySQL 8.4.x LTS, Linux - Generic, glibc 2.28
+   # 新系统选择 MySQL 8.4.9 LTS glibc2.28 包
+   # CentOS 7 选择 MySQL 8.4.4 glibc2.17 x86_64 包
 
    # 上传后运行离线安装
    sudo ./install_mysql.sh
@@ -342,10 +372,14 @@ firewall-cmd --reload
 systemctl stop mysql
 
 # 2. 以安全模式启动MySQL
-/path/to/bin/mysqld_safe --skip-grant-tables &
+/path/to/bin/mysqld_safe \
+  --defaults-file=/etc/my.cnf \
+  --skip-grant-tables \
+  --skip-networking \
+  >/mnt/data/mysql/log/mysql_skip_grant.log 2>&1 &
 
 # 3. 连接MySQL（无需密码）
-/path/to/bin/mysql -u root
+/path/to/bin/mysql --socket=/path/to/mysql.sock -u root
 
 # 4. 修改密码
 FLUSH PRIVILEGES;
@@ -359,39 +393,24 @@ systemctl restart mysql
 
 ---
 
-### Q6: 编译安装失败怎么办？
+### Q6: CentOS 7 为什么不能安装 MySQL 8.4.9？
 
-**常见原因及解决方案**：
+CentOS 7 默认 glibc 是 `2.17`，而 MySQL 8.4.9 当前二进制包通常是 `glibc2.28`，直接运行会失败。
 
-1. **缺少依赖包**：
+**解决方案**：
+
+1. **在线安装**：脚本会自动切换到 CentOS 7 可用的 MySQL 8.4.4 glibc2.17 x86_64 包。
+2. **离线安装**：请准备以下类型的包：
    ```bash
-   # CentOS/RHEL
-   yum install -y cmake gcc gcc-c++ ncurses-devel bison openssl-devel
-   
-   # Ubuntu/Debian
-   apt-get install -y build-essential cmake libncurses5-dev bison libssl-dev
+   mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz
    ```
+3. **不建议做法**：不要在 CentOS 7 上强行升级系统 glibc，容易影响系统稳定性。
 
-2. **内存不足**：
-   ```bash
-   # 减少编译并行数
-   # 在安装时选择 "单线程编译" 或 "自定义并行数"
-   ```
+可用以下命令查看当前 glibc：
 
-3. **磁盘空间不足**：
-   ```bash
-   # 检查磁盘空间
-   df -h
-   
-   # 清理不必要的文件
-   yum clean all  # CentOS/RHEL
-   apt-get clean  # Ubuntu/Debian
-   ```
-
-4. **查看编译日志**：
-   ```bash
-   cat /tmp/mysql_cmake.log
-   ```
+```bash
+ldd --version
+```
 
 ---
 
@@ -480,21 +499,19 @@ sudo rm -rf --no-preserve-root /path/to/dir
 │   ├── lib/                  # 库文件
 │   ├── share/                # 共享文件
 │   ├── include/              # 头文件
-│   └── support-files/        # 服务脚本
+│   ├── support-files/        # 服务脚本
+│   ├── mysql.sock            # MySQL Socket文件
+│   ├── mysql.pid             # MySQL PID文件
+│   └── mysqlx.sock           # MySQL X Plugin Socket文件
 ├── data/                     # 数据目录
 │   ├── ibdata1               # InnoDB数据文件
-│   ├── ib_logfile0           # InnoDB日志文件
-│   ├── ib_logfile1           # InnoDB日志文件
 │   ├── mysql/                # 系统数据库
 │   ├── performance_schema/   # 性能数据库
-│   ├── sys/                  # 系统数据库
-│   └── *.err                 # 错误日志
-├── tmp/                      # 临时目录
-│   ├── mysql.sock            # Socket文件
-│   └── mysql.pid             # PID文件
+│   └── sys/                  # 系统数据库
 └── log/                      # 日志目录
     ├── error.log             # 错误日志
-    └── slow.log              # 慢查询日志
+    ├── slow.log              # 慢查询日志
+    └── mysql_skip_grant.log  # 安全模式改密日志
 
 /etc/
 ├── my.cnf                    # MySQL主配置文件
@@ -591,21 +608,24 @@ EXIT;
 #### 新增功能
 
 - **在线安装**
-  - 支持从MySQL官网下载源码
-  - 支持腾讯云镜像和阿里云镜像（国内加速）
-  - 下载失败自动重试机制（最多3次）
-  - 下载超时时间延长至600秒
+  - 支持从 MySQL 官方 CDN 和归档地址下载二进制包
+  - 根据系统 glibc 自动选择兼容二进制包
+  - CentOS 7 / glibc 2.17 自动适配 MySQL 8.4.4 glibc2.17 x86_64 包
+  - 下载失败自动重试，支持 IPv4、断点续传、低速超时
   - 新增文件完整性验证功能
 
 - **离线安装**
-  - 支持使用本地tar.gz包安装
-  - 自动检测tar.gz包完整性
+  - 支持使用本地 tar.xz 二进制包安装
+  - 自动从文件名解析 MySQL 版本和 glibc 包类型
+  - 自动检测 tar.xz 包完整性
 
 - **安装配置**
   - 自动检测系统架构（x86_64/ARM64）
+  - 自动检测 glibc、systemd、包管理器、SELinux
   - 自动安装依赖包
   - 自动创建MySQL用户和目录
   - 支持自定义安装路径、端口、密码等
+  - mysql.sock、mysql.pid、mysqlx.sock 统一放在安装目录
   - 自动初始化数据库
   - 自动创建systemd服务
   - 自动配置环境变量
@@ -623,4 +643,5 @@ EXIT;
   - 清理临时文件
 
 - **临时文件清理**
-  - 安装完成后自动清理源码包、解压目录、配置日志等
+  - 安装完成后自动清理解压目录和临时文件
+  - 下载中的二进制包支持断点续传，失败时不会删除半包
