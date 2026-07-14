@@ -1,4 +1,4 @@
-#/bin/bash
+#!/bin/bash
 
 echo "停止所有容器服务"
 docker stop $(docker ps -a -q)

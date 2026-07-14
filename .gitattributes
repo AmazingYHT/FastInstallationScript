@@ -1,0 +1,2 @@
+*.sh text eol=lf
+docker.service text eol=lf

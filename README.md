@@ -23,12 +23,12 @@ FastInstallationScript/
 │   ├── postgresql_wal_archive_manager.sh  # WAL归档管理脚本
 │   ├── uninstall_postgresql.sh        # PostgreSQL卸载脚本
 │   └── PostgreSQL自动化脚本使用手册.md  # 使用手册
-├── redis安装脚本(未验证)/
+├── redis安装脚本/
 │   ├── install_redis.sh               # Redis安装脚本（单机/哨兵）
 │   ├── setup_redis_sentinel.sh        # Sentinel哨兵模式配置
 │   ├── uninstall_redis.sh             # Redis卸载脚本
 │   └── Redis自动化脚本使用手册.md      # 使用手册
-├── nacos系列安装脚本(未验证)/
+├── nacos系列安装脚本/
 │   ├── lib_common.sh                  # Linux 通用函数库（日志/检测/依赖/校验）
 │   ├── lib_common.bat                 # Windows 通用子程序库（架构检测/端口校验）
 │   ├── nacos/
@@ -43,7 +43,7 @@ FastInstallationScript/
 │       ├── uninstall_rnacos.sh        # rnacos卸载脚本（Linux）
 │       ├── uninstall_rnacos.bat       # rnacos卸载脚本（Windows）
 │       └── rnacos自动化脚本使用手册.md # 使用手册
-├── kafka安装脚本(未验证)/
+├── kafka安装脚本/
 │   ├── install_kafka.sh               # Kafka安装脚本（Linux，KRaft，单机/集群）
 │   ├── uninstall_kafka.sh             # Kafka卸载脚本（Linux）
 │   └── Kafka自动化脚本使用手册.md      # 使用手册
