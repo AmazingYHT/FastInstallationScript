@@ -764,6 +764,67 @@ select_version() {
     echo ""
 }
 
+# ICU 支持交互选择（PostgreSQL 16+ 默认开启 ICU，需由用户决定）
+# 说明：PG 15 及更早默认不启用 ICU；PG 16/17/18 起 configure 默认检测 ICU，
+#       若系统无 libicu 开发包会直接报错退出，必须显式 --without-icu 才能关闭。
+prompt_icu_support() {
+    # 已显式指定 ICU 相关参数则不再询问
+    if echo "$CONFIGURE_OPTIONS" | grep -q "\-\-with-icu"; then
+        echo -e "${YELLOW}已启用 ICU 支持（需确保已安装 libicu-devel/libicu-dev）${NC}"
+        return 0
+    fi
+    if echo "$CONFIGURE_OPTIONS" | grep -q "\-\-without-icu"; then
+        return 0
+    fi
+
+    # 取主版本号（如 17.9 -> 17）
+    local pg_major
+    pg_major="${PG_VERSION%%.*}"
+
+    # PG 15 及更早默认不启用 ICU，无需处理
+    if [ -z "$pg_major" ] || ! [[ "$pg_major" =~ ^[0-9]+$ ]] || [ "$pg_major" -lt 16 ]; then
+        return 0
+    fi
+
+    # 探测系统是否已存在 ICU 开发文件（pkg-config / 头文件）
+    local icu_present=false
+    if command -v pkg-config &>/dev/null && pkg-config --exists icu-uc icu-i18n 2>/dev/null; then
+        icu_present=true
+    elif ls /usr/include/unicode/ucol.h /usr/local/include/unicode/ucol.h &>/dev/null; then
+        icu_present=true
+    fi
+
+    echo ""
+    echo -e "${CYAN}检测到 PostgreSQL ${pg_major}+：ICU（国际化排序/字符集归类）默认开启。${NC}"
+    if [ "$icu_present" = true ]; then
+        echo -e "${GREEN}已检测到系统存在 libicu 开发库，可直接启用 ICU。${NC}"
+    else
+        echo -e "${YELLOW}当前未检测到 libicu 开发库（离线环境常见）。${NC}"
+        echo -e "${YELLOW}  - 启用 ICU 需先安装 libicu-devel(CentOS/RHEL) 或 libicu-dev(Ubuntu/Debian)，否则 configure 会报错。${NC}"
+    fi
+    echo "  1. 启用 ICU（保留国际化排序功能，需已安装 libicu 开发包）"
+    echo "  2. 关闭 ICU（追加 --without-icu，不影响数据库核心功能）"
+    while true; do
+        read -p "请选择是否启用 ICU [1/2，默认 2]: " icu_choice
+        icu_choice="${icu_choice:-2}"
+        case "$icu_choice" in
+            1)
+                CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-icu"
+                echo -e "${GREEN}已启用 ICU 支持。${NC}"
+                break
+                ;;
+            2)
+                CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --without-icu"
+                echo -e "${YELLOW}已追加 --without-icu，关闭 ICU 支持。${NC}"
+                break
+                ;;
+            *)
+                echo -e "${RED}无效选择，请输入 1 或 2${NC}"
+                ;;
+        esac
+    done
+}
+
 # 插件选择函数
 select_plugins() {
     # 重置UUID库选择
@@ -927,7 +988,10 @@ select_plugins() {
         echo -e "${GREEN}自定义参数: $custom_options${NC}"
         CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS $custom_options"
     fi
-    
+
+    # PostgreSQL 16+ 默认开启 ICU，交由用户决定是否启用
+    prompt_icu_support
+
     echo -e "${GREEN}最终编译配置选项: $CONFIGURE_OPTIONS${NC}"
     echo ""
     
@@ -1612,10 +1676,10 @@ install_dependencies() {
         if command -v yum &> /dev/null; then
             echo "  CentOS/RHEL:"
             echo "    - yum groupinstall \"Development Tools\""
-            echo "    - yum install readline-devel zlib-devel gcc make"
+            echo "    - yum install readline-devel zlib-devel gcc make bison flex"
         elif command -v apt-get &> /dev/null; then
             echo "  Ubuntu/Debian:"
-            echo "    - apt-get install build-essential libreadline-dev zlib1g-dev"
+            echo "    - apt-get install build-essential libreadline-dev zlib1g-dev bison flex"
         fi
         
         # 检查基础依赖是否存在
@@ -1630,10 +1694,22 @@ install_dependencies() {
         if ! command -v make &> /dev/null; then
             missing_deps="$missing_deps make"
         fi
+        # PostgreSQL 编译必需的语法分析工具（configure 缺失即报错中断）
+        if ! command -v bison &> /dev/null; then
+            missing_deps="$missing_deps bison"
+        fi
+        if ! command -v flex &> /dev/null; then
+            missing_deps="$missing_deps flex"
+        fi
         
         if [ -n "$missing_deps" ]; then
             echo -e "${RED}缺少以下基础依赖: $missing_deps${NC}"
-            echo -e "${YELLOW}请先手动安装这些依赖，或选择退出安装${NC}"
+            echo -e "${YELLOW}请先手动安装这些依赖（离线环境请用 rpm/dpkg 离线包），或选择退出安装${NC}"
+            if command -v yum &> /dev/null; then
+                echo -e "${CYAN}在线机下载离线包示例: yum install -y --downloadonly --downloaddir=./pg-deps bison flex${NC}"
+            elif command -v apt-get &> /dev/null; then
+                echo -e "${CYAN}在线机下载离线包示例: apt-get download bison flex${NC}"
+            fi
             read -p "是否继续? [y/N]: " continue_install
             if [[ ! $continue_install =~ ^[Yy]$ ]]; then
                 exit 1
@@ -1650,13 +1726,13 @@ install_dependencies() {
         # CentOS/RHEL
         yum update -y
         yum groupinstall -y "Development Tools"
-        yum install -y readline-devel zlib-devel gcc make
+        yum install -y readline-devel zlib-devel gcc make bison flex
     elif command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
         apt-get update
-        apt-get install -y build-essential libreadline-dev zlib1g-dev
+        apt-get install -y build-essential libreadline-dev zlib1g-dev bison flex
     else
-        echo -e "${RED}不支持的包管理器，请手动安装依赖: readline-devel, zlib-devel, gcc, make${NC}"
+        echo -e "${RED}不支持的包管理器，请手动安装依赖: readline-devel, zlib-devel, gcc, make, bison, flex${NC}"
         exit 1
     fi
 }
@@ -4117,6 +4193,9 @@ install_external_plugins() {
         esac
     done
 
+    # PostgreSQL 16+ 默认开启 ICU，交由用户决定是否启用
+    prompt_icu_support
+
     echo ""
     echo -e "${GREEN}将使用以下配置重新编译PostgreSQL:${NC}"
     echo "  $CONFIGURE_OPTIONS"
@@ -5072,6 +5151,9 @@ offline_install_flow() {
         # 存储选择的插件供后续使用
         SELECTED_PLUGINS="$selected_plugins"
     fi
+
+    # PostgreSQL 16+ 默认开启 ICU，交由用户决定是否启用
+    prompt_icu_support
 
     echo -e "${GREEN}最终编译配置选项: $CONFIGURE_OPTIONS${NC}"
     echo ""

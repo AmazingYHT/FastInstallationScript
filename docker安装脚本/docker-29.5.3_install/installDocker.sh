@@ -18,6 +18,58 @@ NC='\033[0m'    # Reset color to normal
 echo -e "${PU}######## 开始安装 Docker ########${NC}"
 
 # =============================
+# 环境检测：WSL2
+# =============================
+IS_WSL=0
+if grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null; then
+    IS_WSL=1
+    echo -e "${PU}检测到 WSL2 环境，将自动适配兼容配置...${NC}"
+fi
+
+# =============================
+# 自动检测并安装缺失依赖
+# =============================
+echo -e "${PU}######## 检查并安装缺失依赖 ########${NC}"
+
+# 检测包管理器并安装缺失包
+install_pkg() {
+    local pkg=$1
+    if command -v "$pkg" &>/dev/null; then
+        echo -e "${GR}$pkg 已安装，跳过${NC}"
+        return 0
+    fi
+    echo -e "${PU}正在安装 $pkg ...${NC}"
+    if command -v apt &>/dev/null; then
+        apt update -qq && apt install -y -qq "$pkg" 2>/dev/null
+    elif command -v yum &>/dev/null; then
+        yum install -y -q "$pkg" 2>/dev/null
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q "$pkg" 2>/dev/null
+    else
+        echo -e "${RE}未找到可用的包管理器，请手动安装 $pkg${NC}"
+        return 1
+    fi
+}
+
+# WSL2 环境额外依赖
+if [ "$IS_WSL" = "1" ]; then
+    echo -e "${SK}WSL2 环境，安装必要依赖...${NC}"
+    if command -v apt &>/dev/null; then
+        apt update -qq
+    fi
+    for pkg in iptables ca-certificates gnupg lsb-release; do
+        install_pkg "$pkg"
+    done
+else
+    # 普通 Linux 环境
+    for pkg in iptables ca-certificates; do
+        install_pkg "$pkg"
+    done
+fi
+
+echo -e "${GR}依赖检查完成${NC}"
+
+# =============================
 # 解压 Tar 包并授权
 # =============================
 echo '解压 tar 包并赋予权限...'
@@ -36,11 +88,16 @@ cp -r ./conf/docker.service /etc/systemd/system/ && chmod 644 /etc/systemd/syste
 # 设置 Docker 工作目录（支持自定义路径）
 # =============================
 echo -e "${PU}请输入 Docker 数据存储路径（默认为 /mnt/data/dockerWork）：${NC}"
+echo -e "${SK}（WSL2 环境建议使用 /var/lib/docker 或自定义路径）${NC}"
 read -p "> " CUSTOM_PATH
 
 # 如果未输入，则使用默认路径
 if [ -z "$CUSTOM_PATH" ]; then
-    DOCKER_DATA_ROOT="/mnt/data/dockerWork"
+    if [ "$IS_WSL" = "1" ]; then
+        DOCKER_DATA_ROOT="/var/lib/docker"
+    else
+        DOCKER_DATA_ROOT="/mnt/data/dockerWork"
+    fi
 else
     DOCKER_DATA_ROOT="$CUSTOM_PATH"
 fi
@@ -59,7 +116,45 @@ echo -e "${GR}使用的 Docker 数据根路径为：${DOCKER_DATA_ROOT}${NC}"
 echo '创建 Docker 相关目录...'
 mkdir -p /etc/docker
 
-tee /etc/docker/daemon.json <<-EOF
+# =============================
+# WSL2 环境校验：禁止使用 /mnt/ 路径（NTFS 不支持 overlay2）
+# =============================
+if [ "$IS_WSL" = "1" ]; then
+    if echo "$DOCKER_DATA_ROOT" | grep -qE '^/mnt/[a-z]/'; then
+        echo -e "${RE}错误：WSL2 环境下不能将 Docker 数据目录放在 /mnt/ (Windows NTFS) 路径下！${NC}"
+        echo -e "${SK}已自动切换为 Linux 原生分区路径: /var/lib/docker${NC}"
+        DOCKER_DATA_ROOT="/var/lib/docker"
+    fi
+fi
+
+# 创建 daemon.json
+if [ "$IS_WSL" = "1" ]; then
+    tee /etc/docker/daemon.json <<-EOF
+{
+    "data-root": "$DOCKER_DATA_ROOT",
+    "storage-driver": "overlay2",
+    "exec-opts": ["native.cgroupdriver=cgroupfs"],
+    "insecure-registries": [
+        "registry.cn-shenzhen.aliyuncs.com"
+    ],
+    "registry-mirrors": [
+        "https://docker.1panel.live",
+        "https://docker.1ms.run",
+        "https://hub-mirror.c.163.com",
+        "https://docker.m.daocloud.io",
+        "https://ghcr.io",
+        "https://mirror.baidubce.com",
+        "https://docker.nju.edu.cn",
+        "https://registry.docker-cn.com",
+        "https://dockerhub.azk8s.cn",
+        "https://docker.mirrors.ustc.edu.cn",
+        "https://reg-mirror.qiniu.com",
+        "https://mirror.ccs.tencentyun.com"
+    ]
+}
+EOF
+else
+    tee /etc/docker/daemon.json <<-EOF
 {
     "data-root": "$DOCKER_DATA_ROOT",
     "insecure-registries": [
@@ -73,18 +168,15 @@ tee /etc/docker/daemon.json <<-EOF
         "https://ghcr.io",
         "https://mirror.baidubce.com",
         "https://docker.nju.edu.cn",
-        "https://mirror.baidubce.com",
         "https://registry.docker-cn.com",
-        "http://f1361db2.m.daocloud.io",
         "https://dockerhub.azk8s.cn",
         "https://docker.mirrors.ustc.edu.cn",
-        "https://ud6340vz.mirror.aliyuncs.com",
         "https://reg-mirror.qiniu.com",
-        "https://hub-mirror.c.163.com",
         "https://mirror.ccs.tencentyun.com"
     ]
 }
 EOF
+fi
 
 # =============================
 # 启动服务并设置开机自启（自动检测 systemd 是否可用）
@@ -98,6 +190,14 @@ fi
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
     echo '重新加载 Systemd 配置并重启 Docker...'
+    # 停止可能残留的 dockerd 进程，防止干扰 systemd
+    if pgrep -x dockerd >/dev/null 2>&1; then
+        echo '检测到 dockerd 正在运行，先停止...'
+        pkill -x dockerd || true
+        sleep 2
+    fi
+    # 重置失败状态（解决 Start request repeated too quickly 问题）
+    systemctl reset-failed docker.service 2>/dev/null
     systemctl daemon-reload && systemctl restart docker
     echo '设置 Docker 开机自启动...'
     systemctl enable docker.service
@@ -132,7 +232,7 @@ docker info
 # 安装 Docker Compose
 # =============================
 echo '将 docker-compose 移到 /usr/local/bin/ 目录...'
-cp ./conf/docker-compose* /usr/local/bin/docker-compose && chmod 777 /usr/local/bin/docker-compose
+cp ./conf/docker-compose* /usr/local/bin/docker-compose && chmod 755 /usr/local/bin/docker-compose
 
 # =============================
 # 验证安装结果

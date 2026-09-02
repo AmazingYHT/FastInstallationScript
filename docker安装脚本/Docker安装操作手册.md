@@ -9,9 +9,10 @@
 1. [环境准备](#环境准备)
 2. [安装 Docker](#安装-docker)
 3. [配置说明](#配置说明)
-4. [卸载 Docker](#卸载-docker)
-5. [常用命令](#常用命令)
-6. [常见问题](#常见问题)
+4. [Docker 代理配置（docker-proxy-manager.sh）](#-docker-代理配置docker-proxy-managersh)
+5. [卸载 Docker](#卸载-docker)
+6. [常用命令](#常用命令)
+7. [常见问题](#常见问题)
 
 ---
 
@@ -203,7 +204,153 @@ sudo systemctl disable docker
 
 ---
 
-## 🗑️ 卸载 Docker
+## � Docker 代理配置（docker-proxy-manager.sh）
+
+> 在国内网络环境下，拉取 Docker Hub / gcr.io / quay.io 等海外镜像常常失败或速度极慢。
+> 本脚本支持**交互式配置代理 IP 和端口**，一键管理 Docker 守护进程（拉镜像）和 Docker 客户端（容器内/构建）的代理。
+
+### 脚本文件位置
+
+```
+docker-29.5.3_install/
+└── docker-proxy-manager.sh   # Docker 代理一键管理脚本
+```
+
+### 第一步：准备脚本
+
+将 `docker-proxy-manager.sh` 上传至 Linux 服务器任意目录（例如与 installDocker.sh 同级）。
+
+> ⚠️ **重要**：如果脚本是在 Windows 下创建/编辑的，文件会带有 Windows 风格的换行符（`\r\n`），Linux bash 会报语法错误。
+> 执行以下命令修复换行符：
+
+```bash
+sed -i 's/\r$//' docker-proxy-manager.sh
+```
+
+### 第二步：赋予执行权限
+
+```bash
+chmod +x docker-proxy-manager.sh
+```
+
+### 第三步：运行脚本（使用 bash）
+
+```bash
+bash docker-proxy-manager.sh
+```
+
+运行后会看到如下菜单：
+
+```
+=====================================
+       Docker 代理一键管理工具
+=====================================
+1. 仅开启Docker守护进程代理（拉镜像专用，不影响容器内部）
+2. 开启完整全局代理（拉镜像+容器内+构建全走代理）
+-------------------------------------
+3. 仅清理 守护进程拉镜像代理配置
+4. 清理 全部全局代理配置（守护进程+客户端）
+5. 退出脚本
+=====================================
+请输入你要执行的操作序号:
+```
+
+### 选项说明
+
+| 选项 | 名称 | 作用范围 | 典型场景 |
+|------|------|----------|----------|
+| 1 | 守护进程代理 | 仅 Docker daemon 拉镜像 | 机器本身已经能上网，只需要 `docker pull` 走代理 |
+| 2 | 完整全局代理 | 守护进程 + 容器内 + docker build | 需要在容器内 `apt-get/yum/pip/npm` 下载依赖 |
+| 3 | 清理守护进程代理 | 仅移除 daemon 代理 | 要关闭拉镜像代理但保留容器内代理 |
+| 4 | 清理全部代理 | 移除 daemon + 客户端代理 | 完全恢复默认，不留任何代理配置 |
+| 5 | 退出脚本 | - | 不执行任何操作退出 |
+
+### 交互示例（选项 2：完整全局代理）
+
+```
+请输入你要执行的操作序号: 2
+正在配置Docker完整全局代理...
+请输入代理 IP (回车默认 127.0.0.1): 192.168.1.100
+请输入代理端口 (回车默认 7890): 7891
+请输入 NO_PROXY 规则 (回车使用默认):
+ℹ️  当前代理地址：http://192.168.1.100:7891
+ℹ️  NO_PROXY 规则：localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+✅ 全局代理配置完成
+守护进程代理状态：
+Environment=HTTP_PROXY=http://192.168.1.100:7891 HTTPS_PROXY=http://192.168.1.100:7891 NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+客户端代理配置：
+{
+  "proxies": {
+    "default": {
+      "httpProxy": "http://192.168.1.100:7891",
+      "httpsProxy": "http://192.168.1.100:7891",
+      "noProxy": "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    }
+  }
+}
+```
+
+### 关键概念：什么是 NO_PROXY？
+
+NO_PROXY 是代理"白名单"——匹配到的地址**不走代理**，直接通过本地/内网连接。
+
+脚本默认值已覆盖常见内网网段：
+
+```
+localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+```
+
+**为什么必须配置 NO_PROXY？**
+
+- Docker 容器默认使用 `172.17.0.0/16`、`172.18.0.0/16` 等 B 类内网网段互相通信；如果这些地址走代理，容器互联、服务发现会直接失败。
+- 访问宿主机本地服务（localhost/127.0.0.1）不应绕代理。
+- 公司内网镜像仓库、内网 API 本就直连可达。
+
+如果你的内网还有额外网段（例如 `100.64.0.0/10` 或 `.corp.com` 域），可在交互提示时追加到默认规则后面。
+
+### 手动验证代理是否生效
+
+```bash
+# 验证守护进程代理（拉镜像代理）
+systemctl show docker --property=Environment
+# 或
+systemctl show docker | grep -i proxy
+
+# 验证客户端代理（容器内代理）
+cat ~/.docker/config.json
+
+# 实际拉一个海外镜像测试
+docker pull hello-world
+```
+
+### 常见注意事项
+
+**Q1: 代理地址填宿主机的 127.0.0.1，为什么容器里访问不到？**
+> 容器内的 `127.0.0.1` 指容器自己，不是宿主机。
+> **解决方法**：代理 IP 必须填宿主机的**真实内网 IP**（例如 `192.168.1.100`），并且代理软件需要开启"允许局域网访问"。
+> 或者 Docker Desktop / Linux 使用 `host.docker.internal`（需要 Docker 新版本支持）。
+
+**Q2: 脚本里为什么要重启 Docker？**
+> 守护进程代理是写到 `docker.service.d/http-proxy.conf` 里的 systemd Environment 变量，
+> 必须 `systemctl daemon-reload` + `systemctl restart docker` 才能生效。
+
+**Q3: 我只想临时让一次 docker build 走代理，不想改全局配置？**
+```bash
+docker build --build-arg HTTP_PROXY=http://192.168.1.100:7890 \
+             --build-arg HTTPS_PROXY=http://192.168.1.100:7890 \
+             -t myimg .
+```
+
+**Q4: 运行脚本提示 `command not found` 或语法错误？**
+> 大概率是 Windows 换行符（`\r\n`）没清理，重新执行：
+> ```bash
+> sed -i 's/\r$//' docker-proxy-manager.sh
+> bash docker-proxy-manager.sh
+> ```
+
+---
+
+## ��️ 卸载 Docker
 
 ### 方式一：脚本自动卸载（推荐）
 
