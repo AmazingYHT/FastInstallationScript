@@ -39,6 +39,9 @@ PROXY_PASS=""
 OFFLINE_MODE=""
 OFFLINE_TARBALL_PATH=""
 
+# 脚本所在目录（用户未填写路径时的默认查找目录，离线包通常与脚本放在一起）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 镜像地址配置
 PG_MIRROR=""
 MIRROR_NAME=""
@@ -764,6 +767,63 @@ select_version() {
     echo ""
 }
 
+# ICU 开发环境的“真实编译+链接”探测（可复用）
+# 仅存在头文件（如 CentOS 7 自带 unicode/*.h）不代表能链接成功，
+# 必须通过一次真实编译+链接，否则启用 ICU 后 make 阶段会报
+# undefined reference to u_xxx_* 链接错误。
+# 返回 0 = 可链接（并导出 ICU_CFLAGS/ICU_LIBS）；非 0 = 不可链接。
+icu_link_test() {
+    local cc_bin=""
+    if command -v cc &>/dev/null; then cc_bin="cc"; elif command -v gcc &>/dev/null; then cc_bin="gcc"; fi
+
+    local cflags="" libs=""
+    if command -v pkg-config &>/dev/null && pkg-config --exists icu-uc icu-i18n 2>/dev/null; then
+        cflags="$(pkg-config --cflags icu-uc icu-i18n 2>/dev/null)"
+        libs="$(pkg-config --libs icu-uc icu-i18n 2>/dev/null)"
+    fi
+
+    local test_c="/tmp/pg_icu_test.c"
+    cat > "$test_c" <<'ICU_TEST_EOF'
+#include <unicode/utypes.h>
+#include <unicode/ustring.h>
+#include <unicode/ucol.h>
+int main(void) {
+    UErrorCode st = U_ZERO_ERROR;
+    UChar s[8] = {0};
+    u_strToLower(s, 8, s, 0, NULL, &st);
+    ucol_open(NULL, &st);
+    return (int)st;
+}
+ICU_TEST_EOF
+
+    local ok=false
+    if [ -n "$cc_bin" ]; then
+        if "$cc_bin" "$test_c" $cflags $libs -o /tmp/pg_icu_test_bin 2>/dev/null; then
+            ok=true
+        elif "$cc_bin" "$test_c" -licui18n -licuuc -licudata -o /tmp/pg_icu_test_bin 2>/dev/null; then
+            # 直接链接成功，补上空的 cflags
+            cflags=""; libs="-licui18n -licuuc -licudata"
+            ok=true
+        fi
+        rm -f /tmp/pg_icu_test_bin
+    else
+        # 无编译器时退化为检查“开发库软链 + 头文件”（libicuuc.so 存在才算开发包已装）
+        if ls /usr/lib*/libicuuc.so /usr/lib*/*/libicuuc.so /usr/local/lib/libicuuc.so /usr/lib/libicuuc.so &>/dev/null \
+           && ls /usr/include/unicode/ucol.h /usr/local/include/unicode/ucol.h &>/dev/null; then
+            cflags=""; libs="-licui18n -licuuc -licudata"
+            ok=true
+        fi
+    fi
+    rm -f "$test_c"
+
+    if [ "$ok" = true ]; then
+        export ICU_CFLAGS="$cflags"
+        export ICU_LIBS="$libs"
+        return 0
+    fi
+    return 1
+}
+
 # ICU 支持交互选择（PostgreSQL 16+ 默认开启 ICU，需由用户决定）
 # 说明：PG 15 及更早默认不启用 ICU；PG 16/17/18 起 configure 默认检测 ICU，
 #       若系统无 libicu 开发包会直接报错退出，必须显式 --without-icu 才能关闭。
@@ -786,21 +846,21 @@ prompt_icu_support() {
         return 0
     fi
 
-    # 探测系统是否已存在 ICU 开发文件（pkg-config / 头文件）
+    # 通过真实编译+链接测试判断 ICU 开发环境是否可用（复用 icu_link_test）
     local icu_present=false
-    if command -v pkg-config &>/dev/null && pkg-config --exists icu-uc icu-i18n 2>/dev/null; then
-        icu_present=true
-    elif ls /usr/include/unicode/ucol.h /usr/local/include/unicode/ucol.h &>/dev/null; then
+    if icu_link_test; then
         icu_present=true
     fi
 
     echo ""
     echo -e "${CYAN}检测到 PostgreSQL ${pg_major}+：ICU（国际化排序/字符集归类）默认开启。${NC}"
     if [ "$icu_present" = true ]; then
-        echo -e "${GREEN}已检测到系统存在 libicu 开发库，可直接启用 ICU。${NC}"
+        echo -e "${GREEN}已通过编译链接测试，系统 ICU 开发环境可用，可安全启用 ICU。${NC}"
     else
-        echo -e "${YELLOW}当前未检测到 libicu 开发库（离线环境常见）。${NC}"
-        echo -e "${YELLOW}  - 启用 ICU 需先安装 libicu-devel(CentOS/RHEL) 或 libicu-dev(Ubuntu/Debian)，否则 configure 会报错。${NC}"
+        echo -e "${YELLOW}未检测到“可链接”的 libicu 开发库（离线/CentOS 7 常见：仅有头文件或缺 libicuuc.so 软链）。${NC}"
+        echo -e "${YELLOW}  - 此时若启用 ICU，configure 可能通过，但 make 阶段会报 undefined reference to u_xxx_* 链接错误。${NC}"
+        echo -e "${YELLOW}  - 确需启用请先安装完整开发包：libicu-devel(CentOS/RHEL) 或 libicu-dev(Ubuntu/Debian)。${NC}"
+        echo -e "${GREEN}  - 不影响数据库核心功能，离线环境建议直接选 2 关闭。${NC}"
     fi
     echo "  1. 启用 ICU（保留国际化排序功能，需已安装 libicu 开发包）"
     echo "  2. 关闭 ICU（追加 --without-icu，不影响数据库核心功能）"
@@ -809,6 +869,16 @@ prompt_icu_support() {
         icu_choice="${icu_choice:-2}"
         case "$icu_choice" in
             1)
+                # ICU 不可链接仍坚持启用时，二次确认，避免 make 阶段链接失败
+                if [ "$icu_present" != true ]; then
+                    echo -e "${RED}警告：系统 ICU 未通过链接测试，启用后极可能在编译阶段报 undefined reference 链接错误。${NC}"
+                    read -p "仍要强制启用 ICU 吗？建议选 n 关闭 [y/N]: " force_icu
+                    if [[ ! "$force_icu" =~ ^[Yy]$ ]]; then
+                        CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --without-icu"
+                        echo -e "${YELLOW}已改为追加 --without-icu，关闭 ICU 支持。${NC}"
+                        break
+                    fi
+                fi
                 CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-icu"
                 echo -e "${GREEN}已启用 ICU 支持。${NC}"
                 break
@@ -831,6 +901,9 @@ select_plugins() {
     UUID_LIBRARY=""
     # 重置选择的插件
     SELECTED_PLUGINS=""
+    # 重置 pgvector 标志
+    INSTALL_PGVECTOR=""
+    PGVECTOR_INSTALLED=""
     
     echo -e "${YELLOW}请选择需要编译安装的插件:${NC}"
     echo ""
@@ -848,7 +921,8 @@ select_plugins() {
     plugins[pam]="PAM认证支持"
     plugins[bonjour]="Bonjour支持"
     plugins[systemd]="systemd集成支持"
-    
+    plugins[pgvector]="pgvector向量扩展 (独立第三方扩展，编译后自动CREATE EXTENSION)"
+
     # 显示插件选项
     echo "可用插件列表:"
     echo "----------------------------------------"
@@ -857,7 +931,7 @@ select_plugins() {
     done
     echo "----------------------------------------"
     echo ""
-    
+
     echo -e "${CYAN}选择方式:${NC}"
     echo "1. 从上面的插件列表中选择"
     echo "2. 输入自定义的configure参数"
@@ -967,6 +1041,11 @@ select_plugins() {
                     ;;
                 "systemd")
                     CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-systemd"
+                    ;;
+                "pgvector")
+                    # pgvector 是独立第三方扩展，不属于 ./configure 参数，编译后单独安装
+                    INSTALL_PGVECTOR="true"
+                    echo -e "${GREEN}已选择 pgvector，将在 PostgreSQL 编译安装后单独编译该扩展${NC}"
                     ;;
                 
                 *)
@@ -1357,223 +1436,92 @@ install_plugin_dependencies() {
     echo -e "${GREEN}插件依赖安装完成!${NC}"
 }
 
-# 检查和修复ICU依赖
+# 检查和修复ICU依赖（编译前）
+# 仅当显式启用 --with-icu 时介入；用真实编译+链接测试判断 ICU 是否可用，
+# 避免“只有头文件/伪造 pkg-config”导致 configure 通过但 make 链接失败。
 fix_icu_dependencies() {
-    local icu_selected=false
-    
-    # 检查是否选择了ICU插件
-    if echo "$CONFIGURE_OPTIONS" | grep -q "\-\-with-icu"; then
-        icu_selected=true
+    # 未启用 ICU 直接通过（--without-icu 或未选择均无需处理）
+    if ! echo "$CONFIGURE_OPTIONS" | grep -q "\-\-with-icu"; then
+        return 0
     fi
-    
-    if [ "$icu_selected" = false ]; then
-        return
-    fi
-    
-    echo -e "${YELLOW}检查ICU依赖配置...${NC}"
-    
-    # 检查ICU头文件是否存在
-    local icu_header_paths=(
-        "/usr/include/unicode/ucol.h"
-        "/usr/local/include/unicode/ucol.h"
-        "/opt/homebrew/include/unicode/ucol.h"
-        "/usr/include/x86_64-linux-gnu/unicode/ucol.h"
-        "/usr/include/icu/unicode/ucol.h"
-        "/usr/local/include/icu/unicode/ucol.h"
-    )
-    
-    local icu_found=false
-    local icu_path=""
-    
-    for path in "${icu_header_paths[@]}"; do
-        if [ -f "$path" ]; then
-            icu_found=true
-            icu_path=$(dirname "$path")
-            echo -e "${GREEN}找到ICU头文件: $path${NC}"
-            break
-        fi
-    done
-    
-    if [ "$icu_found" = false ]; then
-        echo -e "${RED}未找到ICU头文件，尝试安装ICU开发包...${NC}"
-        
-        if command -v yum &> /dev/null; then
-            yum install -y libicu-devel
-            # 尝试安装EPEL源中的包
-            if ! rpm -q libicu-devel &>/dev/null; then
-                yum install -y epel-release
-                yum install -y libicu-devel
-            fi
-        elif command -v apt-get &> /dev/null; then
-            apt-get install -y libicu-dev
-        fi
-        
-        # 再次检查
-        for path in "${icu_header_paths[@]}"; do
-            if [ -f "$path" ]; then
-                icu_found=true
-                icu_path=$(dirname "$path")
-                break
-            fi
-        done
-    fi
-    
-    # 设置ICU环境变量（绕过pkg-config）
-    if [ "$icu_found" = true ]; then
-        echo -e "${GREEN}配置ICU环境变量（绕过pkg-config）...${NC}"
-        
-        # 设置ICU_CFLAGS
-        if [ -n "$icu_path" ]; then
-            icu_include_path=$(dirname "$icu_path")
-            export ICU_CFLAGS="-I$icu_include_path"
-            echo -e "${GREEN}设置ICU_CFLAGS: $ICU_CFLAGS${NC}"
-        fi
-        
-        # 设置ICU_LIBS
-        local icu_lib_paths=(
-            "/usr/lib64"
-            "/usr/lib/x86_64-linux-gnu"
-            "/usr/local/lib"
-            "/opt/homebrew/lib"
-            "/usr/lib"
-            "/usr/lib64/icu"
-            "/usr/lib/x86_64-linux-gnu/icu"
-            "/usr/local/lib/icu"
-        )
-        
-        for lib_path in "${icu_lib_paths[@]}"; do
-            # 检查静态库和动态库
-            if [ -f "$lib_path/libicuuc.a" ] || [ -f "$lib_path/libicuuc.so" ] || \
-               [ -f "$lib_path/libicui18n.a" ] || [ -f "$lib_path/libicui18n.so" ]; then
-                export ICU_LIBS="-L$lib_path -licuuc -licui18n"
-                echo -e "${GREEN}设置ICU_LIBS: $ICU_LIBS${NC}"
-                break
-            fi
-        done
-        
-        # 如果没有找到库文件，使用系统默认
-        if [ -z "$ICU_LIBS" ]; then
-            export ICU_LIBS="-licuuc -licui18n"
-            echo -e "${GREEN}使用系统默认ICU库: $ICU_LIBS${NC}"
-        fi
-        
-        # 创建临时的pkg-config文件（如果需要）
-        if command -v pkg-config &> /dev/null; then
-            local temp_pc_dir="/tmp/icu_pc_$$"
-            mkdir -p "$temp_pc_dir"
-            
-            # 创建icu-uc.pc
-            cat > "$temp_pc_dir/icu-uc.pc" << EOF
-prefix=/usr
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
 
-Name: ICU Component
-Description: International Components for Unicode
-Version: 60.0
-Requires: 
-Libs: -L\${libdir} -licuuc
-Cflags: -I\${includedir}
-EOF
-            
-            # 创建icu-i18n.pc
-            cat > "$temp_pc_dir/icu-i18n.pc" << EOF
-prefix=/usr
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
+    echo -e "${YELLOW}检查 ICU 依赖（编译链接测试）...${NC}"
 
-Name: ICU I18N
-Description: International Components for Unicode - Internationalization
-Version: 60.0
-Requires: icu-uc
-Libs: -L\${libdir} -licui18n
-Cflags: -I\${includedir}
-EOF
-            
-            export PKG_CONFIG_PATH="$temp_pc_dir:$PKG_CONFIG_PATH"
-            echo -e "${GREEN}创建临时ICU pkg-config文件${NC}"
-        fi
-    else
-        # 即使没有找到头文件，也尝试设置默认值
-        echo -e "${YELLOW}未找到ICU头文件${NC}"
-        echo -e "${RED}ICU依赖可能存在问题${NC}"
+    # 第一次链接测试
+    if icu_link_test; then
+        echo -e "${GREEN}ICU 开发环境可正常编译链接: ICU_CFLAGS='${ICU_CFLAGS}' ICU_LIBS='${ICU_LIBS}'${NC}"
+        return 0
+    fi
+
+    # 不可链接：在线环境尝试安装开发包后复测
+    echo -e "${RED}ICU 未通过链接测试（常见于离线/CentOS 7：仅有头文件或缺 libicuuc.so 开发软链）。${NC}"
+
+    local can_install=false
+    if command -v yum &>/dev/null || command -v dnf &>/dev/null || command -v apt-get &>/dev/null; then
+        can_install=true
+    fi
+
+    if [ "$can_install" = true ]; then
         echo -e "${YELLOW}请选择解决方案:${NC}"
-        echo "1. 自动安装ICU开发包"
-        echo "2. 使用默认设置继续（可能失败）"
-        echo "3. 返回插件选择"
+        echo "  1. 在线安装 ICU 开发包后重试（libicu-devel / libicu-dev）"
+        echo "  2. 关闭 ICU（追加 --without-icu，不影响数据库核心功能，离线推荐）"
+        echo "  3. 返回插件选择"
         echo ""
-        read -p "请选择 [1/2/3]: " fix_choice
-        
-        case $fix_choice in
-            "1")
-                echo -e "${YELLOW}正在安装ICU开发包...${NC}"
-                local install_success=false
-                
-                if command -v yum &> /dev/null; then
-                    echo -e "${GREEN}使用yum安装libicu-devel...${NC}"
-                    yum install -y libicu-devel
-                    if [ $? -eq 0 ]; then
-                        install_success=true
-                    fi
-                    # 如果失败，尝试启用EPEL
-                    if [ "$install_success" = false ]; then
-                        echo -e "${YELLOW}尝试启用EPEL源...${NC}"
-                        yum install -y epel-release
-                        yum install -y libicu-devel
-                        if [ $? -eq 0 ]; then
-                            install_success=true
-                        fi
-                    fi
-                elif command -v apt-get &> /dev/null; then
-                    echo -e "${GREEN}使用apt-get安装libicu-dev...${NC}"
-                    apt-get update
-                    apt-get install -y libicu-dev
-                    if [ $? -eq 0 ]; then
-                        install_success=true
-                    fi
-                else
-                    echo -e "${RED}不支持的包管理器${NC}"
+        read -p "请选择 [1/2/3，默认 2]: " fix_choice
+        fix_choice="${fix_choice:-2}"
+        case "$fix_choice" in
+            1)
+                echo -e "${YELLOW}正在安装 ICU 开发包...${NC}"
+                if command -v yum &>/dev/null; then
+                    yum install -y libicu-devel || { yum install -y epel-release && yum install -y libicu-devel; }
+                elif command -v dnf &>/dev/null; then
+                    dnf install -y libicu-devel
+                elif command -v apt-get &>/dev/null; then
+                    apt-get update && apt-get install -y libicu-dev
                 fi
-                
-                if [ "$install_success" = true ]; then
-                    echo -e "${GREEN}ICU开发包安装成功${NC}"
-                    # 重新检查头文件
-                    for path in "${icu_header_paths[@]}"; do
-                        if [ -f "$path" ]; then
-                            icu_found=true
-                            icu_path=$(dirname "$path")
-                            icu_include_path=$(dirname "$icu_path")
-                            export ICU_CFLAGS="-I$icu_include_path"
-                            break
-                        fi
-                    done
-                    
-                    export ICU_LIBS="-licuuc -licui18n"
-                    echo -e "${GREEN}ICU环境变量已设置${NC}"
-                else
-                    echo -e "${RED}ICU开发包安装失败${NC}"
+                if icu_link_test; then
+                    echo -e "${GREEN}ICU 开发包安装后链接测试通过。${NC}"
+                    return 0
+                fi
+                echo -e "${RED}安装后仍未通过链接测试。${NC}"
+                read -p "是否改为关闭 ICU（--without-icu）继续？[Y/n]: " disable_icu
+                if [[ "$disable_icu" =~ ^[Nn]$ ]]; then
                     echo -e "${YELLOW}返回插件选择...${NC}"
                     return 1
                 fi
+                CONFIGURE_OPTIONS="$(echo "$CONFIGURE_OPTIONS" | sed 's/--with-icu/--without-icu/')"
+                echo -e "${YELLOW}已改为 --without-icu，关闭 ICU。${NC}"
+                return 0
                 ;;
-            "2")
-                export ICU_CFLAGS="-I/usr/include"
-                export ICU_LIBS="-licuuc -licui18n"
-                echo -e "${YELLOW}使用默认ICU设置继续${NC}"
+            2)
+                CONFIGURE_OPTIONS="$(echo "$CONFIGURE_OPTIONS" | sed 's/--with-icu/--without-icu/')"
+                echo -e "${YELLOW}已追加 --without-icu，关闭 ICU 支持。${NC}"
+                return 0
                 ;;
-            "3")
+            3)
                 echo -e "${YELLOW}返回插件选择...${NC}"
                 return 1
                 ;;
             *)
-                echo -e "${RED}无效选择，返回插件选择...${NC}"
-                return 1
+                CONFIGURE_OPTIONS="$(echo "$CONFIGURE_OPTIONS" | sed 's/--with-icu/--without-icu/')"
+                echo -e "${YELLOW}无效选择，默认关闭 ICU（--without-icu）。${NC}"
+                return 0
                 ;;
         esac
     fi
-    
+
+    # 离线（无包管理器）：给出离线安装指引，并建议关闭 ICU
+    echo -e "${YELLOW}离线环境无法自动安装。如需 ICU，请在联网机下载后离线安装：${NC}"
+    echo "  CentOS/RHEL: yum install -y --downloadonly --downloaddir=./icu-deps libicu-devel && rpm -ivh ./icu-deps/*.rpm"
+    echo "  Ubuntu/Debian: apt-get download libicu-dev 后 dpkg -i 安装"
+    echo ""
+    read -p "是否关闭 ICU（--without-icu）继续编译？[Y/n]: " disable_icu2
+    if [[ "$disable_icu2" =~ ^[Nn]$ ]]; then
+        echo -e "${YELLOW}返回插件选择...${NC}"
+        return 1
+    fi
+    CONFIGURE_OPTIONS="$(echo "$CONFIGURE_OPTIONS" | sed 's/--with-icu/--without-icu/')"
+    echo -e "${YELLOW}已追加 --without-icu，关闭 ICU 支持。${NC}"
     return 0
 }
 
@@ -1860,20 +1808,23 @@ find_offline_tarbll() {
         echo -e "${CYAN}请输入PostgreSQL tar.gz包的路径或目录:${NC}"
         echo "  - 完整路径: /path/to/postgresql-xx.x.x.tar.gz"
         echo "  - 目录路径: /path/to/ (会自动查找目录中的tar.gz包)"
+        echo -e "  - 直接回车: 默认使用脚本所在目录 ${GREEN}$SCRIPT_DIR${NC}"
         echo "b. 返回主菜单"
         echo ""
-        read -p "请输入路径 [或输入b返回]: " input_path
-        
+        read -p "请输入路径 [回车使用脚本所在目录 / 输入b返回]: " input_path
+
+        # 未手动填写时，默认使用脚本当前所在目录（离线包通常与脚本放在一起）
+        if [ -z "$input_path" ]; then
+            input_path="$SCRIPT_DIR"
+            echo -e "${CYAN}未输入路径，使用脚本所在目录: $input_path${NC}"
+        fi
+
         case "$input_path" in
             "b"|"B")
                 return 1
                 ;;
-            "")
-                echo -e "${RED}路径不能为空${NC}"
-                continue
-                ;;
         esac
-        
+
         # 检查路径是否存在
         if [ ! -e "$input_path" ]; then
             echo -e "${RED}路径不存在: $input_path${NC}"
@@ -2185,240 +2136,86 @@ compile_install() {
     echo -e "${GREEN}执行命令: ./configure $CONFIGURE_OPTIONS${NC}"
     echo -e "${CYAN}编译命令: make -j$make_jobs && make install${NC}"
     echo ""
-    
+
+    # 若源码目录残留上次 configure 的产物（选项不同），先彻底清理避免混链
+    if [ -f Makefile ]; then
+        echo -e "${YELLOW}检测到旧的编译配置，执行 make distclean 清理残留产物...${NC}"
+        make distclean >/dev/null 2>&1 || true
+    fi
+
     ./configure $CONFIGURE_OPTIONS 2>&1 | tee /tmp/postgres_configure.log
         
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
         echo -e "${RED}配置失败，错误日志已保存到 /tmp/postgres_configure.log${NC}"
         
-        # 检查常见错误
-        if grep -q "icu-uc icu-i18n\|unicode/ucol.h\|Package requirements (icu-uc icu-i18n) were not met" /tmp/postgres_configure.log; then
-            echo -e "${RED}检测到ICU依赖问题${NC}"
-            echo -e "${YELLOW}正在尝试自动修复...${NC}"
-            
-            # 尝试多种ICU路径
-            local icu_paths=(
-                "/usr/include"
-                "/usr/local/include"
-                "/opt/homebrew/include"
-                "/usr/include/x86_64-linux-gnu"
-                "/usr/include/icu"
-                "/usr/local/include/icu"
-            )
-            
-            local icu_fixed=false
-            for icu_path in "${icu_paths[@]}"; do
-                if [ -f "$icu_path/unicode/ucol.h" ] || [ -f "$icu_path/icu/unicode/ucol.h" ]; then
-                    echo -e "${GREEN}找到ICU头文件路径: $icu_path${NC}"
-                    export ICU_CFLAGS="-I$icu_path"
-                    
-                    # 查找对应的库文件
-                    local lib_paths=(
-                        "/usr/lib64"
-                        "/usr/lib/x86_64-linux-gnu"
-                        "/usr/local/lib"
-                        "/opt/homebrew/lib"
-                        "/usr/lib64/icu"
-                        "/usr/lib/x86_64-linux-gnu/icu"
-                        "/usr/local/lib/icu"
-                        "/usr/lib"
-                    )
-                    
-                    for lib_path in "${lib_paths[@]}"; do
-                        if [ -f "$lib_path/libicuuc.so" ] || [ -f "$lib_path/libicuuc.a" ]; then
-                            export ICU_LIBS="-L$lib_path -licuuc -licui18n"
-                            echo -e "${GREEN}设置ICU库路径: $lib_path${NC}"
-                            icu_fixed=true
-                            break
-                        fi
-                    done
-                    
-                    # 如果没有找到特定的库路径，使用默认
-                    if [ "$icu_fixed" = false ]; then
-                        export ICU_LIBS="-licuuc -licui18n"
-                        echo -e "${GREEN}使用默认ICU库${NC}"
-                        icu_fixed=true
-                    fi
-                    break
-                fi
-            done
-            
-            # 创建临时pkg-config文件作为最后的手段
-            if [ "$icu_fixed" = false ]; then
-                echo -e "${YELLOW}尝试创建临时pkg-config文件...${NC}"
-                local temp_pc_dir="/tmp/icu_pc_$$"
-                mkdir -p "$temp_pc_dir"
-                
-                # 查找ICU版本
-                local icu_version="60.0"
-                if command -v icu-config &> /dev/null; then
-                    icu_version=$(icu-config --version 2>/dev/null || echo "60.0")
-                fi
-                
-                # 创建icu-uc.pc
-                cat > "$temp_pc_dir/icu-uc.pc" << EOF
-prefix=/usr
-exec_prefix=\${prefix}
-libdir=/usr/lib
-includedir=/usr/include
+        # 检查常见错误：ICU 相关
+        if grep -q "icu-uc icu-i18n\|unicode/ucol.h\|ICU library not found\|Package requirements (icu-uc icu-i18n) were not met" /tmp/postgres_configure.log; then
+            echo -e "${RED}检测到 ICU 依赖问题。${NC}"
 
-Name: ICU Component
-Description: International Components for Unicode
-Version: $icu_version
-Requires: 
-Libs: -L\${libdir} -licuuc
-Cflags: -I\${includedir}
-EOF
-                
-                # 创建icu-i18n.pc
-                cat > "$temp_pc_dir/icu-i18n.pc" << EOF
-prefix=/usr
-exec_prefix=\${prefix}
-libdir=/usr/lib
-includedir=/usr/include
-
-Name: ICU I18N
-Description: International Components for Unicode - Internationalization
-Version: $icu_version
-Requires: icu-uc
-Libs: -L\${libdir} -licui18n
-Cflags: -I\${includedir}
-EOF
-                
-                export PKG_CONFIG_PATH="$temp_pc_dir:$PKG_CONFIG_PATH"
-                export ICU_CFLAGS="-I/usr/include"
-                export ICU_LIBS="-licuuc -licui18n"
-                icu_fixed=true
-                echo -e "${GREEN}创建临时ICU pkg-config文件${NC}"
-            fi
-            
-            if [ "$icu_fixed" = true ]; then
-                echo -e "${GREEN}ICU环境变量已设置:${NC}"
-                echo "ICU_CFLAGS=$ICU_CFLAGS"
-                echo "ICU_LIBS=$ICU_LIBS"
-                echo ""
-                echo -e "${YELLOW}重新配置...${NC}"
+            # 用真实编译+链接测试判断（而不是只看头文件/伪造 pkg-config）
+            if icu_link_test; then
+                echo -e "${GREEN}ICU 链接测试通过: ICU_CFLAGS='${ICU_CFLAGS}' ICU_LIBS='${ICU_LIBS}'，重新配置...${NC}"
                 ./configure $CONFIGURE_OPTIONS
-                if [ $? -ne 0 ]; then
-                    echo -e "${RED}自动修复失败${NC}"
-                    echo -e "${YELLOW}请尝试以下方法:${NC}"
-                    echo "1. 手动安装ICU开发包:"
-                    echo "   - CentOS/RHEL: yum install libicu-devel"
-                    echo "   - Ubuntu/Debian: apt-get install libicu-dev"
-                    echo ""
-                    echo "2. 或者重新选择插件，不包含ICU"
-                    echo ""
-                    read -p "请选择 [1/2]: " fix_choice
-                    
-                    case $fix_choice in
-                        "1")
-                            echo -e "${YELLOW}正在安装ICU开发包...${NC}"
-                            local install_success=false
-                            
-                            if command -v yum &> /dev/null; then
-                                echo -e "${GREEN}使用yum安装libicu-devel...${NC}"
-                                yum install -y libicu-devel
-                                if [ $? -eq 0 ]; then
-                                    install_success=true
-                                fi
-                                # 如果失败，尝试启用EPEL
-                                if [ "$install_success" = false ]; then
-                                    echo -e "${YELLOW}尝试启用EPEL源...${NC}"
-                                    yum install -y epel-release
-                                    yum install -y libicu-devel
-                                    if [ $? -eq 0 ]; then
-                                        install_success=true
-                                    fi
-                                fi
-                            elif command -v apt-get &> /dev/null; then
-                                echo -e "${GREEN}使用apt-get安装libicu-dev...${NC}"
-                                apt-get update
-                                apt-get install -y libicu-dev
-                                if [ $? -eq 0 ]; then
-                                    install_success=true
-                                fi
-                            else
-                                echo -e "${RED}不支持的包管理器${NC}"
-                            fi
-                            
-                            if [ "$install_success" = true ]; then
-                                echo -e "${GREEN}ICU开发包安装成功${NC}"
-                                # 重新设置环境变量
-                                echo -e "${YELLOW}重新配置ICU环境变量...${NC}"
-                                
-                                # 再次查找ICU路径
-                                local icu_paths=(
-                                    "/usr/include"
-                                    "/usr/local/include"
-                                    "/opt/homebrew/include"
-                                    "/usr/include/x86_64-linux-gnu"
-                                    "/usr/include/icu"
-                                    "/usr/local/include/icu"
-                                )
-                                
-                                for icu_path in "${icu_paths[@]}"; do
-                                    if [ -f "$icu_path/unicode/ucol.h" ] || [ -f "$icu_path/icu/unicode/ucol.h" ]; then
-                                        export ICU_CFLAGS="-I$icu_path"
-                                        echo -e "${GREEN}设置ICU_CFLAGS: $ICU_CFLAGS${NC}"
-                                        break
-                                    fi
-                                done
-                                
-                                export ICU_LIBS="-licuuc -licui18n"
-                                echo -e "${GREEN}设置ICU_LIBS: $ICU_LIBS${NC}"
-                                
-                                echo -e "${YELLOW}重新运行configure...${NC}"
-                                ./configure $CONFIGURE_OPTIONS
-                                if [ $? -ne 0 ]; then
-                                    echo -e "${RED}安装ICU后仍然失败${NC}"
-                                    echo -e "${YELLOW}请检查错误日志: /tmp/postgres_configure.log${NC}"
-                                    return 1
-                                else
-                                    echo -e "${GREEN}ICU问题已解决!${NC}"
-                                fi
-                            else
-                                echo -e "${RED}ICU开发包安装失败${NC}"
-                                echo -e "${YELLOW}请手动安装后重试${NC}"
-                                return 1
-                            fi
-                            ;;
-                        "2")
-                            echo -e "${YELLOW}返回插件选择...${NC}"
-                            return 1
-                            ;;
-                        *)
-                            echo -e "${RED}无效选择，返回插件选择...${NC}"
-                            return 1
-                            ;;
-                    esac
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}ICU 问题已解决!${NC}"
                 else
-                    echo -e "${GREEN}ICU问题已修复!${NC}"
-                fi
-            else
-                echo -e "${RED}自动修复失败${NC}"
-                echo -e "${YELLOW}请尝试以下方法:${NC}"
-                echo "1. 安装ICU开发包:"
-                echo "   - CentOS/RHEL: yum install libicu-devel"
-                echo "   - Ubuntu/Debian: apt-get install libicu-dev"
-                echo ""
-                echo "2. 手动设置环境变量:"
-                echo "   export ICU_CFLAGS='-I/usr/include'"
-                echo "   export ICU_LIBS='-licuuc -licui18n'"
-                echo ""
-                echo "3. 或者重新选择插件，不包含ICU"
-                echo ""
-                read -p "是否继续安装? [y/N]: " continue_install
-                if [[ ! $continue_install =~ ^[Yy]$ ]]; then
-                    echo -e "${YELLOW}返回插件选择...${NC}"
+                    echo -e "${RED}设置 ICU 环境变量后仍配置失败，请查看 /tmp/postgres_configure.log${NC}"
                     return 1
                 fi
+            else
+                echo -e "${YELLOW}ICU 未通过链接测试（离线/CentOS 7 常见：仅有头文件或缺 libicuuc.so 开发软链）。${NC}"
+                echo -e "${YELLOW}请选择解决方案:${NC}"
+                echo "  1. 在线安装 ICU 开发包后重试（libicu-devel / libicu-dev）"
+                echo "  2. 关闭 ICU（--without-icu，不影响数据库核心功能，离线推荐）"
+                echo "  3. 终止并返回插件选择"
+                echo ""
+                read -p "请选择 [1/2/3，默认 2]: " icu_fail_choice
+                icu_fail_choice="${icu_fail_choice:-2}"
+                case "$icu_fail_choice" in
+                    1)
+                        echo -e "${YELLOW}正在安装 ICU 开发包...${NC}"
+                        if command -v yum &>/dev/null; then
+                            yum install -y libicu-devel || { yum install -y epel-release && yum install -y libicu-devel; }
+                        elif command -v dnf &>/dev/null; then
+                            dnf install -y libicu-devel
+                        elif command -v apt-get &>/dev/null; then
+                            apt-get update && apt-get install -y libicu-dev
+                        else
+                            echo -e "${RED}不支持的包管理器（离线环境无法在线安装）。${NC}"
+                        fi
+                        if icu_link_test; then
+                            echo -e "${GREEN}ICU 开发包安装后链接测试通过，重新配置...${NC}"
+                            ./configure $CONFIGURE_OPTIONS
+                            [ $? -eq 0 ] && echo -e "${GREEN}ICU 问题已解决!${NC}" || { echo -e "${RED}仍然失败，请查看 /tmp/postgres_configure.log${NC}"; return 1; }
+                        else
+                            echo -e "${RED}安装后仍未通过链接测试。${NC}"
+                            read -p "是否改为关闭 ICU（--without-icu）继续？[Y/n]: " d1
+                            if [[ "$d1" =~ ^[Nn]$ ]]; then return 1; fi
+                            CONFIGURE_OPTIONS="$(echo "$CONFIGURE_OPTIONS" | sed 's/--with-icu/--without-icu/')"
+                            echo -e "${YELLOW}已改为 --without-icu，重新配置...${NC}"
+                            ./configure $CONFIGURE_OPTIONS
+                            [ $? -eq 0 ] && echo -e "${GREEN}已关闭 ICU 并配置成功。${NC}" || { echo -e "${RED}配置失败，请查看 /tmp/postgres_configure.log${NC}"; return 1; }
+                        fi
+                        ;;
+                    2)
+                        CONFIGURE_OPTIONS="$(echo "$CONFIGURE_OPTIONS" | sed 's/--with-icu/--without-icu/')"
+                        echo -e "${YELLOW}已改为 --without-icu，重新配置...${NC}"
+                        ./configure $CONFIGURE_OPTIONS
+                        [ $? -eq 0 ] && echo -e "${GREEN}已关闭 ICU 并配置成功。${NC}" || { echo -e "${RED}配置失败，请查看 /tmp/postgres_configure.log${NC}"; return 1; }
+                        ;;
+                    3|*)
+                        echo -e "${YELLOW}返回插件选择...${NC}"
+                        return 1
+                        ;;
+                esac
             fi
         else
             echo -e "${YELLOW}请检查错误日志并安装相应的依赖包${NC}"
             echo -e "${YELLOW}错误日志: /tmp/postgres_configure.log${NC}"
             return 1
         fi
-                fi    
+    fi
+
     echo -e "${YELLOW}开始编译...${NC}"
     make
     
@@ -2589,6 +2386,15 @@ EOF
         cd ..
     else
         echo -e "${YELLOW}未找到contrib目录，跳过contrib模块编译${NC}"
+    fi
+
+    # 编译安装 pgvector 扩展（独立第三方扩展，需在主程序 make install 之后）
+    if [ "$INSTALL_PGVECTOR" = "true" ]; then
+        if install_pgvector; then
+            PGVECTOR_INSTALLED="true"
+        else
+            echo -e "${YELLOW}pgvector 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
     fi
 
     # 显示编译统计
@@ -3772,11 +3578,13 @@ check_plugin_dependencies() {
                 fi
                 ;;
             "icu")
-                if pkg-config --exists icu-uc 2>/dev/null || pkg-config --exists icu-i18n 2>/dev/null || [ -f "/usr/include/unicode/ucol.h" ]; then
-                    echo -e "${GREEN}✓ icu 依赖已安装${NC}"
+                # 用真实编译+链接测试判断（仅有头文件不算可用，避免 CentOS 7 误报）
+                if icu_link_test; then
+                    echo -e "${GREEN}✓ icu 依赖已安装（编译+链接测试通过）${NC}"
                 else
-                    echo -e "${YELLOW}✗ icu 依赖缺失${NC}"
+                    echo -e "${YELLOW}✗ icu 依赖缺失或不可链接（可能仅有头文件、缺少 libicuuc.so 开发软链）${NC}"
                     install_package "libicu-devel" "libicu-dev" "icu"
+                    icu_link_test
                 fi
                 ;;
             "ldap")
@@ -3810,6 +3618,10 @@ check_plugin_dependencies() {
                     echo -e "${YELLOW}✗ systemd 依赖缺失${NC}"
                     install_package "systemd-devel" "libsystemd-dev" "systemd"
                 fi
+                ;;
+            "pgvector")
+                # pgvector 是独立第三方扩展，无 ./configure 依赖，编译时仅需 gcc/make 与 pg_config
+                echo -e "${GREEN}✓ pgvector 为独立扩展，将使用 pg_config 单独编译安装${NC}"
                 ;;
             *)
                 echo -e "${YELLOW}⚠ 未知插件 '$plugin'，跳过依赖检查${NC}"
@@ -4069,6 +3881,7 @@ install_external_plugins() {
     echo "pam - PAM认证支持"
     echo "bonjour - Bonjour支持"
     echo "systemd - systemd集成支持"
+    echo "pgvector - pgvector向量扩展（独立扩展，用pg_config单独编译，无需重编PostgreSQL）"
     echo "----------------------------------------"
     echo ""
 
@@ -4084,6 +3897,18 @@ install_external_plugins() {
     echo -e "${CYAN}选择的插件: $selected_plugins${NC}"
     echo ""
 
+    # pgvector 是独立第三方扩展，不走 ./configure，单独用 pg_config 编译安装
+    local want_pgvector=false
+    local recompile_plugins=""
+    for plugin in $selected_plugins; do
+        if [ "$plugin" = "pgvector" ]; then
+            want_pgvector=true
+        else
+            recompile_plugins="$recompile_plugins $plugin"
+        fi
+    done
+    recompile_plugins="$(echo "$recompile_plugins" | xargs)"
+
     # 检查插件依赖
     if ! check_plugin_dependencies "$selected_plugins"; then
         echo -e "${YELLOW}已取消插件安装${NC}"
@@ -4091,9 +3916,26 @@ install_external_plugins() {
     fi
 
     echo ""
-    # 生成configure选项
+
+    # 仅选了 pgvector：无需重编 PostgreSQL，直接编译安装 pgvector
+    if [ "$want_pgvector" = true ] && [ -z "$recompile_plugins" ]; then
+        echo -e "${YELLOW}仅选择了 pgvector，PostgreSQL 无需重新配置/编译，直接安装 pgvector 扩展...${NC}"
+        if install_pgvector; then
+            enable_pgvector_extension
+        else
+            echo -e "${YELLOW}pgvector 安装未完成（PostgreSQL 主程序不受影响）${NC}"
+            cd - > /dev/null 2>&1
+            return 1
+        fi
+        rm -rf "/tmp/pgvector_build"
+        echo -e "${GREEN}✓ 已清理 pgvector 临时构建目录 /tmp/pgvector_build${NC}"
+        cd - > /dev/null 2>&1
+        return 0
+    fi
+
+    # 生成configure选项（pgvector 不在此列，它单独编译）
     CONFIGURE_OPTIONS="--prefix=$PG_INSTALL_DIR"
-    for plugin in $selected_plugins; do
+    for plugin in $recompile_plugins; do
         case $plugin in
             "openssl")
                 CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-openssl"
@@ -4301,6 +4143,15 @@ install_external_plugins() {
         echo -e "${YELLOW}⚠ 未找到contrib目录，跳过contrib模块编译${NC}"
     fi
 
+    # 同时选择了 pgvector：PostgreSQL 重编译安装完成后，单独编译安装 pgvector
+    if [ "$want_pgvector" = true ]; then
+        if install_pgvector; then
+            enable_pgvector_extension
+        else
+            echo -e "${YELLOW}pgvector 安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
     cd - > /dev/null
 
     echo -e "${GREEN}外部插件安装完成!${NC}"
@@ -4412,6 +4263,12 @@ install_external_plugins() {
                 fi
             fi
         fi
+    fi
+
+    # 清理 pgvector 编译构建临时目录（本向导不经过完整安装流程的 cleanup_temp_files）
+    if [ "$want_pgvector" = true ] && [ -d "/tmp/pgvector_build" ]; then
+        rm -rf "/tmp/pgvector_build"
+        echo -e "${GREEN}✓ 已清理 pgvector 临时构建目录 /tmp/pgvector_build${NC}"
     fi
 
     # 提示如何使用安装的插件和扩展
@@ -4730,6 +4587,194 @@ install_contrib_modules() {
     return 0
 }
 
+# 安装 pgvector 向量扩展（独立第三方扩展，非 ./configure 插件）
+# 说明：pgvector 不在 PostgreSQL 源码树内，需单独获取源码，
+#       使用已安装的 pg_config 执行 make && make install。
+install_pgvector() {
+    echo ""
+    echo -e "${YELLOW}========== 安装 pgvector 向量扩展 ==========${NC}"
+
+    # 前置检查：需要已安装的 pg_config（PostgreSQL 必须先编译安装完成）
+    if [ ! -x "$PG_INSTALL_DIR/bin/pg_config" ]; then
+        echo -e "${RED}未找到 pg_config：$PG_INSTALL_DIR/bin/pg_config${NC}"
+        echo -e "${YELLOW}pgvector 需在 PostgreSQL 主程序编译安装完成后再安装${NC}"
+        return 1
+    fi
+
+    local pgvector_version="${PGVECTOR_VERSION:-0.8.6}"
+    local work_dir="/tmp/pgvector_build"
+    local src_dir=""
+    local search_roots=("$SCRIPT_DIR" "/tmp" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD" "$work_dir")
+
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    # 步骤1：定位已解压的 pgvector 源码（源码根目录含 vector.control）
+    local root hit
+    for root in "${search_roots[@]}"; do
+        [ -d "$root" ] || continue
+        hit=$(find "$root" -maxdepth 3 -type f -name "vector.control" 2>/dev/null | head -n1)
+        if [ -n "$hit" ]; then
+            src_dir=$(dirname "$hit")
+            echo -e "${GREEN}找到已解压的 pgvector 源码: $src_dir${NC}"
+            break
+        fi
+    done
+
+    # 步骤2：定位本地压缩包（pgvector-*.tar.gz 或 v*.tar.gz）并解压
+    local archive=""
+    if [ -z "$src_dir" ]; then
+        for root in "${search_roots[@]}"; do
+            [ -d "$root" ] || continue
+            archive=$(find "$root" -maxdepth 2 -type f \( -name "pgvector-*.tar.gz" -o -name "v[0-9]*.tar.gz" \) 2>/dev/null | head -n1)
+            if [ -n "$archive" ]; then
+                echo -e "${GREEN}找到 pgvector 压缩包: $archive${NC}"
+                break
+            fi
+        done
+
+        if [ -n "$archive" ]; then
+            if ! tar -zxf "$archive" -C "$work_dir"; then
+                echo -e "${RED}解压失败: $archive${NC}"
+                return 1
+            fi
+            hit=$(find "$work_dir" -maxdepth 2 -type f -name "vector.control" 2>/dev/null | head -n1)
+            if [ -z "$hit" ]; then
+                echo -e "${RED}压缩包中未找到 pgvector 源码（缺少 vector.control）${NC}"
+                return 1
+            fi
+            src_dir=$(dirname "$hit")
+        fi
+    fi
+
+    # 步骤3：仍无源码时，在线下载（离线模式直接提示并跳过）
+    if [ -z "$src_dir" ]; then
+        if [ "$OFFLINE_MODE" = "true" ]; then
+            echo -e "${RED}离线模式下未找到 pgvector 源码包${NC}"
+            echo -e "${YELLOW}请在联网机下载源码，并与 PostgreSQL tar 包放在同一目录后重试：${NC}"
+            echo "  wget https://github.com/pgvector/pgvector/archive/refs/tags/v${pgvector_version}.tar.gz -O pgvector-${pgvector_version}.tar.gz"
+            echo -e "${YELLOW}也可解压后把源码目录（含 Makefile 与 vector.control）放到 /tmp 或离线包同级目录${NC}"
+            echo -e "${YELLOW}本次跳过 pgvector 安装，不影响 PostgreSQL 主程序${NC}"
+            return 1
+        fi
+
+        local url="https://github.com/pgvector/pgvector/archive/refs/tags/v${pgvector_version}.tar.gz"
+        echo -e "${CYAN}未找到本地源码，尝试在线下载 pgvector v${pgvector_version} ...${NC}"
+        echo -e "${CYAN}下载地址: $url${NC}"
+        local dl_ok=0
+        if command -v wget &>/dev/null; then
+            wget --timeout=300 --tries=2 -O "$work_dir/pgvector.tar.gz" "$url" && dl_ok=1
+        elif command -v curl &>/dev/null; then
+            curl -L --connect-timeout 30 --max-time 600 -f -o "$work_dir/pgvector.tar.gz" "$url" && dl_ok=1
+        else
+            echo -e "${RED}需要 wget 或 curl 以下载 pgvector${NC}"
+        fi
+
+        if [ "$dl_ok" != "1" ] || [ ! -s "$work_dir/pgvector.tar.gz" ]; then
+            echo -e "${RED}pgvector 下载失败${NC}"
+            echo -e "${YELLOW}可手动下载后放到 /tmp 或离线包同级目录：${NC}"
+            echo "  $url"
+            echo -e "${YELLOW}本次跳过 pgvector 安装，不影响 PostgreSQL 主程序${NC}"
+            return 1
+        fi
+
+        if ! tar -zxf "$work_dir/pgvector.tar.gz" -C "$work_dir"; then
+            echo -e "${RED}解压下载的 pgvector 失败${NC}"
+            return 1
+        fi
+        hit=$(find "$work_dir" -maxdepth 2 -type f -name "vector.control" 2>/dev/null | head -n1)
+        if [ -z "$hit" ]; then
+            echo -e "${RED}下载内容中未找到 pgvector 源码${NC}"
+            return 1
+        fi
+        src_dir=$(dirname "$hit")
+    fi
+
+    echo -e "${GREEN}使用 pgvector 源码目录: $src_dir${NC}"
+
+    # 步骤4：编译并安装（显式指定 PostgreSQL 的 pg_config）
+    cd "$src_dir" || return 1
+    local pg_config="$PG_INSTALL_DIR/bin/pg_config"
+    local jobs=$(nproc 2>/dev/null || echo "1")
+
+    echo -e "${CYAN}执行: make PG_CONFIG=$pg_config -j$jobs${NC}"
+    if ! make PG_CONFIG="$pg_config" -j"$jobs"; then
+        echo -e "${RED}pgvector 编译失败${NC}"
+        echo -e "${YELLOW}请确认已安装 gcc、make，且 PostgreSQL 开发文件可用（pg_config 正常）${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}执行: make install PG_CONFIG=$pg_config${NC}"
+    if ! make install PG_CONFIG="$pg_config"; then
+        echo -e "${RED}pgvector 安装失败（make install）${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✓ pgvector 扩展文件已安装到 PostgreSQL 目录${NC}"
+    echo -e "${YELLOW}数据库服务就绪后需执行 CREATE EXTENSION vector;（脚本稍后会自动尝试）${NC}"
+    return 0
+}
+
+# 在 postgres 数据库中创建 pgvector 扩展（服务启动后调用）
+enable_pgvector_extension() {
+    echo ""
+    echo -e "${YELLOW}在数据库中启用 pgvector 扩展（CREATE EXTENSION vector）...${NC}"
+
+    local psql_bin="$PG_INSTALL_DIR/bin/psql"
+    [ -x "$psql_bin" ] || psql_bin="psql"
+    local pg_isready_bin="$PG_INSTALL_DIR/bin/pg_isready"
+    [ -x "$pg_isready_bin" ] || pg_isready_bin="pg_isready"
+    local sql="CREATE EXTENSION IF NOT EXISTS vector;"
+    local ok=false
+
+    # 以数据库属主用户本地连接执行
+    _pgvector_run_sql() {
+        if [ "$EUID" -eq 0 ]; then
+            sudo -u "$PG_USER" "$psql_bin" -d postgres -c "$sql" 2>/dev/null && return 0
+            su - "$PG_USER" -c "\"$psql_bin\" -d postgres -c \"$sql\"" 2>/dev/null && return 0
+        fi
+        "$psql_bin" -U "$PG_USER" -d postgres -c "$sql" 2>/dev/null && return 0
+        return 1
+    }
+
+    # 先快速探测数据库是否在运行（未启动则不做无意义的重试等待）
+    local server_up=false
+    if [ -x "$PG_INSTALL_DIR/bin/pg_isready" ] || command -v pg_isready &>/dev/null; then
+        "$pg_isready_bin" -q 2>/dev/null && server_up=true
+    else
+        # 无 pg_isready 时用一次连接尝试判断
+        _pgvector_run_sql && { server_up=true; ok=true; }
+    fi
+
+    if [ "$server_up" != true ]; then
+        echo -e "${YELLOW}检测到数据库服务未运行，跳过自动创建扩展。${NC}"
+        echo -e "${GREEN}pgvector 扩展文件已安装完成（vector.so / vector.control），无需重新编译。${NC}"
+        echo -e "${CYAN}待数据库启动后，在目标库执行一次即可注册扩展：${NC}"
+        echo "  $psql_bin -U $PG_USER -d postgres -c \"CREATE EXTENSION vector;\""
+        echo -e "${CYAN}其它业务库同理，连到对应库执行 CREATE EXTENSION vector;${NC}"
+        return 0
+    fi
+
+    # 服务已运行，少量重试以等待就绪
+    local i
+    for i in 1 2 3; do
+        if _pgvector_run_sql; then
+            ok=true
+            break
+        fi
+        echo -e "${YELLOW}等待数据库服务就绪... ($i/3)${NC}"
+        sleep 2
+    done
+
+    if [ "$ok" = true ]; then
+        echo -e "${GREEN}✓ 已在 postgres 数据库创建扩展 vector${NC}"
+        echo -e "${CYAN}在其它业务库使用时，请在对应库执行: CREATE EXTENSION vector;${NC}"
+    else
+        echo -e "${YELLOW}⚠ 自动创建扩展未成功，可在服务启动后手动执行：${NC}"
+        echo "  $psql_bin -U $PG_USER -d postgres -c \"CREATE EXTENSION vector;\""
+    fi
+}
+
 # 验证安装
 verify_installation() {
     echo -e "${YELLOW}验证安装...${NC}"
@@ -4837,6 +4882,13 @@ cleanup_temp_files() {
         fi
     done 2>/dev/null
 
+    # 清理 pgvector 编译构建目录（下载/解压的源码与临时压缩包）
+    if [ -d "/tmp/pgvector_build" ]; then
+        rm -rf "/tmp/pgvector_build"
+        cleaned_files+=("pgvector_build/")
+        ((cleaned_count++))
+    fi
+
     # 清理临时密码设置脚本
     if [ -f "/tmp/set_postgres_password.sh" ]; then
         rm -f "/tmp/set_postgres_password.sh"
@@ -4892,10 +4944,31 @@ show_installation_info() {
     echo -e "连接命令:"
     echo -e "psql -U $PG_USER -W"
     echo -e ""
+    echo -e "若提示 psql 命令不存在（环境变量未生效），可使用完整路径:"
+    echo -e "$PG_INSTALL_DIR/bin/psql -h 127.0.0.1 -p ${PG_PORT:-5432} -U $PG_USER -d postgres -W"
+    echo -e ""
     echo -e "服务管理命令:"
-    local service_name="postgresql"
-    if [ -n "$pg_version" ]; then
-        service_name="postgresql${pg_version}"
+    # 动态探测实际的 systemd 服务单元名（优先匹配本次安装路径对应的 postgresql*.service），
+    # 避免用版本号猜（PG_VERSION 是 17.9 这类完整版本号，服务后缀只用主版本 17）。
+    local service_name=""
+    local svc
+    if command -v systemctl &>/dev/null; then
+        for svc in $(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^postgresql.*\.service$'); do
+            if systemctl cat "$svc" 2>/dev/null | grep -qF "$PG_INSTALL_DIR"; then
+                service_name="${svc%.service}"
+                break
+            fi
+        done
+        # 没按路径匹配上，则退而取任意 postgresql*.service 的第一个
+        if [ -z "$service_name" ]; then
+            svc=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^postgresql.*\.service$' | head -n1)
+            [ -n "$svc" ] && service_name="${svc%.service}"
+        fi
+    fi
+    # 仍未探测到时，用主版本号兜底（PG_VERSION 形如 17.9，取主版本 17）
+    if [ -z "$service_name" ]; then
+        local pg_major="${pg_version%%.*}"
+        service_name="postgresql${pg_major}"
     fi
     echo -e "启动: systemctl start $service_name"
     echo -e "停止: systemctl stop $service_name"
@@ -5059,6 +5132,9 @@ offline_install_flow() {
     UUID_LIBRARY=""
     # 重置选择的插件
     SELECTED_PLUGINS=""
+    # 重置 pgvector 标志
+    INSTALL_PGVECTOR=""
+    PGVECTOR_INSTALLED=""
 
     # 定义可用插件
     declare -A plugins
@@ -5073,6 +5149,7 @@ offline_install_flow() {
     plugins[pam]="PAM认证支持"
     plugins[bonjour]="Bonjour支持"
     plugins[systemd]="systemd集成支持"
+    plugins[pgvector]="pgvector向量扩展 (独立第三方扩展，需在离线目录准备其源码包)"
 
     # 显示插件选项
     echo "可用插件列表:"
@@ -5140,6 +5217,11 @@ offline_install_flow() {
                     ;;
                 "systemd")
                     CONFIGURE_OPTIONS="$CONFIGURE_OPTIONS --with-systemd"
+                    ;;
+                "pgvector")
+                    # pgvector 是独立第三方扩展，不属于 ./configure 参数，编译后单独安装
+                    INSTALL_PGVECTOR="true"
+                    echo -e "${GREEN}已选择 pgvector，将在 PostgreSQL 编译安装后单独编译该扩展${NC}"
                     ;;
                 *)
                     echo -e "${YELLOW}注意: 插件 '$plugin' 不在预定义列表中，将作为自定义参数处理${NC}"
@@ -5279,6 +5361,13 @@ offline_install_flow() {
 
     cd $PG_INSTALL_DIR
 
+    # 若该源码目录曾被 configure/编译过（如上次 --with-icu），先彻底清理，
+    # 避免旧的目标文件（如引用 ICU 的 .o）与新配置混链导致 undefined reference
+    if [ -f Makefile ]; then
+        echo -e "${YELLOW}检测到旧的编译配置，执行 make distclean 清理残留产物...${NC}"
+        make distclean >/dev/null 2>&1 || true
+    fi
+
     ./configure $CONFIGURE_OPTIONS 2>&1 | tee /tmp/postgres_configure.log
         
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
@@ -5327,6 +5416,15 @@ offline_install_flow() {
         cd $PG_INSTALL_DIR
     fi
 
+    # 编译安装 pgvector 扩展（独立第三方扩展，需在主程序 make install 之后）
+    if [ "$INSTALL_PGVECTOR" = "true" ]; then
+        if install_pgvector; then
+            PGVECTOR_INSTALLED="true"
+        else
+            echo -e "${YELLOW}pgvector 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
     # 步骤10: 设置环境变量
     setup_environment
 
@@ -5347,6 +5445,11 @@ offline_install_flow() {
 
     # 步骤15: 验证安装
     verify_installation
+
+    # pgvector 扩展文件已安装时，在数据库中创建扩展
+    if [ "$PGVECTOR_INSTALLED" = "true" ]; then
+        enable_pgvector_extension
+    fi
 
     # 步骤16: 显示安装信息
     show_installation_info
@@ -5798,7 +5901,12 @@ main() {
                 echo -e "${YELLOW}安装验证失败，重新开始安装流程...${NC}"
                 continue
             fi
-            
+
+            # pgvector 扩展文件已安装时，在数据库中创建扩展
+            if [ "$PGVECTOR_INSTALLED" = "true" ]; then
+                enable_pgvector_extension
+            fi
+
             show_installation_info
 
             echo -e "${GREEN}PostgreSQL ${PG_VERSION} 安装完成!${NC}"
@@ -5832,6 +5940,8 @@ main() {
                 CONFIGURE_OPTIONS=""
                 SELECTED_PLUGINS=""
                 UUID_LIBRARY=""
+                INSTALL_PGVECTOR=""
+                PGVECTOR_INSTALLED=""
                 continue  # 返回主程序循环开始
                 ;;
             *)

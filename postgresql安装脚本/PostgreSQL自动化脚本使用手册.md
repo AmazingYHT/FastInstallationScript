@@ -34,7 +34,10 @@
 - **下载重试机制**：自动重试、文件完整性验证
 - **插件依赖检查**：自动检查并安装插件依赖
 - **插件系统**：openssl、perl、python、tcl、uuid、xml、icu、ldap、pam、systemd、bonjour
-- **临时文件清理**：安装完成后自动清理临时文件
+- **pgvector 向量扩展**：独立第三方扩展，用 `pg_config` 单独编译，在线自动下载源码、离线支持本地源码包
+- **ICU 可用性探测**：采用真实编译+链接测试，避免仅有头文件而缺开发库导致的链接失败
+- **路径默认值**：离线 tar 包路径留空时默认使用脚本所在目录
+- **临时文件清理**：安装完成后自动清理临时文件（含 pgvector 构建目录）
 - **WAL归档**：完整归档配置、自动清理、定时清理、智能清理
 
 ---
@@ -149,8 +152,17 @@ sudo ./install_postgresql.sh
 sudo ./install_postgresql.sh
 
 # 选择 "4. 离线安装"
-# 输入 tar.gz 包路径
+# 输入 tar.gz 包路径（直接回车则默认使用脚本所在目录）
 ```
+
+> 💡 **路径默认值**：提示输入离线 tar 包路径时，**直接回车**即默认使用脚本当前所在目录，无需手动填写。
+
+> 📦 **离线安装 pgvector**：离线模式不会联网下载 pgvector。请提前在联网机下载源码包，与 PostgreSQL tar 包放在同一目录（或放到 `/tmp`）。版本可在发布页 <https://github.com/pgvector/pgvector/releases> 选择，下载时把 URL 末尾版本号替换为目标版本即可：
+> ```bash
+> # 例如下载 v0.8.6（版本号可自行替换）
+> wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz -O pgvector-0.8.6.tar.gz
+> ```
+> 也可解压后把源码目录（含 `Makefile` 与 `vector.control`）放到上述位置。
 
 #### 可选插件
 
@@ -162,13 +174,74 @@ sudo ./install_postgresql.sh
 | tcl | Tcl 存储过程 | tcl-devel |
 | uuid | UUID 生成 | uuid-devel / libossp-uuid-devel |
 | xml | XML 数据类型 | libxml2-devel |
-| icu | 国际化支持 | libicu-devel |
+| icu | 国际化支持（排序/字符序） | libicu-devel |
 | ldap | LDAP 认证 | openldap-devel |
 | pam | PAM 认证 | pam-devel |
 | systemd | systemd 集成 | systemd-devel |
 | bonjour | Bonjour 服务发现 | avahi-devel |
+| pgvector | 向量检索扩展（独立扩展，非 `./configure` 插件） | gcc、make、pg_config |
 
 > ⚠️ **UUID插件说明**：脚本会自动检测系统中可用的UUID库（e2fsprogs或OSSP），优先使用e2fsprogs。如两者都未安装，会尝试自动安装。
+
+> ⚠️ **ICU 探测说明**：ICU 是否可用通过**真实编译+链接测试**判定（调用 `u_strToLower`/`ucol_open` 试编译），而非仅检查头文件。某些系统（如 CentOS 7）自带 ICU 头文件但缺少可链接的开发库（`libicuuc.so`），仅检测头文件会误判为可用、导致 make 阶段报 `undefined reference to u_xxx_50`。探测不通过时，可选择在线安装 `libicu-devel` 后复测，或改用 `--without-icu`。**不启用 ICU 不影响数据库核心功能**，仅排序规则使用 libc 提供者（详见 [FAQ：ICU 相关](#q8-不启用-icu-有什么影响)）。
+
+---
+
+#### pgvector 向量扩展
+
+pgvector 提供向量类型 `vector` 与相似度检索（`<->`/`<=>`/`<#>`），是**独立第三方扩展**，不在 PostgreSQL 源码树内，也没有 `./configure --with-xxx` 开关。脚本在 PostgreSQL 主程序编译安装完成后，使用已安装的 `pg_config` 单独编译它。
+
+**安装机制（两步）**：
+
+1. **编译安装文件**（不需要数据库运行）：定位/下载 pgvector 源码 → `make PG_CONFIG=<prefix>/bin/pg_config` → `make install`，仅把 `vector.so`、`vector.control`、`vector--*.sql` 拷贝到 PostgreSQL 安装目录。
+2. **在库内注册扩展**（需要数据库运行）：服务启动后自动执行 `CREATE EXTENSION IF NOT EXISTS vector;`。扩展按数据库生效，需要在每个要用向量检索的库中单独创建（脚本默认在 `postgres` 库创建）。
+
+> 💡 跳过"启动数据库"**不影响** pgvector 文件安装；只是 `CREATE EXTENSION` 会被跳过，待服务启动后手动执行即可。
+
+**源码获取顺序**（脚本依次尝试）：
+
+1. 已解压源码：在 `脚本所在目录`、`/tmp`、`离线tar包同级目录`、`当前目录`、`/tmp/pgvector_build` 中递归查找含 `vector.control` 的目录；
+2. 本地压缩包：匹配 `pgvector-*.tar.gz` 或 `v<版本>.tar.gz` 并解压；
+3. 以上都没有时：
+   - **在线模式**：自动从 GitHub 下载（见下）；
+   - **离线模式**：不下载，打印手动下载指引后跳过（不影响 PostgreSQL 主程序）。
+
+**在线下载地址**（版本由变量 `PGVECTOR_VERSION` 控制，默认 `0.8.0`）：
+
+```
+https://github.com/pgvector/pgvector/archive/refs/tags/v<PGVECTOR_VERSION>.tar.gz
+# 默认拼接为：
+https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.0.tar.gz
+```
+
+> 📌 **版本下载地址（可自行替换版本号）**：
+> - 版本发布页（浏览/选择版本）：<https://github.com/pgvector/pgvector/releases>
+> - 指定版本页面（如 v0.8.6）：<https://github.com/pgvector/pgvector/releases/tag/v0.8.6>
+> - 直接下载源码包（把 URL 末尾的版本号换成需要的版本即可，脚本即用此地址）：
+>   `https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz`
+
+可通过环境变量指定版本：
+
+```bash
+export PGVECTOR_VERSION=0.8.6
+sudo ./install_postgresql.sh
+```
+
+**离线环境准备**：在联网机下载后，把压缩包（或解压后的源码目录，需含 `Makefile` 与 `vector.control`）放到脚本目录、PostgreSQL tar 包同级目录或 `/tmp`：
+
+```bash
+# 下载指定版本（版本号可自行替换，发布页见 https://github.com/pgvector/pgvector/releases ）
+wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz -O pgvector-0.8.6.tar.gz
+```
+
+**事后加装**：已装好的 PostgreSQL 也可通过主菜单 `3 → 1（外部插件向导）` 输入 `pgvector` 单独加装，无需重新编译 PostgreSQL。
+
+**手动启用扩展**（服务未运行而跳过时）：
+
+```bash
+# 启动数据库后，在目标库执行
+<prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION vector;"
+```
 
 #### 默认配置
 
@@ -514,19 +587,24 @@ sudo ./install_postgresql.sh
 **排查步骤**：
 
 ```bash
-# 1. 查看服务状态
-systemctl status postgresql18
+# 1. 查看服务状态（服务名为 postgresql<主版本号>，如 postgresql17）
+systemctl status postgresql17
 
 # 2. 查看详细日志
-journalctl -u postgresql18 -n 50
+journalctl -u postgresql17 -n 50
 
 # 3. 检查数据目录权限
 ls -la /mnt/data/postgresql/data
 
 # 4. 手动启动查看错误
-sudo -u postgres /mnt/data/postgresql/postgresql-18.1/bin/pg_ctl \
+sudo -u postgres /mnt/data/postgresql/postgresql-17.9/bin/pg_ctl \
   -D /mnt/data/postgresql/data start
+
+# 5. 查看数据库日志文件
+tail -n 50 /mnt/data/postgresql/data/postgresql.log
 ```
+
+> ⚠️ 若执行 `systemctl status postgresql` 报 `Unit postgresql.service could not be found.`，说明服务名用错了——正确服务名带主版本号（如 `postgresql17`），可用 `systemctl list-unit-files --type=service | grep postgresql` 查询。
 
 ---
 
@@ -550,8 +628,8 @@ host    all             all             0.0.0.0/0               md5
 # 或指定网段：
 host    all             all             192.168.1.0/24          md5
 
-# 3. 重启服务
-systemctl restart postgresql18
+# 3. 重启服务（服务名带主版本号，如 postgresql17）
+systemctl restart postgresql17
 
 # 4. 开放防火墙端口
 firewall-cmd --permanent --add-port=5432/tcp
@@ -594,6 +672,40 @@ sudo rm -rf --no-preserve-root /path/to/dir
 
 ---
 
+### Q8: 不启用 ICU 有什么影响？
+
+**结论**：不影响数据库、SQL、事务、复制等核心功能。ICU 只决定**字符串排序/比较规则（collation，字符序）的提供者**：
+
+- `--with-icu`：使用跨平台的 ICU 库提供排序规则；
+- `--without-icu`：使用操作系统 libc（glibc）提供排序规则。
+
+**不启用 ICU 的实际差异**：
+
+1. **glibc 升级后需重建索引**（最需注意）：系统升级 glibc 后排序规则可能变化，导致已建的 text/varchar B-tree 索引逻辑顺序错乱。升级 glibc 后应对相关库执行 `REINDEX`（或 `reindexdb -a`）。
+2. **跨平台/跨系统迁移**排序结果可能不一致（如 CentOS 与 Ubuntu 之间）；同版本同系统内无影响。
+3. 无法使用 ICU 专属的定制排序（忽略大小写/重音、数字自然排序等）。
+
+> 💡 CentOS 7 自带 ICU 50 且通常缺少可链接开发库，直接 `--without-icu` 是合理选择。脚本已通过编译+链接测试自动判断 ICU 是否真正可用，不可用时会引导安装 `libicu-devel` 或关闭 ICU。
+
+---
+
+### Q9: 安装 pgvector 必须启动数据库吗？离线怎么准备？
+
+**不需要启动数据库即可完成文件安装**。pgvector 分两步：
+
+1. `make && make install` 只拷贝扩展文件（`vector.so` 等），**与数据库是否运行无关**；
+2. `CREATE EXTENSION vector` 才需要数据库运行，且按数据库生效。
+
+跳过"启动数据库"时，脚本会用 `pg_isready` 探测，服务未运行则跳过注册并打印手动命令，待启动后执行：
+
+```bash
+<prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION vector;"
+```
+
+**离线环境**：脚本不会联网下载，需提前把 `pgvector-*.tar.gz`（或解压后的源码目录）放到脚本目录、PostgreSQL tar 包同级目录或 `/tmp`。详见 [pgvector 向量扩展](#pgvector-向量扩展)。
+
+---
+
 ## 📝 附录
 
 ### 目录结构
@@ -619,31 +731,43 @@ sudo rm -rf --no-preserve-root /path/to/dir
 
 ### 服务管理
 
+> ⚠️ **服务名规则**：systemd 服务名为 `postgresql<主版本号>`（只取主版本，不含小版本）。例如 PostgreSQL 17.9 的服务名是 `postgresql17`，18.1 是 `postgresql18`。**不是** `postgresql`（该单元不存在，执行会报 `Unit postgresql.service could not be found.`）。
+>
+> 安装结束后脚本会自动探测并展示实际服务名，以下以 17 为例：
+
 ```bash
 # 启动服务
-systemctl start postgresql18
+systemctl start postgresql17
 
 # 停止服务
-systemctl stop postgresql18
+systemctl stop postgresql17
 
 # 重启服务
-systemctl restart postgresql18
+systemctl restart postgresql17
 
 # 查看状态
-systemctl status postgresql18
+systemctl status postgresql17
 
 # 开机自启
-systemctl enable postgresql18
+systemctl enable postgresql17
 
 # 禁用自启
-systemctl disable postgresql18
+systemctl disable postgresql17
 ```
+
+> 💡 不确定服务名时，可查询：
+> ```bash
+> systemctl list-unit-files --type=service | grep postgresql
+> ```
 
 ### 数据库连接
 
 ```bash
-# 命令行连接
-psql -U postgres -h localhost -p 5432
+# 命令行连接（依赖 /etc/profile 中的 PATH 环境变量，需重新登录或 source /etc/profile 后生效）
+psql -U postgres -W
+
+# 若提示 psql 命令不存在，使用完整路径连接（-h 指定主机、-p 指定端口、-d 指定数据库）
+<安装目录>/bin/psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -W
 
 # 连接指定数据库
 psql -U postgres -d mydb -W
@@ -676,7 +800,7 @@ psql -U postgres -c "SELECT version();"
 ## 📞 技术支持
 
 如有问题，请检查：
-1. 系统日志：`journalctl -u postgresql18 -n 100`
+1. 系统日志：`journalctl -u postgresql<主版本号> -n 100`（如 `journalctl -u postgresql17 -n 100`）
 2. PostgreSQL 日志：`/mnt/data/postgresql/data/log/`
 3. 清理日志：`/mnt/data/postgresql/cleanup_wal.log`
 
@@ -684,7 +808,35 @@ psql -U postgres -c "SELECT version();"
 
 ## 📌 版本更新信息
 
-### v2.1.0 (最新)
+### v2.2.0 (最新)
+
+#### 新增功能
+
+- **pgvector 向量扩展支持**
+  - 在线安装、离线安装、外部插件向导三处均可选择 pgvector
+  - 独立扩展，使用 `pg_config` 单独 `make && make install`，无需重编 PostgreSQL
+  - 在线模式自动从 GitHub 下载源码（版本由 `PGVECTOR_VERSION` 控制，默认 0.8.0）
+  - 离线模式支持本地源码目录 / `pgvector-*.tar.gz`（可放脚本目录、tar 包同级或 `/tmp`）
+  - 服务启动后自动 `CREATE EXTENSION vector`；未启动则跳过并给出手动命令
+  - 已装 PostgreSQL 可通过主菜单 `3 → 1` 事后单独加装
+
+- **路径默认值优化**
+  - 离线 tar 包路径留空回车时，默认使用脚本当前所在目录
+
+- **ICU 可用性探测增强**
+  - 改用真实编译+链接测试判定 ICU 是否可用，避免仅有头文件缺开发库导致的链接失败
+  - configure 失败后的自动修复分支与编译前依赖检查统一复用该链接测试
+  - 移除旧的"伪造 pkg-config"逻辑，改为在线装包复测 / 关闭 ICU 等明确选项
+
+#### 功能优化
+
+- **修正安装完成后展示的服务管理命令**：服务名改为动态探测实际的 systemd 单元（`postgresql<主版本号>`，如 `postgresql17`），不再用完整版本号错拼成 `postgresql17.9` 或退化成不存在的 `postgresql`
+- 连接命令同时展示简洁形式 `psql -U postgres -W` 与带完整路径/主机/端口的兜底形式
+- 重配前自动执行 `make distclean`，避免 `--with-icu` 与 `--without-icu` 混配残留导致链接错误
+- 临时文件清理新增 pgvector 构建目录 `/tmp/pgvector_build`
+- pgvector 启用前用 `pg_isready` 探测服务，避免无意义重试等待
+
+### v2.1.0
 
 #### 新增功能
 
