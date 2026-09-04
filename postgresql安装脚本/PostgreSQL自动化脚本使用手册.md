@@ -35,9 +35,11 @@
 - **插件依赖检查**：自动检查并安装插件依赖
 - **插件系统**：openssl、perl、python、tcl、uuid、xml、icu、ldap、pam、systemd、bonjour
 - **pgvector 向量扩展**：独立第三方扩展，用 `pg_config` 单独编译，在线自动下载源码、离线支持本地源码包
+- **PostGIS 空间扩展**：独立第三方扩展（3.5.7），autotools 构建，在线自动下载源码、离线支持本地源码包，自动检测并安装 geos/proj/gdal 等依赖；老系统（如 CentOS 7）GEOS<3.8 / PROJ<6 时自动源码编译 GEOS 3.9.3 / PROJ 6.3.2 到 `/usr/local`
+- **TimescaleDB 时序扩展**：独立第三方扩展（2.29.2），cmake 构建，自动配置 `shared_preload_libraries` 并重启数据库后注册扩展
 - **ICU 可用性探测**：采用真实编译+链接测试，避免仅有头文件而缺开发库导致的链接失败
 - **路径默认值**：离线 tar 包路径留空时默认使用脚本所在目录
-- **临时文件清理**：安装完成后自动清理临时文件（含 pgvector 构建目录）
+- **临时文件清理**：安装完成后自动清理临时文件（含 pgvector / PostGIS / TimescaleDB 构建目录）
 - **WAL归档**：完整归档配置、自动清理、定时清理、智能清理
 
 ---
@@ -157,12 +159,24 @@ sudo ./install_postgresql.sh
 
 > 💡 **路径默认值**：提示输入离线 tar 包路径时，**直接回车**即默认使用脚本当前所在目录，无需手动填写。
 
-> 📦 **离线安装 pgvector**：离线模式不会联网下载 pgvector。请提前在联网机下载源码包，与 PostgreSQL tar 包放在同一目录（或放到 `/tmp`）。版本可在发布页 <https://github.com/pgvector/pgvector/releases> 选择，下载时把 URL 末尾版本号替换为目标版本即可：
+> 📦 **离线安装第三方扩展**：离线模式不会联网下载第三方扩展。请提前在联网机下载源码包，与 PostgreSQL tar 包放在同一目录（或放到 `/tmp`）。下载时把 URL 末尾版本号替换为目标版本即可：
 > ```bash
-> # 例如下载 v0.8.6（版本号可自行替换）
+> # pgvector（版本发布页 https://github.com/pgvector/pgvector/releases ）
 > wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz -O pgvector-0.8.6.tar.gz
+>
+> # PostGIS 3.5.7（codeload 源码包，解压目录为 postgis-3.5.7）
+> wget https://codeload.github.com/postgis/postgis/tar.gz/refs/tags/3.5.7 -O postgis-3.5.7.tar.gz
+>
+> # 老系统（CentOS 7 等）GEOS/PROJ 版本过低，PostGIS 编译前需源码升级（可选，详见 PostGIS 专节）
+> wget https://download.osgeo.org/geos/geos-3.9.3.tar.bz2
+> wget https://download.osgeo.org/proj/proj-6.3.2.tar.gz
+>
+> # TimescaleDB 2.29.2（codeload 源码包，解压目录为 timescaledb-2.29.2）
+> wget https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/2.29.2 -O timescaledb-2.29.2.tar.gz
 > ```
-> 也可解压后把源码目录（含 `Makefile` 与 `vector.control`）放到上述位置。
+> 也可解压后把源码目录放到上述位置（pgvector 目录需含 `Makefile` 与 `vector.control`；PostGIS 目录顶层需含 `GNUmakefile.in`（`postgis.control.in` 实际在 `extensions/postgis/` 子目录）；TimescaleDB 目录需含 `bootstrap` 与 `timescaledb.control.in`）。脚本会按扩展标记自动识别，并归一化到真正的源码根目录（含 `configure`/`bootstrap` 的那一层）。
+>
+> ⚠️ **PostGIS 注意**：从 GitHub/codeload 下载的源码包**不含已生成的 `configure`**（只有 `configure.ac` 与 `autogen.sh`）。脚本会自动运行 `./autogen.sh` 生成（需目标机装有 `autoconf`/`automake`/`libtool`，依赖检查阶段会自动安装）；若下载的是 PostGIS 官方 make dist 发布包（自带 `configure`），则跳过此步骤直接编译。
 
 #### 可选插件
 
@@ -180,6 +194,8 @@ sudo ./install_postgresql.sh
 | systemd | systemd 集成 | systemd-devel |
 | bonjour | Bonjour 服务发现 | avahi-devel |
 | pgvector | 向量检索扩展（独立扩展，非 `./configure` 插件） | gcc、make、pg_config |
+| postgis | 空间/GIS 扩展（独立扩展，autotools 构建） | geos≥3.8、proj≥6（老系统自动源码编译 GEOS 3.9.3/PROJ 6.3.2）、gdal、json-c、libxml2、protobuf-c |
+| timescaledb | 时序数据库扩展（独立扩展，cmake 构建，需 preload 并重启） | cmake ≥ 3.15（CentOS 7 用 cmake3）、gcc、openssl-devel |
 
 > ⚠️ **UUID插件说明**：脚本会自动检测系统中可用的UUID库（e2fsprogs或OSSP），优先使用e2fsprogs。如两者都未安装，会尝试自动安装。
 
@@ -206,12 +222,12 @@ pgvector 提供向量类型 `vector` 与相似度检索（`<->`/`<=>`/`<#>`）�
    - **在线模式**：自动从 GitHub 下载（见下）；
    - **离线模式**：不下载，打印手动下载指引后跳过（不影响 PostgreSQL 主程序）。
 
-**在线下载地址**（版本由变量 `PGVECTOR_VERSION` 控制，默认 `0.8.0`）：
+**在线下载地址**（版本由变量 `PGVECTOR_VERSION` 控制，默认 `0.8.6`）：
 
 ```
 https://github.com/pgvector/pgvector/archive/refs/tags/v<PGVECTOR_VERSION>.tar.gz
 # 默认拼接为：
-https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.0.tar.gz
+https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz
 ```
 
 > 📌 **版本下载地址（可自行替换版本号）**：
@@ -241,6 +257,123 @@ wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz -O pgv
 ```bash
 # 启动数据库后，在目标库执行
 <prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION vector;"
+```
+
+---
+
+#### PostGIS 空间扩展
+
+PostGIS 为 PostgreSQL 增加地理空间（GIS）类型与函数（`geometry`/`geography`、空间索引、投影变换等）。它与 pgvector 一样是**独立第三方扩展**，不在 PostgreSQL 源码树内，没有 `./configure --with-xxx` 开关；脚本在主程序编译安装完成后，用已安装的 `pg_config` 单独编译。默认版本 `3.5.7`（由变量 `POSTGIS_VERSION` 控制）。
+
+**安装机制（两步）**：
+
+1. **编译安装文件**（不需要数据库运行）：定位/下载 PostGIS 源码 → （GEOS/PROJ 版本不达标时自动源码编译到 `/usr/local`）→ `./configure --with-pgconfig=<prefix>/bin/pg_config --with-geosconfig=... --with-projdir=...` → `make && make install`。若完整特性（raster/topology）因依赖缺失 configure 失败，脚本会自动回退为 `./configure ... --without-raster --without-topology` 再编译。
+2. **在库内注册扩展**（需要数据库运行）：服务启动后自动执行 `CREATE EXTENSION IF NOT EXISTS postgis;`（默认在 `postgres` 库）。扩展按数据库生效，需要在每个要用空间功能的库中单独创建。
+
+**核心依赖版本要求（重要）**：PostGIS 3.5 要求 **GEOS ≥ 3.8**、**PROJ ≥ 4.9（脚本统一要求 ≥ 6）**。CentOS 7 等老系统自带源里的 GEOS 仅 **3.4.2**、PROJ 仅 **4.8**，版本过低会导致 configure 报 `PostGIS requires GEOS >= 3.8.0`。脚本在 configure 前会先用 `geos-config --version` / `pkg-config --modversion proj` 检测版本，**不达标时自动从源码编译安装到 `/usr/local`**（并配置 `PATH`/`LD_LIBRARY_PATH`/`PKG_CONFIG_PATH`、写入 `ld.so.conf.d` 后 `ldconfig`）：
+
+| 依赖 | 自动编译版本 | 选该版本的原因 | 下载地址 |
+|-----|-------------|---------------|---------|
+| GEOS | **3.9.3**（变量 `GEOS_VERSION`） | GEOS 3.10+ 需 C++14/17，而 CentOS 7 的 gcc 4.8.5 仅支持 C++11；3.9.x 用 autotools 构建且满足 ≥3.8 | `https://download.osgeo.org/geos/geos-3.9.3.tar.bz2` |
+| PROJ | **6.3.2**（变量 `PROJ_VERSION`） | PROJ 7+ 改用 cmake 且强制依赖 sqlite3/tiff；6.3.2 用 autotools、自带 datumgrid 栅格，更稳妥 | `https://download.osgeo.org/proj/proj-6.3.2.tar.gz` |
+
+> 编译 GEOS 需 `gcc-c++ make bzip2`（解压 `.tar.bz2`），编译 PROJ 需 `gcc-c++ make sqlite-devel`，脚本会在编译前自动安装这些工具链。
+
+**其它系统依赖**（脚本通过 `pkg-config` 与头文件检测，缺失时自动安装）：
+
+| 系统 | 依赖包 |
+|-----|-------|
+| CentOS/RHEL | `geos-devel proj-devel proj-epsg gdal-devel json-c-devel libxml2-devel protobuf-c-devel` |
+| Debian/Ubuntu | `libgeos-dev libproj-dev libgdal-dev libjson-c-dev libxml2-dev libprotobuf-c-dev` |
+
+> 💡 PostGIS **不需要** `shared_preload_libraries`，编译安装后即可直接 `CREATE EXTENSION`。
+
+**在线下载地址**（codeload，版本由 `POSTGIS_VERSION` 控制）：
+
+```
+https://codeload.github.com/postgis/postgis/tar.gz/refs/tags/<POSTGIS_VERSION>
+# 默认拼接为：
+https://codeload.github.com/postgis/postgis/tar.gz/refs/tags/3.5.7
+# 下载后解压目录为 postgis-3.5.7
+wget https://codeload.github.com/postgis/postgis/tar.gz/refs/tags/3.5.7 -O postgis-3.5.7.tar.gz
+```
+
+可通过环境变量指定版本：
+
+```bash
+export POSTGIS_VERSION=3.5.7
+sudo ./install_postgresql.sh
+```
+
+**离线环境准备**：在联网机下载后，把压缩包（或解压后的源码目录，顶层含 `GNUmakefile.in`、子目录 `extensions/postgis/` 内含 `postgis.control.in`）放到脚本目录、PostgreSQL tar 包同级目录或 `/tmp`。脚本会自动识别并定位到源码根。
+
+> **离线老系统（如 CentOS 7）还需提前准备 GEOS/PROJ 源码包**：因系统自带 GEOS 3.4 / PROJ 4.8 版本过低，脚本需源码编译升级。离线环境无法联网下载时，请预先把下面两个包一并放到脚本目录 / tar 同级目录 / `/tmp`（脚本本地优先识别 `geos-[0-9]*.tar.*`、`proj-[0-9]*.tar.*`）：
+>
+> ```
+> wget https://download.osgeo.org/geos/geos-3.9.3.tar.bz2
+> wget https://download.osgeo.org/proj/proj-6.3.2.tar.gz
+> ```
+
+> 说明：codeload/GitHub 源码包顶层没有已生成的 `configure`（只有 `autogen.sh`），脚本会自动运行 `./autogen.sh` 生成（需 `autoconf`/`automake`/`libtool`）；官方 make dist 发布包自带 `configure`，可直接编译。
+
+**事后加装**：已装好的 PostgreSQL 可通过主菜单 `3 → 1（外部插件向导）` 输入 `postgis` 单独加装，无需重新编译 PostgreSQL。
+
+**手动启用扩展**（服务未运行而跳过时）：
+
+```bash
+<prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION postgis;"
+```
+
+---
+
+#### TimescaleDB 时序扩展
+
+TimescaleDB 为 PostgreSQL 提供时序数据能力（hypertable、自动分区、连续聚合等）。同样是**独立第三方扩展**，使用 **cmake** 构建。默认版本 `2.29.2`（由变量 `TIMESCALEDB_VERSION` 控制）。
+
+**安装机制（三步）**：
+
+1. **编译安装文件**（不需要数据库运行）：定位/下载源码 → `./bootstrap -DPG_CONFIG=<prefix>/bin/pg_config`（内部调用 cmake）→ `cd build && make && make install`。脚本会先检测 `cmake` **版本是否 ≥ 3.15**（TimescaleDB 2.x 硬性要求）：已达标直接使用；否则在 CentOS/RHEL 7 上自动安装并启用 `cmake3`（来自 EPEL，通常为 `/usr/bin/cmake3`）并加入 PATH，在 dnf/apt 系统上升级 `cmake`。bootstrap 以 `BUILD_FORCE_REMOVE=true` 运行，遇到旧的 `build/` 目录会自动重建，避免交互询问与旧缓存残留。bootstrap 还会自动追加 `-DREGRESS_CHECKS=OFF`（跳过回归测试、加快构建）。
+   - **OpenSSL 检查与交互选择**：TimescaleDB 默认强制要求 PostgreSQL 带 OpenSSL（`--with-openssl`）。脚本在 bootstrap 前用 `pg_config --configure` 探测主程序是否启用 OpenSSL；若**未启用**（cmake 会报 `PostgreSQL was built without OpenSSL support`），会**暂停并提示二选一**：
+     - **选项 1（默认）**：忽略 OpenSSL，以 `-DUSE_OPENSSL=0` 继续编译——核心时序功能（hypertable、分区、连续聚合等）不受影响，仅压缩/加密相关能力不可用；
+     - **选项 2**：取消安装，先 `yum install openssl-devel`（Debian/Ubuntu 为 `libssl-dev`），并让 PostgreSQL 带 `--with-openssl` 插件**重新编译**（注意：仅装 openssl-devel 无效，PostgreSQL 本身必须重编带 openssl），再回来装 TimescaleDB。
+2. **配置预加载库并重启**（TimescaleDB 的特殊要求）：TimescaleDB **必须**出现在 `shared_preload_libraries` 中才能创建扩展。脚本优先用 `ALTER SYSTEM SET shared_preload_libraries TO '<现有>,timescaledb';` 在线配置；服务未运行/离线时则直接改写 `postgresql.conf`。配置后**自动重启** PostgreSQL 服务并等待其就绪。
+3. **在库内注册扩展**：重启就绪后自动执行 `CREATE EXTENSION IF NOT EXISTS timescaledb;`（默认在 `postgres` 库）。扩展按数据库生效。
+
+> ⚠️ **与 pgvector/PostGIS 的关键区别**：TimescaleDB 需要 `shared_preload_libraries = 'timescaledb'` 且**必须重启数据库**后才能 `CREATE EXTENSION`。脚本已自动完成配置与重启；若手动安装，请务必先配置 preload 并重启。
+
+**在线下载地址**（codeload，版本由 `TIMESCALEDB_VERSION` 控制）：
+
+```
+https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/<TIMESCALEDB_VERSION>
+# 默认拼接为：
+https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/2.29.2
+# 下载后解压目录为 timescaledb-2.29.2
+wget https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/2.29.2 -O timescaledb-2.29.2.tar.gz
+```
+
+可通过环境变量指定版本：
+
+```bash
+export TIMESCALEDB_VERSION=2.29.2
+sudo ./install_postgresql.sh
+```
+
+**离线环境准备**：在联网机下载后，把压缩包（或解压后的源码目录，需含 `bootstrap` 与 `timescaledb.control.in`）放到脚本目录、PostgreSQL tar 包同级目录或 `/tmp`。注意 TimescaleDB 编译仍需目标机装有 `cmake` 与编译工具链。
+
+**事后加装**：已装好的 PostgreSQL 可通过主菜单 `3 → 1（外部插件向导）` 输入 `timescaledb` 单独加装；向导会自动配置 preload、重启服务并创建扩展。
+
+**手动启用扩展**（如需手动操作）：
+
+```bash
+# 1. 配置预加载库（二选一）
+<prefix>/bin/psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries TO 'timescaledb';"
+#   或在 postgresql.conf 中设置：shared_preload_libraries = 'timescaledb'
+
+# 2. 重启数据库（服务名为 postgresql<主版本号>）
+systemctl restart postgresql17
+
+# 3. 在目标库创建扩展
+<prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION timescaledb;"
 ```
 
 #### 默认配置
@@ -704,6 +837,43 @@ sudo rm -rf --no-preserve-root /path/to/dir
 
 **离线环境**：脚本不会联网下载，需提前把 `pgvector-*.tar.gz`（或解压后的源码目录）放到脚本目录、PostgreSQL tar 包同级目录或 `/tmp`。详见 [pgvector 向量扩展](#pgvector-向量扩展)。
 
+PostGIS 的文件安装同样不需要数据库运行（仅 `CREATE EXTENSION postgis` 需要运行）；离线时提前准备 `postgis-*.tar.gz`，详见 [PostGIS 空间扩展](#postgis-空间扩展)。
+
+---
+
+### Q10: TimescaleDB 为什么要重启数据库？PostGIS 需要吗？
+
+**TimescaleDB 必须重启，PostGIS 不需要。**
+
+- **TimescaleDB**：它属于需要预加载的扩展，`shared_preload_libraries` 必须包含 `timescaledb`，且该参数只在数据库启动时读取。因此流程是：配置 preload → **重启** → `CREATE EXTENSION timescaledb`。脚本已自动完成 `ALTER SYSTEM`（或改写 `postgresql.conf`）、重启服务、等待就绪、创建扩展这一整套动作。手动安装时若漏了重启，`CREATE EXTENSION` 会报错提示必须先加入 preload 并重启。
+- **PostGIS / pgvector**：不需要 `shared_preload_libraries`，编译安装后直接 `CREATE EXTENSION` 即可，无需重启。
+
+> 💡 若 TimescaleDB 扩展创建失败，请确认 `SHOW shared_preload_libraries;` 的输出中含有 `timescaledb`，且数据库在配置后已重启。
+
+---
+
+### Q11: TimescaleDB 报 `CMake 3.15 or higher is required`？
+
+**原因**：TimescaleDB 2.x 要求 **cmake ≥ 3.15**，而 CentOS/RHEL 7 系统自带的 cmake 是 **2.8.12.2**，版本过低。
+
+**脚本已自动处理**：依赖检查和安装阶段都会校验 cmake 版本，不达标时在 CentOS/RHEL 7 自动安装并启用 `cmake3`（EPEL 提供，通常是 `/usr/bin/cmake3`）并加入 PATH；在 dnf（RHEL 8+）/apt（Debian/Ubuntu）系统上直接升级 `cmake`。
+
+如需手动处理：
+
+```bash
+# CentOS/RHEL 7
+yum install -y epel-release
+yum install -y cmake3            # 提供 /usr/bin/cmake3
+# 让 bootstrap 能调用到（bootstrap 内部调用的是 cmake）：
+export PATH=/usr/bin:$PATH       # cmake3 与 cmake 同名时可不处理；若只有 cmake3：
+ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+
+# 验证版本
+cmake --version                  # 需 >= 3.15
+```
+
+> 💡 若 EPEL 的 cmake3 仍不可用，可从 <https://github.com/Kitware/CMake/releases> 下载预编译二进制（如 `cmake-3.2x.x-linux-x86_64.tar.gz`），解压后把其 `bin` 加入 PATH 再重跑向导。
+
 ---
 
 ## 📝 附录
@@ -808,7 +978,43 @@ psql -U postgres -c "SELECT version();"
 
 ## 📌 版本更新信息
 
-### v2.2.0 (最新)
+### v2.3.0 (最新)
+
+#### 新增功能
+
+- **PostGIS 空间扩展支持（默认 3.5.7）**
+  - 在线安装、离线安装、外部插件向导三处均可选择 postgis
+  - 独立第三方扩展，autotools 构建：`./configure --with-pgconfig=...` + `make && make install`
+  - configure 失败自动回退 `--without-raster --without-topology`
+  - 自动检测并安装 geos/proj/gdal/json-c/libxml2/protobuf-c 等依赖（区分 CentOS/Debian）
+  - 在线从 codeload 下载源码（版本由 `POSTGIS_VERSION` 控制），离线支持本地 `postgis-*.tar.gz`/源码目录
+  - 服务启动后自动 `CREATE EXTENSION postgis`；无需 preload、无需重启
+  - **老系统 GEOS/PROJ 自动源码升级**：PostGIS 3.5 需 GEOS ≥ 3.8、PROJ ≥ 6，CentOS 7 自带 GEOS 3.4 / PROJ 4.8 会报 `requires GEOS >= 3.8.0`。脚本 configure 前自动检测版本，不达标时从源码编译 **GEOS 3.9.3**（兼容 gcc 4.8 的 C++11，不用需 C++14 的 3.10+）与 **PROJ 6.3.2**（autotools 构建，不用需 cmake 的 7+）到 `/usr/local`，并配置 `PATH`/`LD_LIBRARY_PATH`/`PKG_CONFIG_PATH` 与 `ldconfig`；configure 显式传 `--with-geosconfig`/`--with-projdir` 指向新版本。离线可预置 `geos-*.tar.*`/`proj-*.tar.*`，版本由 `GEOS_VERSION`/`PROJ_VERSION` 控制
+
+- **TimescaleDB 时序扩展支持（默认 2.29.2）**
+  - 在线安装、离线安装、外部插件向导三处均可选择 timescaledb
+  - 独立第三方扩展，cmake 构建：`./bootstrap -DPG_CONFIG=...` + `cd build && make && make install`
+  - 自动检测并安装 cmake / openssl-devel（libssl-dev）
+  - **版本感知的 cmake 校验**：TimescaleDB 2.x 需 cmake ≥ 3.15，旧系统（如 CentOS 7 自带 cmake 2.8）会自动安装 `cmake3`（EPEL），并在独立 shim 目录（`/tmp/pg_cmake_shim`）中把现代 cmake 软链为 `cmake`、置于 PATH 最前并清理命令缓存，确保覆盖系统旧 cmake；dnf/apt 系统自动升级 `cmake`
+  - bootstrap 以 `BUILD_FORCE_REMOVE=true` 运行，自动清理重建旧 `build/` 目录，避免交互询问与旧缓存残留
+  - 自动配置 `shared_preload_libraries='timescaledb'`（优先 `ALTER SYSTEM`，离线改写 `postgresql.conf`）并**自动重启**服务、等待就绪后 `CREATE EXTENSION timescaledb`
+  - 在线从 codeload 下载源码（版本由 `TIMESCALEDB_VERSION` 控制），离线支持本地 `timescaledb-*.tar.gz`/源码目录
+  - **内存感知的安全并行编译**：新增 `_pg_safe_jobs()`，按 `min(CPU核数, 可用内存MB/1500)` 自动限制 `make -j` 并行度，避免并行编译 C++（GEOS/PostGIS/TimescaleDB）时内存不足触发 GCC 内部错误（`internal compiler error ... likely a hardware or OS problem`）；编译失败时自动降级重试：先 `make -j1`（单线程降峰值内存），仍失败则以 `-O0` 低优化重新 configure/cmake 后再单线程编译。编译重型 C++ 前还会检测内存，物理内存+swap 低于 ~3GB 时**自动创建临时 swap 文件**（`_pg_ensure_swap()`，1~4GB，放在空间充足的分区）兜底，防止编译器进程被 OOM 杀死。**自动启用新版 GCC（devtoolset）**：CentOS/RHEL 7 自带 g++ 4.8.5 对现代 C++11/14 支持不全、编译 GEOS 3.9 等会随机触发 GCC 内部错误（`internal compiler error`，每次崩溃文件不同，与内存无关）；`_pg_enable_modern_gcc()` 检测到 g++ < 7 时自动安装并启用 SCL `devtoolset-8/9/10/11`（`centos-release-scl` + `devtoolset-N-toolchain`，source `/opt/rh/devtoolset-N/root/enable` 并导出 `CC/CXX`），同时 `export CCACHE_DISABLE=1` 禁用 ccache 排除缓存导致的偶发异常。源码下载统一启用进度条（`wget --progress=bar:force` / `curl --progress-bar`）
+  - 新增服务名动态探测、服务重启、preload 幂等配置等通用辅助函数（同时复用于其他扩展）
+  - **OpenSSL 检查与交互选择**：bootstrap 前用 `pg_config --configure` 探测主程序是否启用 OpenSSL；未启用（cmake 会报 `PostgreSQL was built without OpenSSL support`）时**暂停提示二选一**：选项 1（默认）以 `-DUSE_OPENSSL=0` 继续（核心时序功能不受影响）；选项 2 取消并指引安装 `openssl-devel`、带 `--with-openssl` 重编 PostgreSQL 后再来（仅装 openssl-devel 无效）。并统一加 `-DREGRESS_CHECKS=OFF` 跳过回归测试
+
+#### 功能优化
+
+- 第三方扩展源码定位统一支持 `*.control` 与构建期才生成的 `*.control.in` 标记，解决全新源码首次解压误判"缺少 control"的问题
+- **修复 PostGIS 源码识别失败**：PostGIS 的 `postgis.control.in` 实际位于 `extensions/postgis/` 子目录（非源码根），原查找深度不足且会把目录误判到子目录。现放宽查找深度，并在命中标记后沿目录向上**归一化到真正的源码根**（PostGIS 以含 `configure`/`GNUmakefile.in`/`autogen.sh` 的目录为准，TimescaleDB 以含 `bootstrap` 的目录为准）
+- **兼容 codeload/GitHub 源码包**：该类源码包不含已生成的 `configure`，PostGIS 安装时自动运行 `./autogen.sh` 生成；依赖检查阶段对缺失的 `autoconf`/`automake`/`libtool` 自动安装（官方 make dist 发布包自带 `configure`，直接跳过）
+- 修复 PostGIS/TimescaleDB 源码准备阶段日志被命令替换吞掉的问题：失败时回显完整下载/解压日志与手动下载命令，便于定位
+- 第三方扩展一律**优先使用本地源码**（已解压目录 → 本地压缩包），均未找到时才在线下载
+- TimescaleDB 源码根自动归一化（命中 `build/src` 时回溯到含 `bootstrap` 的源码根）
+- 外部插件向导支持 pgvector / postgis / timescaledb 与 contrib 插件任意混选，独立扩展统一走"编译→启用"流程
+- 临时文件清理新增 `/tmp/postgis_build`、`/tmp/timescaledb_build`
+
+### v2.2.0
 
 #### 新增功能
 

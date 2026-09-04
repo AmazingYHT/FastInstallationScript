@@ -4,6 +4,9 @@
 # 支持 x86 和 ARM 架构
 # 作者: 基于PostgreSQL 12安装文档改编
 
+# 脚本构建标识：用于核对服务器上运行的是否为最新副本
+SCRIPT_BUILD_TAG="2026.09.03-ext-enable-prompt"
+
 # 不使用 set -e，避免意外退出
 # set -e
 
@@ -38,6 +41,25 @@ PROXY_PASS=""
 # 离线安装模式
 OFFLINE_MODE=""
 OFFLINE_TARBALL_PATH=""
+
+# 独立第三方扩展的默认版本（可用环境变量覆盖）
+PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.6}"
+POSTGIS_VERSION="${POSTGIS_VERSION:-3.5.7}"
+TIMESCALEDB_VERSION="${TIMESCALEDB_VERSION:-2.29.2}"
+# PostGIS 3.5 要求 GEOS >= 3.8、PROJ >= 4.9；CentOS7 系统源为 GEOS 3.4 / PROJ 4.8，
+# 版本过低时从源码编译安装到 /usr/local（GEOS 选 3.9 以兼容 gcc 4.8 的 C++11；PROJ 6.3.2 用 autotools）
+# PROJ 6+ 编译要求 sqlite3 >= 3.11，而 CentOS7 自带 SQLite 仅 3.7.17，版本过低时同样从源码编译到 /usr/local
+GEOS_VERSION="${GEOS_VERSION:-3.9.3}"
+PROJ_VERSION="${PROJ_VERSION:-6.3.2}"
+SQLITE_VERSION="${SQLITE_VERSION:-3.46.0}"
+
+# 独立第三方扩展的选择与安装完成标志
+INSTALL_PGVECTOR=""
+PGVECTOR_INSTALLED=""
+INSTALL_POSTGIS=""
+POSTGIS_INSTALLED=""
+INSTALL_TIMESCALEDB=""
+TIMESCALEDB_INSTALLED=""
 
 # 脚本所在目录（用户未填写路径时的默认查找目录，离线包通常与脚本放在一起）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -904,6 +926,11 @@ select_plugins() {
     # 重置 pgvector 标志
     INSTALL_PGVECTOR=""
     PGVECTOR_INSTALLED=""
+    # 重置 PostGIS / TimescaleDB 标志
+    INSTALL_POSTGIS=""
+    POSTGIS_INSTALLED=""
+    INSTALL_TIMESCALEDB=""
+    TIMESCALEDB_INSTALLED=""
     
     echo -e "${YELLOW}请选择需要编译安装的插件:${NC}"
     echo ""
@@ -922,6 +949,8 @@ select_plugins() {
     plugins[bonjour]="Bonjour支持"
     plugins[systemd]="systemd集成支持"
     plugins[pgvector]="pgvector向量扩展 (独立第三方扩展，编译后自动CREATE EXTENSION)"
+    plugins[postgis]="PostGIS空间扩展 (独立第三方扩展，需geos/proj等依赖)"
+    plugins[timescaledb]="TimescaleDB时序扩展 (独立第三方扩展，需cmake，自动配置preload并重启)"
 
     # 显示插件选项
     echo "可用插件列表:"
@@ -1046,6 +1075,16 @@ select_plugins() {
                     # pgvector 是独立第三方扩展，不属于 ./configure 参数，编译后单独安装
                     INSTALL_PGVECTOR="true"
                     echo -e "${GREEN}已选择 pgvector，将在 PostgreSQL 编译安装后单独编译该扩展${NC}"
+                    ;;
+                "postgis")
+                    # PostGIS 是独立第三方扩展，autotools 构建，编译后单独安装
+                    INSTALL_POSTGIS="true"
+                    echo -e "${GREEN}已选择 postgis，将在 PostgreSQL 编译安装后单独编译该扩展（需 geos/proj/gdal 等依赖）${NC}"
+                    ;;
+                "timescaledb")
+                    # TimescaleDB 是独立第三方扩展，cmake 构建，需 shared_preload_libraries
+                    INSTALL_TIMESCALEDB="true"
+                    echo -e "${GREEN}已选择 timescaledb，将在 PostgreSQL 编译安装后单独编译该扩展（需 cmake，启用时自动配置 preload 并重启）${NC}"
                     ;;
                 
                 *)
@@ -2397,6 +2436,24 @@ compile_install() {
         fi
     fi
 
+    # 编译安装 PostGIS 扩展（独立第三方扩展，autotools 构建）
+    if [ "$INSTALL_POSTGIS" = "true" ]; then
+        if install_postgis; then
+            POSTGIS_INSTALLED="true"
+        else
+            echo -e "${YELLOW}postgis 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
+    # 编译安装 TimescaleDB 扩展（独立第三方扩展，cmake 构建，启用时需 preload + 重启）
+    if [ "$INSTALL_TIMESCALEDB" = "true" ]; then
+        if install_timescaledb; then
+            TIMESCALEDB_INSTALLED="true"
+        else
+            echo -e "${YELLOW}timescaledb 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
     # 显示编译统计
     echo ""
     echo -e "${CYAN}编译统计:${NC}"
@@ -3623,6 +3680,36 @@ check_plugin_dependencies() {
                 # pgvector 是独立第三方扩展，无 ./configure 依赖，编译时仅需 gcc/make 与 pg_config
                 echo -e "${GREEN}✓ pgvector 为独立扩展，将使用 pg_config 单独编译安装${NC}"
                 ;;
+            "postgis")
+                # PostGIS 为独立第三方扩展（autotools），但编译依赖 geos/proj/gdal/json-c/libxml2 等系统库
+                echo -e "${CYAN}PostGIS 为独立扩展，但编译依赖 geos/proj/gdal/json-c/libxml2 等开发库${NC}"
+                local postgis_missing=false
+                if pkg-config --exists proj 2>/dev/null && [ -f /usr/include/geos_c.h ]; then
+                    echo -e "${GREEN}✓ 检测到 geos/proj 开发库${NC}"
+                else
+                    postgis_missing=true
+                fi
+                if $postgis_missing; then
+                    echo -e "${YELLOW}✗ PostGIS 依赖缺失（geos/proj 等），尝试安装完整开发库${NC}"
+                    # 一次性安装核心依赖（raster 依赖 gdal，缺失时脚本会自动回退到 --without-raster）
+                    install_package "geos-devel proj-devel proj-epsg gdal-devel json-c-devel libxml2-devel protobuf-c-devel" \
+                        "libgeos-dev libproj-dev libgdal-dev libjson-c-dev libxml2-dev libprotobuf-c-dev" \
+                        "PostGIS 依赖(geos/proj/gdal/json-c/libxml2)"
+                fi
+                # Git/codeload 源码包无已生成的 configure，需 autogen.sh（autoconf/automake/libtool）生成；
+                # 官方 make dist 发布包自带 configure，用不到这些工具，装了也无害
+                if ! command -v autoconf &>/dev/null || ! command -v automake &>/dev/null || ! command -v libtoolize &>/dev/null; then
+                    echo -e "${YELLOW}✗ 缺少 autotools（autoconf/automake/libtool），Git 源码包需其生成 configure，尝试安装${NC}"
+                    install_package "autoconf automake libtool which" \
+                        "autoconf automake libtool pkg-config" \
+                        "PostGIS autotools(autoconf/automake/libtool)"
+                fi
+                ;;
+            "timescaledb")
+                # TimescaleDB 为独立第三方扩展（cmake 构建），需要 cmake >= 3.15（旧系统自带 cmake 2.8 不满足）
+                echo -e "${CYAN}TimescaleDB 为独立扩展，使用 cmake 构建（需 cmake >= 3.15）${NC}"
+                _pg_ensure_modern_cmake
+                ;;
             *)
                 echo -e "${YELLOW}⚠ 未知插件 '$plugin'，跳过依赖检查${NC}"
                 ;;
@@ -3882,6 +3969,8 @@ install_external_plugins() {
     echo "bonjour - Bonjour支持"
     echo "systemd - systemd集成支持"
     echo "pgvector - pgvector向量扩展（独立扩展，用pg_config单独编译，无需重编PostgreSQL）"
+    echo "postgis - PostGIS空间扩展（独立扩展，autotools编译，需geos/proj等依赖，无需重编PostgreSQL）"
+    echo "timescaledb - TimescaleDB时序扩展（独立扩展，cmake编译，需shared_preload_libraries并重启）"
     echo "----------------------------------------"
     echo ""
 
@@ -3897,17 +3986,35 @@ install_external_plugins() {
     echo -e "${CYAN}选择的插件: $selected_plugins${NC}"
     echo ""
 
-    # pgvector 是独立第三方扩展，不走 ./configure，单独用 pg_config 编译安装
+    # pgvector / postgis / timescaledb 是独立第三方扩展，不走 ./configure，单独用 pg_config 编译安装
     local want_pgvector=false
+    local want_postgis=false
+    local want_timescaledb=false
     local recompile_plugins=""
     for plugin in $selected_plugins; do
-        if [ "$plugin" = "pgvector" ]; then
-            want_pgvector=true
-        else
-            recompile_plugins="$recompile_plugins $plugin"
-        fi
+        case "$plugin" in
+            pgvector) want_pgvector=true ;;
+            postgis) want_postgis=true ;;
+            timescaledb) want_timescaledb=true ;;
+            *) recompile_plugins="$recompile_plugins $plugin" ;;
+        esac
     done
     recompile_plugins="$(echo "$recompile_plugins" | xargs)"
+
+    # 安装独立扩展（pgvector/postgis/timescaledb），全部安装后启用
+    install_standalone_extensions() {
+        local any_ok=false
+        if [ "$want_pgvector" = true ]; then
+            if install_pgvector; then any_ok=true; enable_pgvector_extension; else echo -e "${YELLOW}pgvector 安装未完成（PostgreSQL 主程序不受影响）${NC}"; fi
+        fi
+        if [ "$want_postgis" = true ]; then
+            if install_postgis; then any_ok=true; enable_postgis_extension; else echo -e "${YELLOW}postgis 安装未完成（PostgreSQL 主程序不受影响）${NC}"; fi
+        fi
+        if [ "$want_timescaledb" = true ]; then
+            if install_timescaledb; then any_ok=true; enable_timescaledb_extension; else echo -e "${YELLOW}timescaledb 安装未完成（PostgreSQL 主程序不受影响）${NC}"; fi
+        fi
+        $any_ok
+    }
 
     # 检查插件依赖
     if ! check_plugin_dependencies "$selected_plugins"; then
@@ -3917,18 +4024,22 @@ install_external_plugins() {
 
     echo ""
 
-    # 仅选了 pgvector：无需重编 PostgreSQL，直接编译安装 pgvector
-    if [ "$want_pgvector" = true ] && [ -z "$recompile_plugins" ]; then
-        echo -e "${YELLOW}仅选择了 pgvector，PostgreSQL 无需重新配置/编译，直接安装 pgvector 扩展...${NC}"
-        if install_pgvector; then
-            enable_pgvector_extension
+    # 仅选了独立扩展（pgvector/postgis/timescaledb）：无需重编 PostgreSQL，直接编译安装
+    local want_any_standalone=false
+    if [ "$want_pgvector" = true ] || [ "$want_postgis" = true ] || [ "$want_timescaledb" = true ]; then
+        want_any_standalone=true
+    fi
+    if [ "$want_any_standalone" = true ] && [ -z "$recompile_plugins" ]; then
+        echo -e "${YELLOW}仅选择了独立扩展，PostgreSQL 无需重新配置/编译，直接安装扩展...${NC}"
+        if install_standalone_extensions; then
+            :
         else
-            echo -e "${YELLOW}pgvector 安装未完成（PostgreSQL 主程序不受影响）${NC}"
+            echo -e "${YELLOW}独立扩展安装未完成（PostgreSQL 主程序不受影响）${NC}"
             cd - > /dev/null 2>&1
             return 1
         fi
-        rm -rf "/tmp/pgvector_build"
-        echo -e "${GREEN}✓ 已清理 pgvector 临时构建目录 /tmp/pgvector_build${NC}"
+        rm -rf "/tmp/pgvector_build" "/tmp/postgis_build" "/tmp/timescaledb_build" "/tmp/geos_dep_build" "/tmp/proj_dep_build" "/tmp/sqlite_dep_build"
+        echo -e "${GREEN}✓ 已清理扩展临时构建目录${NC}"
         cd - > /dev/null 2>&1
         return 0
     fi
@@ -4143,13 +4254,9 @@ install_external_plugins() {
         echo -e "${YELLOW}⚠ 未找到contrib目录，跳过contrib模块编译${NC}"
     fi
 
-    # 同时选择了 pgvector：PostgreSQL 重编译安装完成后，单独编译安装 pgvector
-    if [ "$want_pgvector" = true ]; then
-        if install_pgvector; then
-            enable_pgvector_extension
-        else
-            echo -e "${YELLOW}pgvector 安装未完成，PostgreSQL 主程序不受影响${NC}"
-        fi
+    # 同时选择了独立扩展（pgvector/postgis/timescaledb）：PostgreSQL 重编译安装完成后单独编译安装
+    if [ "$want_any_standalone" = true ]; then
+        install_standalone_extensions || echo -e "${YELLOW}部分独立扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
     fi
 
     cd - > /dev/null
@@ -4265,10 +4372,10 @@ install_external_plugins() {
         fi
     fi
 
-    # 清理 pgvector 编译构建临时目录（本向导不经过完整安装流程的 cleanup_temp_files）
-    if [ "$want_pgvector" = true ] && [ -d "/tmp/pgvector_build" ]; then
-        rm -rf "/tmp/pgvector_build"
-        echo -e "${GREEN}✓ 已清理 pgvector 临时构建目录 /tmp/pgvector_build${NC}"
+    # 清理独立扩展编译构建临时目录（本向导不经过完整安装流程的 cleanup_temp_files）
+    if [ "$want_any_standalone" = true ]; then
+        rm -rf "/tmp/pgvector_build" "/tmp/postgis_build" "/tmp/timescaledb_build" "/tmp/geos_dep_build" "/tmp/proj_dep_build" "/tmp/sqlite_dep_build" 2>/dev/null
+        echo -e "${GREEN}✓ 已清理扩展临时构建目录（pgvector/postgis/timescaledb 及 geos/proj/sqlite 依赖）${NC}"
     fi
 
     # 提示如何使用安装的插件和扩展
@@ -4294,6 +4401,9 @@ install_external_plugins() {
     echo "  1. 某些插件需要额外的系统库支持"
     echo "  2. 如果扩展安装失败，请检查PostgreSQL日志"
     echo "  3. 使用 'SELECT * FROM pg_extension;' 查看已安装的扩展"
+    if [ "$want_timescaledb" = true ]; then
+        echo "  4. TimescaleDB 需 shared_preload_libraries='timescaledb' 并重启服务后才能 CREATE EXTENSION（脚本已自动配置/重启）"
+    fi
     echo ""
 
     return 0
@@ -4663,9 +4773,9 @@ install_pgvector() {
         echo -e "${CYAN}下载地址: $url${NC}"
         local dl_ok=0
         if command -v wget &>/dev/null; then
-            wget --timeout=300 --tries=2 -O "$work_dir/pgvector.tar.gz" "$url" && dl_ok=1
+            wget --progress=bar:force --timeout=300 --tries=2 -O "$work_dir/pgvector.tar.gz" "$url" && dl_ok=1
         elif command -v curl &>/dev/null; then
-            curl -L --connect-timeout 30 --max-time 600 -f -o "$work_dir/pgvector.tar.gz" "$url" && dl_ok=1
+            curl -L --progress-bar --connect-timeout 30 --max-time 600 -f -o "$work_dir/pgvector.tar.gz" "$url" && dl_ok=1
         else
             echo -e "${RED}需要 wget 或 curl 以下载 pgvector${NC}"
         fi
@@ -4718,22 +4828,37 @@ install_pgvector() {
 # 在 postgres 数据库中创建 pgvector 扩展（服务启动后调用）
 enable_pgvector_extension() {
     echo ""
-    echo -e "${YELLOW}在数据库中启用 pgvector 扩展（CREATE EXTENSION vector）...${NC}"
-
     local psql_bin="$PG_INSTALL_DIR/bin/psql"
     [ -x "$psql_bin" ] || psql_bin="psql"
     local pg_isready_bin="$PG_INSTALL_DIR/bin/pg_isready"
     [ -x "$pg_isready_bin" ] || pg_isready_bin="pg_isready"
     local sql="CREATE EXTENSION IF NOT EXISTS vector;"
+    local pg_user="${PG_USER:-${DEFAULT_PG_USER:-postgres}}"
     local ok=false
 
-    # 以数据库属主用户本地连接执行
+    echo -e "${GREEN}✓ pgvector 扩展文件已安装完成（无需重新编译）。${NC}"
+    # 交互确认：是否立即在 postgres 库自动注册扩展，默认跳过（避免服务未启动/需密码认证时脚本卡死）
+    local enable_now="n"
+    read -r -p "$(echo -e "${CYAN}是否立即在 postgres 数据库自动启用 pgvector？[y/N]（默认跳过，可稍后手动执行）：${NC}")" enable_now
+    case "$enable_now" in
+        y|Y|yes|YES)
+            echo -e "${YELLOW}在数据库中启用 pgvector 扩展（$sql）...${NC}"
+            ;;
+        *)
+            echo -e "${CYAN}已跳过自动启用。待数据库启动后，在目标库执行：${NC}"
+            echo "  $psql_bin -U $pg_user -d postgres -c \"$sql\""
+            echo -e "${CYAN}其它业务库同理，连到对应库执行 $sql${NC}"
+            return 0
+            ;;
+    esac
+
+    # 以数据库属主用户本地连接执行（-w/超时/</dev/null 防止需密码认证时停在 Password: 提示而卡死）
     _pgvector_run_sql() {
         if [ "$EUID" -eq 0 ]; then
-            sudo -u "$PG_USER" "$psql_bin" -d postgres -c "$sql" 2>/dev/null && return 0
-            su - "$PG_USER" -c "\"$psql_bin\" -d postgres -c \"$sql\"" 2>/dev/null && return 0
+            sudo -u "$pg_user" env PGCONNECT_TIMEOUT=5 "$psql_bin" -w -d postgres -c "$sql" </dev/null 2>/dev/null && return 0
+            su - "$pg_user" -c "PGCONNECT_TIMEOUT=5 \"$psql_bin\" -w -d postgres -c \"$sql\"" </dev/null 2>/dev/null && return 0
         fi
-        "$psql_bin" -U "$PG_USER" -d postgres -c "$sql" 2>/dev/null && return 0
+        PGCONNECT_TIMEOUT=5 "$psql_bin" -w -U "$pg_user" -d postgres -c "$sql" </dev/null 2>/dev/null && return 0
         return 1
     }
 
@@ -4750,7 +4875,7 @@ enable_pgvector_extension() {
         echo -e "${YELLOW}检测到数据库服务未运行，跳过自动创建扩展。${NC}"
         echo -e "${GREEN}pgvector 扩展文件已安装完成（vector.so / vector.control），无需重新编译。${NC}"
         echo -e "${CYAN}待数据库启动后，在目标库执行一次即可注册扩展：${NC}"
-        echo "  $psql_bin -U $PG_USER -d postgres -c \"CREATE EXTENSION vector;\""
+        echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION vector;\""
         echo -e "${CYAN}其它业务库同理，连到对应库执行 CREATE EXTENSION vector;${NC}"
         return 0
     fi
@@ -4771,7 +4896,1200 @@ enable_pgvector_extension() {
         echo -e "${CYAN}在其它业务库使用时，请在对应库执行: CREATE EXTENSION vector;${NC}"
     else
         echo -e "${YELLOW}⚠ 自动创建扩展未成功，可在服务启动后手动执行：${NC}"
-        echo "  $psql_bin -U $PG_USER -d postgres -c \"CREATE EXTENSION vector;\""
+        echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION vector;\""
+    fi
+}
+
+# ============================================================================
+# 独立第三方扩展通用辅助函数（PostGIS / TimescaleDB 等复用）
+# ============================================================================
+
+# 探测当前安装对应的 systemd 服务名（返回值由 echo 输出，未找到则回退 postgresql<主版本号>）
+_pg_detect_service_name() {
+    local svc svc_name=""
+    if command -v systemctl &>/dev/null; then
+        for svc in $(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^postgresql.*\.service$'); do
+            if systemctl cat "$svc" 2>/dev/null | grep -qF "$PG_INSTALL_DIR"; then
+                svc_name="${svc%.service}"
+                break
+            fi
+        done
+        if [ -z "$svc_name" ]; then
+            svc=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^postgresql.*\.service$' | head -n1)
+            [ -n "$svc" ] && svc_name="${svc%.service}"
+        fi
+    fi
+    if [ -z "$svc_name" ]; then
+        local pg_major=""
+        [ -f "$PG_DATA_DIR/PG_VERSION" ] && pg_major=$(cat "$PG_DATA_DIR/PG_VERSION" 2>/dev/null | tr -dc '0-9.' | cut -d. -f1)
+        [ -z "$pg_major" ] && pg_major="${PG_VERSION%%.*}"
+        svc_name="postgresql${pg_major}"
+    fi
+    echo "$svc_name"
+}
+
+# 重启 PostgreSQL 服务（root 直接 systemctl，非 root 尝试 sudo）
+_pg_restart_service() {
+    local svc_name="$1"
+    echo -e "${CYAN}重启 PostgreSQL 服务 ($svc_name) 以使配置生效...${NC}"
+    if [ "$EUID" -eq 0 ]; then
+        systemctl restart "$svc_name" 2>/dev/null
+    else
+        sudo systemctl restart "$svc_name" 2>/dev/null
+    fi
+    return $?
+}
+
+# 以数据库属主用户执行一条 SQL（成功返回0）。参数：$1=SQL
+_pg_ext_run_sql() {
+    local sql="$1"
+    # 兜底：部分入口（如“插件和扩展管理”菜单）可能未设置 PG_USER，空用户名会导致
+    # sudo -u "" / psql -U "" 全部失败，默认用 postgres 超级用户
+    local pg_user="${PG_USER:-${DEFAULT_PG_USER:-postgres}}"
+    local psql_bin="$PG_INSTALL_DIR/bin/psql"
+    [ -x "$psql_bin" ] || psql_bin="psql"
+    # 防挂死：-w/--no-password 使 psql 在需要密码时直接失败而非停在 Password: 提示；
+    # PGCONNECT_TIMEOUT 限制连接等待；</dev/null 断开标准输入。三者共同保证自动启用
+    # 扩展时脚本不会因等待输入（密码/确认）而卡死（2>/dev/null 会吞掉密码提示，表面像“卡住”）
+    if [ "$EUID" -eq 0 ]; then
+        sudo -u "$pg_user" env PGCONNECT_TIMEOUT=5 "$psql_bin" -w -d postgres -c "$sql" </dev/null 2>/dev/null && return 0
+        su - "$pg_user" -c "PGCONNECT_TIMEOUT=5 \"$psql_bin\" -w -d postgres -c \"$sql\"" </dev/null 2>/dev/null && return 0
+    fi
+    PGCONNECT_TIMEOUT=5 "$psql_bin" -w -U "$pg_user" -d postgres -c "$sql" </dev/null 2>/dev/null && return 0
+    return 1
+}
+
+# 获取当前 shared_preload_libraries 配置值（可能为空/多行）
+_pg_get_preload_libraries() {
+    local pg_user="${PG_USER:-${DEFAULT_PG_USER:-postgres}}"
+    local psql_bin="$PG_INSTALL_DIR/bin/psql"
+    [ -x "$psql_bin" ] || psql_bin="psql"
+    if [ "$EUID" -eq 0 ]; then
+        sudo -u "$pg_user" "$psql_bin" -d postgres -tAc "SHOW shared_preload_libraries;" 2>/dev/null
+    else
+        "$psql_bin" -U "$pg_user" -d postgres -tAc "SHOW shared_preload_libraries;" 2>/dev/null
+    fi
+}
+
+# 确保某个库已加入 shared_preload_libraries（幂等）。优先 ALTER SYSTEM，失败则改写 postgresql.conf。
+# 返回：0=已配置（可能需要重启），1=服务未运行或配置失败
+_pg_ensure_preload_library() {
+    local lib="$1"
+    local current=""
+
+    current="$( _pg_get_preload_libraries | tr -d ' ' )"
+    if [ -n "$current" ]; then
+        local item
+        local IFS=','
+        for item in $current; do
+            [ "$item" = "$lib" ] && { echo "present"; return 0; }
+        done
+    fi
+
+    # 服务未运行时无法 ALTER SYSTEM / SHOW，改为直接改写 postgresql.conf
+    if [ -z "$current" ] && ! "$PG_INSTALL_DIR/bin/pg_isready" -q 2>/dev/null && ! command -v pg_isready >/dev/null 2>&1; then
+        : # 走到下面的 conf 改写
+    fi
+
+    # 尝试在线 ALTER SYSTEM（服务运行中）
+    if _pg_ext_run_sql "ALTER SYSTEM SET shared_preload_libraries TO '$( [ -n "$current" ] && echo "$current,$lib" || echo "$lib" )';" 2>/dev/null; then
+        echo "altered"
+        return 0
+    fi
+
+    # 离线兜底：改写 postgresql.conf
+    local conf="$PG_DATA_DIR/postgresql.conf"
+    if [ ! -f "$conf" ]; then
+        return 1
+    fi
+    local new_value
+    if grep -qE "^[[:space:]]*shared_preload_libraries[[:space:]]*=" "$conf"; then
+        local existing
+        existing=$(grep -E "^[[:space:]]*shared_preload_libraries[[:space:]]*=" "$conf" | tail -n1 | sed -E "s/^[^=]*=[[:space:]]*//; s/[#;].*$//; s/^['\"]//; s/['\"][[:space:]]*$//; s/[[:space:]]//g")
+        if [ -n "$existing" ]; then
+            new_value="$existing,$lib"
+        else
+            new_value="$lib"
+        fi
+        sed -i -E "\|^[[:space:]]*shared_preload_libraries[[:space:]]*=|c shared_preload_libraries = '$new_value'" "$conf" 2>/dev/null
+    else
+        echo "" >> "$conf"
+        echo "shared_preload_libraries = '$lib'" >> "$conf"
+    fi
+    echo "conf"
+    return 0
+}
+
+# 通用：判断给定 cmake 二进制版本是否 >= 3.15（TimescaleDB 2.x 的最低要求）
+# 参数：$1=cmake 二进制路径；满足返回 0
+_pg_cmake_version_ok() {
+    local bin="$1" ver major minor
+    [ -n "$bin" ] && [ -x "$bin" ] || return 1
+    ver=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    [ -n "$ver" ] || return 1
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    [ -z "$minor" ] && minor=0
+    # >= 3.15 即满足
+    [ "$major" -gt 3 ] 2>/dev/null && return 0
+    [ "$major" -eq 3 ] && [ "$minor" -ge 15 ] 2>/dev/null && return 0
+    return 1
+}
+
+# 通用：确保 PATH 中有 >= 3.15 的 cmake（TimescaleDB 构建用）。
+# 旧系统（如 CentOS 7）自带 cmake 2.8，需安装 cmake3（EPEL 提供，通常为 /usr/bin/cmake3）。
+# 成功后把现代 cmake 所在目录放到 PATH 最前（bootstrap 内部直接调用 `cmake`），并返回 0。
+_pg_ensure_modern_cmake() {
+    # 1) 现有 cmake 已达标
+    if _pg_cmake_version_ok "$(command -v cmake 2>/dev/null)"; then
+        echo -e "${GREEN}✓ cmake 版本满足要求（$(cmake --version | head -n1)）${NC}"
+        return 0
+    fi
+
+    # 2) 查找已安装且达标的现代 cmake/cmake3（可能不在 PATH 或名为 cmake3）
+    local c3="" b
+    # 候选：PATH 中的 cmake3、常见安装路径的 cmake3/cmake
+    local cand=""
+    for b in "$(command -v cmake3 2>/dev/null)" /usr/bin/cmake3 /usr/local/bin/cmake3 \
+             /opt/cmake3/bin/cmake /usr/local/bin/cmake /opt/cmake/bin/cmake; do
+        [ -n "$b" ] && [ -x "$b" ] && cand="$cand
+$b"
+    done
+    for b in $cand; do
+        if _pg_cmake_version_ok "$b"; then c3="$b"; break; fi
+    done
+    if [ -n "$c3" ]; then
+        _pg_activate_cmake "$c3" && return 0
+    fi
+
+    # 3) 需要安装：CentOS/RHEL7 用 cmake3（EPEL），新系统/Debian 用 cmake
+    echo -e "${YELLOW}✗ 当前 cmake 版本过低或缺失（TimescaleDB 需 cmake >= 3.15），尝试安装现代版本${NC}"
+    if command -v dnf &>/dev/null || command -v apt-get &>/dev/null; then
+        install_package "cmake openssl-devel" "cmake libssl-dev" "现代 cmake/openssl" false
+    else
+        # CentOS/RHEL 7：cmake3 在 EPEL，先确保 EPEL 可用
+        if ! rpm -q epel-release &>/dev/null; then
+            yum install -y epel-release 2>/dev/null
+        fi
+        install_package "cmake3 openssl-devel" "cmake libssl-dev" "cmake3/openssl(EPEL)" false
+    fi
+
+    # 4) 安装后重新探测
+    hash -r 2>/dev/null
+    if _pg_cmake_version_ok "$(command -v cmake 2>/dev/null)"; then
+        echo -e "${GREEN}✓ cmake 已升级：$(cmake --version | head -n1)${NC}"
+        return 0
+    fi
+    cand=""
+    for b in "$(command -v cmake3 2>/dev/null)" /usr/bin/cmake3 /usr/local/bin/cmake3 \
+             /opt/cmake3/bin/cmake /usr/local/bin/cmake /opt/cmake/bin/cmake; do
+        [ -n "$b" ] && [ -x "$b" ] && cand="$cand
+$b"
+    done
+    for b in $cand; do
+        if _pg_cmake_version_ok "$b"; then
+            _pg_activate_cmake "$b" && return 0
+        fi
+    done
+
+    echo -e "${RED}✗ 未能获得 cmake >= 3.15，TimescaleDB 无法编译${NC}"
+    echo -e "${CYAN}  CentOS/RHEL 7: yum install -y epel-release && yum install -y cmake3${NC}"
+    echo -e "${CYAN}  其它系统: yum install -y cmake 或 apt-get install -y cmake${NC}"
+    echo -e "${CYAN}  或从 https://github.com/Kitware/CMake/releases 下载预编译二进制后加入 PATH${NC}"
+    return 1
+}
+
+# 通用：把一个达标的现代 cmake（可能名为 cmake3）通过 shim 目录以 `cmake` 名义放到 PATH 最前。
+# 关键点：/usr/bin 下可能同时存在旧 cmake(2.8) 与 cmake3，仅把 cmake3 所在目录前置并不能覆盖旧 cmake；
+# 故在独立 shim 目录里软链 `cmake -> 现代二进制`，再将该目录置于 PATH 最前并 hash -r 清缓存。
+# 参数：$1=现代 cmake 二进制绝对路径
+_pg_activate_cmake() {
+    local modern="$1"
+    [ -n "$modern" ] && [ -x "$modern" ] || return 1
+    local shim_dir="/tmp/pg_cmake_shim"
+    mkdir -p "$shim_dir" 2>/dev/null || return 1
+    ln -sf "$modern" "$shim_dir/cmake" 2>/dev/null || return 1
+    # 若现代二进制名为 cmake3，也额外提供 ctest3 等无需；bootstrap 只调用 cmake
+    export PATH="$shim_dir:$PATH"
+    hash -r 2>/dev/null
+    local resolved
+    resolved="$(command -v cmake 2>/dev/null)"
+    if _pg_cmake_version_ok "$resolved"; then
+        echo -e "${GREEN}✓ 已启用现代 cmake：$("$resolved" --version | head -n1)（$resolved）${NC}"
+        return 0
+    fi
+    echo -e "${RED}✗ 现代 cmake 软链后仍未生效（当前: $resolved）${NC}"
+    return 1
+}
+
+# 通用：准备独立扩展源码（查找已解压目录 / 本地压缩包 / 在线下载）。
+# 参数：$1=扩展名(小写,用于日志)  $2=work_dir  $3=control文件名(如 postgis.control)
+#       $4=压缩包名匹配glob(如 'postgis-*.tar.gz')  $5=在线下载URL
+#       $6=未配置源码的标记文件(可选,如 postgis.control.in)
+#       $7=源码根锚点文件(可选,空格分隔;命中标记后沿目录向上找到第一个含这些文件的目录作为源码根,
+#          如 PostGIS 用 'GNUmakefile.in autogen.sh configure'，TimescaleDB 用 'bootstrap')
+# 说明：PostGIS/TimescaleDB 的 *.control(.in) 往往不在源码根目录——PostGIS 在 extensions/postgis/ 下
+#       （深度4），TimescaleDB 的 control 由 cmake 生成在 build/src/ 下；而 configure/bootstrap 在源码根。
+#       因此先按 control/标记文件定位（查找深度放宽到 6），再沿目录向上归一化到“含根锚点文件”的真正
+#       源码根；未提供锚点时回退为标记文件所在目录。
+# 成功时 echo 日志，且最后一行输出源码目录绝对路径；失败返回非0。
+_pg_ext_prepare_source() {
+    local ext_name="$1"
+    local work_dir="$2"
+    local control_file="$3"
+    local archive_glob="$4"
+    local url="$5"
+    local marker_file="${6:-}"
+    local root_anchors="${7:-}"
+
+    local search_roots=("$SCRIPT_DIR" "/tmp" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD" "$work_dir")
+
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    # 在 $1 目录下定位标记文件（已生成的 control 优先，其次未配置的 marker），回显其绝对路径
+    _find_marker() {
+        local base="$1" hit=""
+        hit=$(find "$base" -maxdepth 6 -type f -name "$control_file" 2>/dev/null | head -n1)
+        if [ -z "$hit" ] && [ -n "$marker_file" ]; then
+            hit=$(find "$base" -maxdepth 6 -type f -name "$marker_file" 2>/dev/null | head -n1)
+        fi
+        [ -n "$hit" ] && echo "$hit"
+    }
+
+    # 由标记文件路径归一化出真正的源码根：沿目录向上，找到第一个含根锚点文件的目录
+    _normalize_root() {
+        local hit="$1" d anc parent
+        d=$(dirname "$hit")
+        if [ -z "$root_anchors" ]; then
+            echo "$d"
+            return 0
+        fi
+        while :; do
+            for anc in $root_anchors; do
+                if [ -e "$d/$anc" ]; then
+                    echo "$d"
+                    return 0
+                fi
+            done
+            parent=$(dirname "$d")
+            [ "$parent" = "$d" ] && break
+            d="$parent"
+        done
+        # 未找到锚点：回退为标记文件所在目录
+        dirname "$hit"
+    }
+
+    # 在指定目录下查找源码，命中时 echo 归一化后的源码根目录
+    _find_src_root() {
+        local base="$1" hit=""
+        hit=$( _find_marker "$base" )
+        [ -n "$hit" ] && _normalize_root "$hit"
+    }
+
+    local src_dir="" hit root archive
+
+    # 1) 已解压源码（源码根目录含 control 文件或标记文件）
+    for root in "${search_roots[@]}"; do
+        [ -d "$root" ] || continue
+        src_dir=$( _find_src_root "$root" )
+        if [ -n "$src_dir" ]; then
+            echo -e "${GREEN}找到已解压的 $ext_name 源码: $src_dir${NC}"
+            break
+        fi
+    done
+
+    # 2) 本地压缩包
+    if [ -z "$src_dir" ]; then
+        for root in "${search_roots[@]}"; do
+            [ -d "$root" ] || continue
+            archive=$(find "$root" -maxdepth 2 -type f -name "$archive_glob" 2>/dev/null | head -n1)
+            if [ -n "$archive" ]; then
+                echo -e "${GREEN}找到 $ext_name 压缩包: $archive${NC}"
+                break
+            fi
+        done
+
+        if [ -n "$archive" ]; then
+            if ! tar -zxf "$archive" -C "$work_dir"; then
+                echo -e "${RED}解压失败: $archive${NC}"
+                return 1
+            fi
+            src_dir=$( _find_src_root "$work_dir" )
+            if [ -z "$src_dir" ]; then
+                echo -e "${RED}压缩包中未找到 $ext_name 源码（缺少 $control_file${marker_file:+ 或 $marker_file}）${NC}"
+                return 1
+            fi
+        fi
+    fi
+
+    # 3) 在线下载
+    if [ -z "$src_dir" ]; then
+        if [ "$OFFLINE_MODE" = "true" ]; then
+            echo -e "${RED}离线模式下未找到 $ext_name 源码包${NC}"
+            echo -e "${YELLOW}请在联网机下载源码，并与 PostgreSQL tar 包放在同一目录后重试：${NC}"
+            echo "  wget $url -O ${ext_name}-src.tar.gz"
+            echo -e "${YELLOW}也可解压后把源码目录放到 /tmp 或离线包同级目录${NC}"
+            echo -e "${YELLOW}本次跳过 $ext_name 安装，不影响 PostgreSQL 主程序${NC}"
+            return 1
+        fi
+
+        echo -e "${CYAN}未找到本地源码，尝试在线下载 $ext_name ...${NC}"
+        echo -e "${CYAN}下载地址: $url${NC}"
+        echo -e "${CYAN}（文件较大，请耐心等待，下方会显示下载进度条）${NC}"
+        local dl_ok=0 dl_file="$work_dir/${ext_name}.tar.gz"
+        if command -v wget &>/dev/null; then
+            wget --progress=bar:force --timeout=300 --tries=2 -O "$dl_file" "$url" && dl_ok=1
+        elif command -v curl &>/dev/null; then
+            curl -L --progress-bar --connect-timeout 30 --max-time 600 -f -o "$dl_file" "$url" && dl_ok=1
+        else
+            echo -e "${RED}需要 wget 或 curl 以下载 $ext_name${NC}"
+        fi
+
+        if [ "$dl_ok" != "1" ] || [ ! -s "$dl_file" ]; then
+            echo -e "${RED}$ext_name 下载失败${NC}"
+            echo -e "${YELLOW}可手动下载后放到 /tmp 或离线包同级目录：${NC}"
+            echo "  $url"
+            echo -e "${YELLOW}本次跳过 $ext_name 安装，不影响 PostgreSQL 主程序${NC}"
+            return 1
+        fi
+
+        if ! tar -zxf "$dl_file" -C "$work_dir"; then
+            echo -e "${RED}解压下载的 $ext_name 失败${NC}"
+            return 1
+        fi
+        src_dir=$( _find_src_root "$work_dir" )
+        if [ -z "$src_dir" ]; then
+            echo -e "${RED}下载内容中未找到 $ext_name 源码（缺少 $control_file${marker_file:+ 或 $marker_file}）${NC}"
+            return 1
+        fi
+    fi
+
+    echo "$src_dir"
+    return 0
+}
+
+# 通用：服务就绪后在 postgres 库执行 CREATE EXTENSION。
+# 参数：$1=扩展名(SQL名,如 postgis)  $2=显示名  $3=控制文件中的库名提示(可选)
+# 若服务未运行则只打印手动命令，不做重试。
+_pg_enable_simple_extension() {
+    local ext_sql="$1"
+    local ext_show="$2"
+    local psql_bin="$PG_INSTALL_DIR/bin/psql"
+    [ -x "$psql_bin" ] || psql_bin="psql"
+    local pg_isready_bin="$PG_INSTALL_DIR/bin/pg_isready"
+    [ -x "$pg_isready_bin" ] || pg_isready_bin="pg_isready"
+    local sql="CREATE EXTENSION IF NOT EXISTS $ext_sql;"
+    local ok=false
+    # 与 _pg_ext_run_sql 一致的空用户名兜底，保证手动提示命令里 -U 不为空
+    local pg_user="${PG_USER:-${DEFAULT_PG_USER:-postgres}}"
+
+    echo ""
+    echo -e "${GREEN}✓ $ext_show 扩展文件已安装完成（无需重新编译）。${NC}"
+    # 交互确认：是否立即在 postgres 库自动注册扩展。默认跳过，避免服务未启动/需密码认证时脚本卡死
+    local enable_now="n"
+    read -r -p "$(echo -e "${CYAN}是否立即在 postgres 数据库自动启用 $ext_show？[y/N]（默认跳过，可稍后按下方命令手动执行）：${NC}")" enable_now
+    case "$enable_now" in
+        y|Y|yes|YES)
+            echo -e "${YELLOW}在数据库中启用 $ext_show 扩展（$sql）...${NC}"
+            ;;
+        *)
+            echo -e "${CYAN}已跳过自动启用。待数据库启动后，在目标库执行一次即可注册扩展：${NC}"
+            echo "  $psql_bin -U $pg_user -d postgres -c \"$sql\""
+            echo -e "${CYAN}其它业务库同理，连到对应库执行 $sql${NC}"
+            return 0
+            ;;
+    esac
+
+    local server_up=false
+    if [ -x "$PG_INSTALL_DIR/bin/pg_isready" ] || command -v pg_isready &>/dev/null; then
+        "$pg_isready_bin" -q 2>/dev/null && server_up=true
+    else
+        _pg_ext_run_sql "$sql" && { server_up=true; ok=true; }
+    fi
+
+    if [ "$server_up" != true ]; then
+        echo -e "${YELLOW}检测到数据库服务未运行，跳过自动创建扩展。${NC}"
+        echo -e "${GREEN}$ext_show 扩展文件已安装完成，无需重新编译。${NC}"
+        echo -e "${CYAN}待数据库启动后，在目标库执行一次即可注册扩展：${NC}"
+        echo "  $psql_bin -U $pg_user -d postgres -c \"$sql\""
+        echo -e "${CYAN}其它业务库同理，连到对应库执行 $sql${NC}"
+        return 0
+    fi
+
+    local i
+    for i in 1 2 3; do
+        if _pg_ext_run_sql "$sql"; then
+            ok=true
+            break
+        fi
+        echo -e "${YELLOW}等待数据库服务就绪... ($i/3)${NC}"
+        sleep 2
+    done
+
+    if [ "$ok" = true ]; then
+        echo -e "${GREEN}✓ 已在 postgres 数据库创建扩展 $ext_sql${NC}"
+        echo -e "${CYAN}在其它业务库使用时，请在对应库执行: $sql${NC}"
+    else
+        echo -e "${YELLOW}⚠ 自动创建扩展未成功，可在服务启动后手动执行：${NC}"
+        echo "  $psql_bin -U $pg_user -d postgres -c \"$sql\""
+    fi
+}
+
+# ============================================================================
+# PostGIS 空间扩展
+# ============================================================================
+
+# 版本比较：$1 >= $2 返回 0（格式 x.y.z，借助 sort -V）
+_pg_ver_ge() {
+    [ -n "$1" ] || return 1
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+# 确保 /usr/local 下自编译的库可被动态链接、可执行文件优先被找到
+_pg_prepend_local_prefix() {
+    export PATH="/usr/local/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    local f="/etc/ld.so.conf.d/local-pg-ext.conf"
+    if [ ! -f "$f" ]; then
+        echo "/usr/local/lib" > "$f" 2>/dev/null || true
+    fi
+    ldconfig 2>/dev/null || true
+    hash -r 2>/dev/null || true
+}
+
+# 编译重型 C++（GEOS/PROJ 等）前确保内存充足。物理内存+交换分区过低时，编译器进程会被
+# OOM 杀死，报 GCC “internal compiler error ... likely a hardware or OS problem”，
+# 且每次崩溃的源文件都不同。此时自动创建一个临时 swap 文件兜底（编译完成后可保留，利于后续编译）。
+_pg_ensure_swap() {
+    [ -r /proc/meminfo ] || return 0
+    command -v swapon >/dev/null 2>&1 || return 0
+    local mem_kb swap_kb total_kb need_mb=3072 add_mb swapfile dir
+    mem_kb=$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    swap_kb=$(awk '/SwapTotal/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    : "${mem_kb:=0}"; : "${swap_kb:=0}"
+    total_kb=$((mem_kb + swap_kb))
+    if [ "$total_kb" -ge $((need_mb * 1024)) ]; then
+        return 0   # 内存(含swap)已充足
+    fi
+    # 已存在本脚本创建的 swap 则跳过
+    if swapon --show 2>/dev/null | grep -q "pg_ext_swapfile"; then
+        return 0
+    fi
+    if [ "$(id -u 2>/dev/null)" != "0" ]; then
+        echo -e "${YELLOW}⚠ 检测到内存偏低（物理内存+swap 约 $((total_kb / 1024))MB < ${need_mb}MB），${NC}"
+        echo -e "${YELLOW}  当前非 root 用户无法自动创建 swap。若编译出现编译器崩溃(internal compiler error)，${NC}"
+        echo -e "${YELLOW}  请用 root 执行：dd if=/dev/zero of=/swapfile bs=1M count=2048 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile${NC}"
+        return 0
+    fi
+    # 需要补充的内存量（MB），限制在 1024~4096 之间
+    add_mb=$(( (need_mb * 1024 - total_kb) / 1024 ))
+    [ "$add_mb" -lt 1024 ] && add_mb=1024
+    [ "$add_mb" -gt 4096 ] && add_mb=4096
+    # 选一个剩余空间足够的目录放置 swap 文件（优先 /，其次 /var、/tmp）
+    swapfile=""
+    for dir in / /var /tmp; do
+        [ -d "$dir" ] || continue
+        local avail_kb
+        avail_kb=$(df -P -k "$dir" 2>/dev/null | awk 'NR==2{print $4}')
+        [ -z "$avail_kb" ] && continue
+        if [ "$avail_kb" -ge $(( (add_mb + 512) * 1024 )) ]; then
+            swapfile="$dir/pg_ext_swapfile"; [ "$dir" = "/" ] && swapfile="/pg_ext_swapfile"
+            break
+        fi
+    done
+    if [ -z "$swapfile" ]; then
+        echo -e "${YELLOW}⚠ 内存偏低（约 $((total_kb / 1024))MB）但磁盘剩余空间不足，无法自动创建 ${add_mb}MB swap；${NC}"
+        echo -e "${YELLOW}  若编译崩溃，请手动清理磁盘后加 swap，或在内存更大的机器上编译。${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}⚠ 检测到内存偏低（物理内存+swap 约 $((total_kb / 1024))MB < ${need_mb}MB），${NC}"
+    echo -e "${CYAN}  为避免编译时内存不足导致编译器崩溃，自动创建 ${add_mb}MB 临时交换文件: $swapfile${NC}"
+    if dd if=/dev/zero of="$swapfile" bs=1M count="$add_mb" 2>/dev/null \
+       && chmod 600 "$swapfile" \
+       && mkswap "$swapfile" >/dev/null 2>&1 \
+       && swapon "$swapfile" 2>/dev/null; then
+        echo -e "${GREEN}✓ 已启用临时 swap（$swapfile），编译内存压力将得到缓解${NC}"
+        echo -e "${CYAN}  （该 swap 会持续生效；如需移除：swapoff $swapfile && rm -f $swapfile）${NC}"
+    else
+        echo -e "${YELLOW}⚠ 自动创建 swap 失败，继续编译；若出现编译器崩溃请手动加 swap。${NC}"
+        rm -f "$swapfile" 2>/dev/null
+    fi
+    return 0
+}
+
+# 编译 GEOS/PROJ 等现代 C++ 项目前，确保使用足够新的 GCC。
+# CentOS 7 自带 gcc 4.8.5，对 C++11/14 支持不完整且有代码生成 bug，编译 GEOS 3.9 这类
+# 项目会随机触发 GCC 内部错误（internal compiler error，每次崩溃文件不同）——与内存无关。
+# CentOS/RHEL 7 通过 SCL(devtoolset) 提供新版 gcc，本函数尝试安装并启用。
+# 同时禁用 ccache（老版本 ccache 也可能造成偶发编译异常）。
+_pg_enable_modern_gcc() {
+    # 始终禁用 ccache，让编译器直接被调用，排除缓存导致的偶发问题
+    export CCACHE_DISABLE=1
+
+    _pg_gcc_major() {
+        local v
+        v=$(g++ -dumpversion 2>/dev/null | grep -oE '^[0-9]+' | head -n1)
+        echo "${v:-0}"
+    }
+
+    local cur; cur=$(_pg_gcc_major)
+    if [ "$cur" -ge 7 ] 2>/dev/null; then
+        echo -e "${GREEN}✓ 编译器版本满足要求（g++ $(g++ -dumpversion)）${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}当前 g++ 版本为 $(g++ -dumpversion 2>/dev/null || echo '未知')，编译 GEOS/PROJ 等现代 C++ 易触发编译器内部错误，尝试启用新版 gcc（devtoolset）...${NC}"
+
+    local os_id=""
+    if [ -r /etc/os-release ]; then
+        os_id=$(. /etc/os-release 2>/dev/null; echo "$ID")
+    fi
+
+    if echo "$os_id" | grep -qiE 'centos|rhel|redhat|rocky|alma|ol'; then
+        # 仅在 el7（gcc 4.8）需要 SCL；el8 自带 gcc 8+
+        if yum install -y centos-release-scl >/dev/null 2>&1; then
+            echo -e "${CYAN}  已启用 SCL 软件源（centos-release-scl）${NC}"
+        else
+            echo -e "${YELLOW}  安装 centos-release-scl 失败，尝试直接安装 devtoolset...${NC}"
+        fi
+        # 依次尝试 devtoolset-11 / 10 / 9 / 8（版本越新对 C++ 支持越好）
+        local dts dtsdir
+        for dts in devtoolset-11 devtoolset-10 devtoolset-9 devtoolset-8; do
+            if yum install -y "$dts-toolchain" >/dev/null 2>&1; then
+                dtsdir="/opt/rh/$dts/root"
+                if [ -f "$dtsdir/usr/bin/g++" ] || ls "$dtsdir"/usr/bin/g++* >/dev/null 2>&1; then
+                    # source SCL enable，使当前 shell 的 PATH/CC/CXX 指向新版 gcc
+                    if [ -f "$dtsdir/enable" ]; then
+                        # shellcheck disable=SC1090
+                        . "$dtsdir/enable" 2>/dev/null
+                    fi
+                    export CC="$dtsdir/usr/bin/gcc"
+                    export CXX="$dtsdir/usr/bin/g++"
+                    hash -r 2>/dev/null || true
+                    cur=$(_pg_gcc_major)
+                    if [ "$cur" -ge 7 ] 2>/dev/null; then
+                        echo -e "${GREEN}✓ 已启用 $dts（g++ $($CXX -dumpversion 2>/dev/null)），位于 $dtsdir${NC}"
+                        return 0
+                    fi
+                fi
+            fi
+        done
+    fi
+
+    # 兜底：再检查一次当前版本（也许系统本身已有较新 gcc，只是未在默认 PATH）
+    cur=$(_pg_gcc_major)
+    if [ "$cur" -ge 7 ] 2>/dev/null; then
+        echo -e "${GREEN}✓ 编译器版本满足要求（g++ $(g++ -dumpversion)）${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}⚠ 未能自动启用新版 GCC。当前 g++ 为 $(g++ -dumpversion 2>/dev/null || echo '未知')，${NC}"
+    echo -e "${YELLOW}  若编译 GEOS/PROJ 时出现「internal compiler error / likely a hardware or OS problem」，${NC}"
+    echo -e "${YELLOW}  请手动安装新版编译器后重试，例如 CentOS/RHEL 7：${NC}"
+    echo -e "${CYAN}    yum install -y centos-release-scl && yum install -y devtoolset-11-toolchain${NC}"
+    echo -e "${CYAN}    scl enable devtoolset-11 bash   # 进入新版 gcc 环境后再运行本脚本${NC}"
+    # 不直接失败：允许继续尝试（Debian/Ubuntu 或已手工装好工具链的环境可能本就没问题）
+    return 0
+}
+
+# 根据 CPU 核数与可用内存计算安全的 make 并行度。
+# C++ 项目（如 GEOS）在 -O2 下单编译进程峰值内存可达 ~1.2GB，并行过高会 OOM，
+# 触发 GCC “internal compiler error ... likely a hardware or OS problem”。
+# 经验值：每个并行任务预留约 1500MB；并行度取 min(CPU核数, 可用内存MB/1500)，至少 1。
+_pg_safe_jobs() {
+    local cpu mem_mb jobs_by_mem
+    cpu=$(nproc 2>/dev/null || echo 2)
+    mem_mb=0
+    if [ -r /proc/meminfo ]; then
+        # MemAvailable 为内核估算的“可用于启动新程序”的内存（KB）
+        mem_mb=$(awk '/MemAvailable/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+    fi
+    [ -z "$mem_mb" ] && mem_mb=0
+    if [ "$mem_mb" -gt 0 ] 2>/dev/null; then
+        jobs_by_mem=$(( mem_mb / 1500 ))
+        [ "$jobs_by_mem" -lt 1 ] && jobs_by_mem=1
+        if [ "$jobs_by_mem" -lt "$cpu" ]; then
+            echo "$jobs_by_mem"
+        else
+            echo "$cpu"
+        fi
+    else
+        echo "$cpu"
+    fi
+}
+
+# 通用：本地优先获取依赖库源码（已解压目录 → 本地压缩包 → 在线下载）并编译安装到 /usr/local
+# 参数：$1=名称(如 geos/proj/sqlite)  $2=压缩包名glob(如 'geos-[0-9]*.tar.*')  $3=下载URL
+#       $4=构建方式 autotools|cmake  $5=额外配置参数(可选)
+#       $6=解压后源码目录前缀(可选)，默认取压缩包glob中第一个“-”前部分(如 geos/proj)；
+#          当包名含多个“-”时必须显式传入，例如 sqlite 包为 sqlite-autoconf-*.tar.gz、
+#          解压目录为 sqlite-autoconf-<ver>，默认前缀会误算成 "sqlite" 导致定位失败，需传 "sqlite-autoconf"
+_pg_build_dep_from_source() {
+    local name="$1" glob="$2" url="$3" buildsys="$4" confargs="${5:-}" dir_prefix="${6:-}"
+    local prefix="${glob%%-*}"   # 取第一个“-”前部分，如 geos / proj / sqlite(注意非 sqlite-autoconf)
+    [ -n "$dir_prefix" ] && prefix="$dir_prefix"
+    local work_dir="/tmp/${name}_dep_build"
+    local roots=("$SCRIPT_DIR" "/tmp" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD")
+    local jobs; jobs=$(_pg_safe_jobs)
+    echo -e "${CYAN}编译并行度: make -j$jobs（已按可用内存自动限制，避免内存不足导致编译器崩溃）${NC}"
+    local src_dir="" d arch cand out
+
+    rm -rf "$work_dir"; mkdir -p "$work_dir"
+
+    # 1) 本地已解压目录（含 configure 或 CMakeLists.txt）
+    for d in "${roots[@]}"; do
+        [ -d "$d" ] || continue
+        while IFS= read -r cand; do
+            if [ -e "$cand/configure" ] || [ -e "$cand/CMakeLists.txt" ]; then
+                src_dir="$cand"; break
+            fi
+        done < <(find "$d" -maxdepth 3 -type d -name "${prefix}-[0-9]*" 2>/dev/null)
+        [ -n "$src_dir" ] && break
+    done
+
+    # 2) 本地压缩包
+    if [ -z "$src_dir" ]; then
+        for d in "${roots[@]}"; do
+            [ -d "$d" ] || continue
+            arch=$(find "$d" -maxdepth 2 -type f -name "$glob" 2>/dev/null | head -n1)
+            [ -n "$arch" ] && break
+        done
+        if [ -n "$arch" ]; then
+            echo -e "${CYAN}找到 ${name} 本地压缩包: $arch${NC}"
+            if ! tar -xf "$arch" -C "$work_dir"; then
+                echo -e "${RED}${name} 压缩包解压失败: $arch${NC}"; return 1
+            fi
+            src_dir=$(find "$work_dir" -maxdepth 1 -type d -name "${prefix}-[0-9]*" 2>/dev/null | head -n1)
+        fi
+    fi
+
+    # 3) 在线下载
+    if [ -z "$src_dir" ]; then
+        # 汇总本次实际会搜索的本地目录，用于提示用户离线包该放哪
+        local search_hints=""
+        for d in "$SCRIPT_DIR" "/tmp" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD"; do
+            [ -n "$d" ] && [ -d "$d" ] && search_hints="$search_hints\n    $d"
+        done
+        if [ "$OFFLINE_MODE" = true ]; then
+            echo -e "${RED}离线模式：未找到 ${name} 源码，请手动下载后放到以下任一目录（脚本会自动识别，无需解压）：${NC}"
+            echo -e "${CYAN}  wget $url -O $(basename "$url")${NC}"
+            echo -e "${CYAN}可放置目录：${search_hints}${NC}"
+            return 1
+        fi
+        out="$work_dir/$(basename "$url")"
+        echo -e "${CYAN}未找到本地 ${name} 源码，在线下载: $url${NC}"
+        echo -e "${CYAN}（离线环境可预先把 $(basename "$url") 放到以下任一目录，脚本将自动识别而不联网下载）：${NC}"
+        echo -e "${CYAN}    ${search_hints}${NC}"
+        echo -e "${CYAN}（文件较大，请耐心等待，下方会显示下载进度条；若长时间无进度可能是网络慢）${NC}"
+        if command -v wget &>/dev/null; then
+            # --progress=bar:force：即使非交互终端也强制显示进度条，避免“看起来卡住”
+            wget --progress=bar:force --timeout=300 --tries=2 -O "$out" "$url" || out=""
+        elif command -v curl &>/dev/null; then
+            curl -fL --progress-bar --connect-timeout 30 --max-time 600 -o "$out" "$url" || out=""
+        else
+            echo -e "${RED}未找到 wget/curl，无法下载 ${name} 源码${NC}"; return 1
+        fi
+        if [ -z "$out" ] || [ ! -s "$out" ]; then
+            echo -e "${RED}${name} 源码下载失败: $url${NC}"; return 1
+        fi
+        tar -xf "$out" -C "$work_dir" || { echo -e "${RED}${name} 源码解压失败${NC}"; return 1; }
+        src_dir=$(find "$work_dir" -maxdepth 1 -type d -name "${prefix}-[0-9]*" 2>/dev/null | head -n1)
+    fi
+
+    if [ -z "$src_dir" ] || [ ! -d "$src_dir" ]; then
+        echo -e "${RED}${name} 源码目录定位失败${NC}"; return 1
+    fi
+    echo -e "${GREEN}使用 ${name} 源码目录: $src_dir${NC}"
+    cd "$src_dir" || return 1
+    _pg_prepend_local_prefix
+    # GEOS 等现代 C++ 项目需要新版编译器；老系统（CentOS7 gcc 4.8）自动启用 devtoolset 并禁用 ccache
+    _pg_enable_modern_gcc
+
+    # 老版 gcc（主版本 <5，如 CentOS7 自带的 gcc 4.8.5）编译 SQLite 的巨型单文件 sqlite3.c
+    # （amalgamation，约25万行、内含 exprAnalyze 等超大函数）时，在默认 -O2 下会触发编译器
+    # 内部错误（internal compiler error: Segmentation fault）。这是 gcc 4.8 已知的 codegen 缺陷，
+    # 降并行度（-j1）对此无效（sqlite3.c 只有一个编译单元），只有降低优化级别才能规避。
+    # 因此在配置前主动检测实际生效的 C 编译器版本（devtoolset 启用成功则为新版 gcc），
+    # 老 gcc 直接以 -O1 配置；若 -O1 仍失败，下方还有 -j1 与 -O0 两级兜底。
+    local opt_flags="" cc_bin cc_ver cc_major
+    cc_bin="${CC:-gcc}"
+    if cc_ver=$("$cc_bin" -dumpversion 2>/dev/null); then
+        cc_major=$(printf '%s' "$cc_ver" | grep -oE '^[0-9]+' | head -n1)
+        if [ -n "$cc_major" ] && [ "$cc_major" -lt 5 ] 2>/dev/null; then
+            opt_flags="-O1"
+            echo -e "${YELLOW}检测到 C 编译器为老版本 gcc $cc_ver（主版本 <5）：编译巨型源文件（如 SQLite 的 sqlite3.c）${NC}"
+            echo -e "${YELLOW}在 -O2 下会触发 internal compiler error（编译器段错误），主动改用 -O1 低优化级别配置以规避${NC}"
+        fi
+    fi
+
+    if [ "$buildsys" = "cmake" ]; then
+        _pg_ensure_modern_cmake || return 1
+        echo -e "${CYAN}执行: cmake -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release ${opt_flags:+-DCMAKE_C_FLAGS=$opt_flags -DCMAKE_CXX_FLAGS=$opt_flags} $confargs .${NC}"
+        cmake -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release \
+              ${opt_flags:+-DCMAKE_C_FLAGS="$opt_flags" -DCMAKE_CXX_FLAGS="$opt_flags"} \
+              $confargs . || { echo -e "${RED}${name} cmake 配置失败${NC}"; return 1; }
+    else
+        if [ ! -e configure ] && [ -e autogen.sh ]; then
+            echo -e "${YELLOW}${name} 源码无 configure，先运行 ./autogen.sh...${NC}"
+            bash ./autogen.sh || { echo -e "${RED}${name} autogen.sh 失败（缺 autoconf/automake/libtool）${NC}"; return 1; }
+        fi
+        echo -e "${CYAN}执行: ./configure --prefix=/usr/local ${opt_flags:+CFLAGS=$opt_flags CXXFLAGS=$opt_flags} $confargs${NC}"
+        ./configure --prefix=/usr/local ${opt_flags:+CFLAGS="$opt_flags" CXXFLAGS="$opt_flags"} $confargs \
+            || { echo -e "${RED}${name} configure 失败${NC}"; return 1; }
+    fi
+
+    echo -e "${CYAN}执行: make -j$jobs && make install（${name}）${NC}"
+    if make -j"$jobs"; then
+        :
+    else
+        # 第一次失败：多为并行编译内存不足导致 GCC 内部错误（internal compiler error /
+        # “likely a hardware or OS problem”）。降为单线程重试，显著降低峰值内存。
+        echo -e "${YELLOW}${name} 并行编译失败（可能为内存不足导致编译器崩溃），降为单线程 make -j1 重试...${NC}"
+        if make -j1; then
+            :
+        else
+            # 第二次失败：重新以低优化级别(-O0)配置后再单线程编译，最大限度降低单进程内存峰值。
+            if [ "$buildsys" = "cmake" ]; then
+                echo -e "${YELLOW}单线程仍失败，以 -O0 低优化重新 cmake 后再编译...${NC}"
+                cmake -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Debug \
+                      -DCMAKE_C_FLAGS="-O0" -DCMAKE_CXX_FLAGS="-O0" $confargs . \
+                      && make -j1 || { echo -e "${RED}${name} 编译失败（已尝试降并行度与低优化仍失败，请检查内存/磁盘或手动编译）${NC}"; return 1; }
+            else
+                echo -e "${YELLOW}单线程仍失败，以 -O0 低优化重新 configure 后再编译...${NC}"
+                ( ./configure --prefix=/usr/local CFLAGS="-O0" CXXFLAGS="-O0" $confargs && make -j1 ) \
+                    || { echo -e "${RED}${name} 编译失败（已尝试降并行度与低优化仍失败，请检查内存/磁盘或手动编译）${NC}"; return 1; }
+            fi
+        fi
+    fi
+    make install || { echo -e "${RED}${name} 安装失败（make install）${NC}"; return 1; }
+    _pg_prepend_local_prefix
+    echo -e "${GREEN}✓ ${name} 已编译安装到 /usr/local${NC}"
+    return 0
+}
+
+# 确保 PostGIS 3.5 所需的 GEOS(>=3.8) 与 PROJ(>=6) 就绪；系统包过旧时从源码编译到 /usr/local
+_pg_ensure_postgis_build_deps() {
+    _pg_prepend_local_prefix
+    _pg_ensure_swap
+    local ver bin url sqlite_num
+
+    # ---- GEOS ----
+    bin=$(command -v geos-config 2>/dev/null)
+    ver=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    if _pg_ver_ge "$ver" "3.8"; then
+        echo -e "${GREEN}✓ GEOS 版本满足要求：$ver（$bin）${NC}"
+    else
+        echo -e "${YELLOW}系统 GEOS 版本过低（当前: ${ver:-未安装}，PostGIS 3.5 需 >= 3.8），从源码编译 GEOS ${GEOS_VERSION} 到 /usr/local...${NC}"
+        install_package "gcc-c++ make which bzip2" "g++ make bzip2" "GEOS 编译工具链" false
+        url="https://download.osgeo.org/geos/geos-${GEOS_VERSION}.tar.bz2"
+        if ! _pg_build_dep_from_source "geos" "geos-[0-9]*.tar.*" "$url" "autotools"; then
+            echo -e "${RED}GEOS 源码编译安装失败，PostGIS 将无法配置${NC}"
+            echo -e "${YELLOW}可手动下载 $url 放到 /tmp 或脚本目录后重试${NC}"
+            return 1
+        fi
+        bin=$(command -v geos-config 2>/dev/null)
+        ver=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        if _pg_ver_ge "$ver" "3.8"; then
+            echo -e "${GREEN}✓ GEOS 已升级：$ver（$bin）${NC}"
+        else
+            echo -e "${RED}GEOS 编译后版本仍不达标：${ver:-未知}${NC}"; return 1
+        fi
+    fi
+
+    # ---- PROJ（PostGIS 3.5 需 >=4.9，这里统一要求 >=6 以使用现代 proj API）----
+    ver=$(pkg-config --modversion proj 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    [ -z "$ver" ] && ver=$(/usr/local/bin/proj --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    [ -z "$ver" ] && ver=$(proj --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+    if _pg_ver_ge "$ver" "6.0"; then
+        echo -e "${GREEN}✓ PROJ 版本满足要求：$ver${NC}"
+    else
+        echo -e "${YELLOW}系统 PROJ 版本过低（当前: ${ver:-未安装}），从源码编译 PROJ ${PROJ_VERSION} 到 /usr/local...${NC}"
+        install_package "gcc-c++ make which sqlite-devel" "g++ make libsqlite3-dev" "PROJ 编译工具链(sqlite3)" false
+
+        # ---- SQLite（PROJ 6+ 的 configure 要求 sqlite3 >= 3.11，CentOS7 自带仅 3.7.17）----
+        # 版本过低时先从源码编译 SQLite 到 /usr/local（安装 sqlite3.pc，供 PROJ 的 pkg-config 检测）
+        ver=$(pkg-config --modversion sqlite3 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        [ -z "$ver" ] && ver=$(/usr/local/bin/sqlite3 --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if _pg_ver_ge "$ver" "3.11"; then
+            echo -e "${GREEN}✓ SQLite 版本满足 PROJ 编译要求：$ver${NC}"
+        else
+            echo -e "${YELLOW}系统 SQLite 版本过低（当前: ${ver:-未安装}，PROJ ${PROJ_VERSION} 需 >= 3.11），从源码编译 SQLite ${SQLITE_VERSION} 到 /usr/local...${NC}"
+            install_package "gcc make which" "gcc make" "SQLite 编译工具链" false
+            # sqlite 官方包名为 sqlite-autoconf-NNNNNNN.tar.gz（数字=主*1000000+次*10000+补丁*100）
+            sqlite_num=$(echo "$SQLITE_VERSION" | awk -F. '{printf "%d", $1*1000000 + $2*10000 + $3*100}')
+            url="https://www.sqlite.org/2024/sqlite-autoconf-${sqlite_num}.tar.gz"
+            # 第6参数显式指定解压目录前缀：包名含多个“-”，默认前缀会误算为 sqlite
+            if ! _pg_build_dep_from_source "sqlite" "sqlite-autoconf-[0-9]*.tar.*" "$url" "autotools" "" "sqlite-autoconf"; then
+                echo -e "${RED}SQLite 源码编译安装失败，PROJ 将无法配置${NC}"
+                echo -e "${YELLOW}可手动下载 $url 放到 /tmp 或脚本目录后重试${NC}"
+                return 1
+            fi
+            _pg_prepend_local_prefix
+            ver=$(pkg-config --modversion sqlite3 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+            if _pg_ver_ge "$ver" "3.11"; then
+                echo -e "${GREEN}✓ SQLite 已升级：$ver${NC}"
+            else
+                echo -e "${RED}SQLite 编译后版本仍不达标：${ver:-未知}${NC}"; return 1
+            fi
+        fi
+
+        url="https://download.osgeo.org/proj/proj-${PROJ_VERSION}.tar.gz"
+        if ! _pg_build_dep_from_source "proj" "proj-[0-9]*.tar.*" "$url" "autotools"; then
+            echo -e "${RED}PROJ 源码编译安装失败，PostGIS 将无法配置${NC}"
+            echo -e "${YELLOW}可手动下载 $url 放到 /tmp 或脚本目录后重试${NC}"
+            return 1
+        fi
+        ver=$(pkg-config --modversion proj 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        [ -z "$ver" ] && ver=$(/usr/local/bin/proj --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        if _pg_ver_ge "$ver" "6.0"; then
+            echo -e "${GREEN}✓ PROJ 已升级：$ver${NC}"
+        else
+            echo -e "${RED}PROJ 编译后版本仍不达标：${ver:-未知}${NC}"; return 1
+        fi
+    fi
+    return 0
+}
+
+install_postgis() {
+    echo ""
+    echo -e "${YELLOW}========== 安装 PostGIS 空间扩展 ==========${NC}"
+
+    if [ ! -x "$PG_INSTALL_DIR/bin/pg_config" ]; then
+        echo -e "${RED}未找到 pg_config：$PG_INSTALL_DIR/bin/pg_config${NC}"
+        echo -e "${YELLOW}PostGIS 需在 PostgreSQL 主程序编译安装完成后再安装${NC}"
+        return 1
+    fi
+
+    local pg_config="$PG_INSTALL_DIR/bin/pg_config"
+    local jobs=$(_pg_safe_jobs)
+    local work_dir="/tmp/postgis_build"
+    local url="https://codeload.github.com/postgis/postgis/tar.gz/refs/tags/${POSTGIS_VERSION}"
+
+    # 准备源码：postgis.control(.in) 位于 extensions/postgis/ 子目录，命中后归一化到含
+    # configure/GNUmakefile.in/autogen.sh 的源码根（根锚点）。
+    # 注意：命令替换会吞掉函数内的所有输出，因此手动回显日志（最后一行是源码路径）
+    local prepared src_dir rc
+    prepared=$( _pg_ext_prepare_source "postgis" "$work_dir" "postgis.control" "postgis-*.tar.gz" "$url" "postgis.control.in" "configure GNUmakefile.in autogen.sh" )
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        [ -n "$prepared" ] && echo "$prepared"
+        echo -e "${RED}PostGIS 源码准备失败（见上方日志），可手动下载后放到 /tmp 或脚本目录再重试：${NC}"
+        echo "  wget $url -O postgis-${POSTGIS_VERSION}.tar.gz"
+        return 1
+    fi
+    echo "$prepared" | head -n -1
+    src_dir=$(echo "$prepared" | tail -n1)
+
+    echo -e "${GREEN}使用 PostGIS 源码目录: $src_dir${NC}"
+    cd "$src_dir" || return 1
+
+    # CentOS7 等老系统的 GEOS/PROJ 版本过低（GEOS 3.4 < 3.8、PROJ 4.8），版本不达标时自动源码编译到 /usr/local
+    if ! _pg_ensure_postgis_build_deps; then
+        echo -e "${RED}PostGIS 核心依赖（GEOS/PROJ）版本不达标且源码编译失败，无法继续${NC}"
+        return 1
+    fi
+
+    # GitHub/codeload 源码包不含已生成的 configure（只有 configure.ac + autogen.sh），
+    # 需先运行 autogen.sh 生成 configure；官方 make dist 发布包自带 configure，直接跳过。
+    if [ ! -x ./configure ] && [ ! -f ./configure ]; then
+        if [ -f ./autogen.sh ]; then
+            echo -e "${YELLOW}源码包未包含 configure（Git/codeload 源码），先运行 ./autogen.sh 生成...${NC}"
+            if ! bash ./autogen.sh; then
+                echo -e "${RED}autogen.sh 执行失败，缺少 autotools 构建工具${NC}"
+                echo -e "${YELLOW}请安装后重试：${NC}"
+                echo -e "${CYAN}  CentOS/RHEL: yum install autoconf automake libtool which${NC}"
+                echo -e "${CYAN}  Debian/Ubuntu: apt-get install autoconf automake libtool pkg-config${NC}"
+                return 1
+            fi
+        else
+            echo -e "${RED}源码目录缺少 configure 且无 autogen.sh，源码不完整: $src_dir${NC}"
+            return 1
+        fi
+    fi
+
+    # 显式指定 /usr/local 下新编的 geos-config 与 PROJ 目录，避免 configure 误用系统老版本
+    local geoscfg projdir postgis_conf
+    geoscfg="$(command -v geos-config 2>/dev/null)"
+    projdir=""
+    [ -x /usr/local/bin/proj ] && projdir="/usr/local"
+    postgis_conf="--with-pgconfig=$pg_config"
+    [ -n "$geoscfg" ] && postgis_conf="$postgis_conf --with-geosconfig=$geoscfg"
+    [ -n "$projdir" ] && postgis_conf="$postgis_conf --with-projdir=$projdir"
+
+    echo -e "${CYAN}执行: ./configure $postgis_conf${NC}"
+    if ! ./configure $postgis_conf; then
+        # CentOS7 自带 protobuf-c 1.0.2 < PostGIS 要求的 1.1.0，会报
+        # "Old protobuf-c release found but 1.1.0 is required"。protobuf 仅用于
+        # MVT/Geobuf 矢量瓦片（ST_AsMVT），非核心功能，先单独关闭它（保留 raster/topology）。
+        echo -e "${YELLOW}完整配置失败，尝试关闭 protobuf（MVT 矢量瓦片；CentOS7 自带 protobuf-c 1.0.2 低于要求的 1.1.0）...${NC}"
+        if ! ./configure $postgis_conf --without-protobuf; then
+            echo -e "${YELLOW}仍失败，尝试最精简配置（同时关闭 raster/topology/protobuf）...${NC}"
+            if ! ./configure $postgis_conf --without-raster --without-topology --without-protobuf; then
+                echo -e "${RED}PostGIS 配置失败${NC}"
+                echo -e "${YELLOW}请确认 GEOS >= 3.8、PROJ >= 6（脚本已尝试源码编译到 /usr/local），以及 json-c/libxml2 开发库${NC}"
+                echo -e "${CYAN}  CentOS/RHEL: yum install geos-devel proj-devel json-c-devel libxml2-devel${NC}"
+                echo -e "${CYAN}  Debian/Ubuntu: apt-get install libgeos-dev libproj-dev libjson-c-dev libxml2-dev${NC}"
+                return 1
+            fi
+        fi
+    fi
+
+    echo -e "${CYAN}执行: make -j$jobs${NC}"
+    if ! make -j"$jobs"; then
+        echo -e "${YELLOW}PostGIS 并行编译失败（可能为内存不足），降为单线程 make -j1 重试...${NC}"
+        if ! make -j1; then
+            echo -e "${RED}PostGIS 编译失败${NC}"
+            echo -e "${YELLOW}请确认已安装 gcc/make 及 geos/proj/json-c/libxml2 等开发库${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${CYAN}执行: make install${NC}"
+    if ! make install; then
+        echo -e "${RED}PostGIS 安装失败（make install）${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✓ PostGIS 扩展文件已安装到 PostgreSQL 目录${NC}"
+    echo -e "${YELLOW}数据库服务就绪后需执行 CREATE EXTENSION postgis;（脚本稍后会自动尝试）${NC}"
+    return 0
+}
+
+# 启用 PostGIS（无需 shared_preload_libraries）
+enable_postgis_extension() {
+    _pg_enable_simple_extension "postgis" "PostGIS"
+}
+
+# ============================================================================
+# TimescaleDB 时序扩展（需 shared_preload_libraries + 重启）
+# ============================================================================
+install_timescaledb() {
+    echo ""
+    echo -e "${YELLOW}========== 安装 TimescaleDB 时序扩展 ==========${NC}"
+
+    if [ ! -x "$PG_INSTALL_DIR/bin/pg_config" ]; then
+        echo -e "${RED}未找到 pg_config：$PG_INSTALL_DIR/bin/pg_config${NC}"
+        echo -e "${YELLOW}TimescaleDB 需在 PostgreSQL 主程序编译安装完成后再安装${NC}"
+        return 1
+    fi
+
+    # 内存不足时自动创建临时 swap，避免编译阶段编译器被 OOM 杀死
+    _pg_ensure_swap
+
+    # TimescaleDB 2.x 需要 cmake >= 3.15；旧系统（如 CentOS 7）自带 cmake 2.8，需升级/启用 cmake3
+    if ! _pg_ensure_modern_cmake; then
+        return 1
+    fi
+
+    local pg_config="$PG_INSTALL_DIR/bin/pg_config"
+    local jobs=$(_pg_safe_jobs)
+    local work_dir="/tmp/timescaledb_build"
+    local url="https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/${TIMESCALEDB_VERSION}"
+
+    # timescaledb.control 由 cmake 配置阶段生成（位于 build/src/），未配置前源码根只有 timescaledb.control.in；
+    # 命中标记后归一化到含 bootstrap 的源码根（根锚点）。
+    # 注意：命令替换会吞掉函数内的所有输出，因此手动回显日志（最后一行是源码路径）
+    local prepared src_dir rc
+    prepared=$( _pg_ext_prepare_source "timescaledb" "$work_dir" "timescaledb.control" "timescaledb-*.tar.gz" "$url" "timescaledb.control.in" "bootstrap" )
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        [ -n "$prepared" ] && echo "$prepared"
+        echo -e "${RED}TimescaleDB 源码准备失败（见上方日志），可手动下载后放到 /tmp 或脚本目录再重试：${NC}"
+        echo "  wget $url -O timescaledb-${TIMESCALEDB_VERSION}.tar.gz"
+        return 1
+    fi
+    echo "$prepared" | head -n -1
+    src_dir=$(echo "$prepared" | tail -n1)
+
+    # 兼容命中已构建目录（timescaledb.control 在 build/src 下）：归一化到含 bootstrap 的源码根
+    if [ ! -f "$src_dir/bootstrap" ]; then
+        local boot_root
+        boot_root=$(find "$work_dir" "$(dirname "$src_dir")" -maxdepth 4 -type f -name bootstrap 2>/dev/null | head -n1)
+        [ -n "$boot_root" ] && src_dir="$(dirname "$boot_root")"
+    fi
+    if [ ! -f "$src_dir/bootstrap" ]; then
+        echo -e "${RED}TimescaleDB 源码目录中缺少 bootstrap 脚本: $src_dir${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}使用 TimescaleDB 源码目录: $src_dir${NC}"
+    cd "$src_dir" || return 1
+
+    # 探测 PostgreSQL 是否带 --with-openssl 编译。TimescaleDB 默认强制要求 OpenSSL，
+    # 若主程序未启用 openssl，cmake 会报 "PostgreSQL was built without OpenSSL support"。
+    # 此时交由用户选择：忽略并以 -DUSE_OPENSSL=0 继续，或取消去装 openssl-devel 并重编 PostgreSQL。
+    local ts_extra_args=""
+    local pg_conf_opts
+    pg_conf_opts="$("$pg_config" --configure 2>/dev/null)"
+    if echo "$pg_conf_opts" | grep -q -- "--with-openssl"; then
+        echo -e "${GREEN}✓ 检测到 PostgreSQL 已启用 OpenSSL，TimescaleDB 将使用 OpenSSL${NC}"
+    else
+        echo -e "${YELLOW}⚠ 检测到 PostgreSQL 编译时未启用 OpenSSL（pg_config --configure 无 --with-openssl）${NC}"
+        echo -e "${YELLOW}  TimescaleDB 默认要求 OpenSSL，否则 cmake 会报「PostgreSQL was built without OpenSSL support」。${NC}"
+        echo -e "${YELLOW}  注意：仅安装 openssl-devel 无效，必须让 PostgreSQL 本身带 --with-openssl 重新编译。${NC}"
+        echo ""
+        echo -e "${CYAN}请选择如何处理：${NC}"
+        echo "  1. 忽略 OpenSSL，以 -DUSE_OPENSSL=0 继续编译 TimescaleDB"
+        echo "     （核心时序功能 hypertable/分区/连续聚合不受影响，仅压缩/加密相关能力不可用）"
+        echo "  2. 取消本次安装，我先安装 openssl-devel 并让 PostgreSQL 带 --with-openssl 重新编译后再来"
+        local ssl_choice=""
+        read -p "请输入选择 [1/2，默认 1]: " ssl_choice
+        case "$ssl_choice" in
+            2)
+                echo -e "${YELLOW}已取消 TimescaleDB 安装。请按以下步骤处理后重试：${NC}"
+                echo -e "${CYAN}  1) 安装 OpenSSL 开发库：${NC}"
+                echo -e "${CYAN}       CentOS/RHEL: yum install openssl-devel${NC}"
+                echo -e "${CYAN}       Debian/Ubuntu: apt-get install libssl-dev${NC}"
+                echo -e "${CYAN}  2) 重新编译/安装 PostgreSQL 并勾选 openssl 插件（全新安装或在插件选择中加入 openssl，${NC}"
+                echo -e "${CYAN}     使 CONFIGURE 带上 --with-openssl）${NC}"
+                echo -e "${CYAN}  3) 再走 主菜单 3 → 1（外部插件向导）安装 timescaledb${NC}"
+                return 1
+                ;;
+            1|"")
+                echo -e "${GREEN}将以 -DUSE_OPENSSL=0 继续（不使用 OpenSSL）${NC}"
+                ts_extra_args="$ts_extra_args -DUSE_OPENSSL=0"
+                ;;
+            *)
+                echo -e "${YELLOW}未识别的选择，默认按 1 处理：以 -DUSE_OPENSSL=0 继续${NC}"
+                ts_extra_args="$ts_extra_args -DUSE_OPENSSL=0"
+                ;;
+        esac
+    fi
+    # 跳过回归测试（无需初始化测试库），加快构建
+    ts_extra_args="$ts_extra_args -DREGRESS_CHECKS=OFF"
+
+    echo -e "${CYAN}执行: BUILD_FORCE_REMOVE=true ./bootstrap -DPG_CONFIG=$pg_config$ts_extra_args（内部调用 cmake）${NC}"
+    # BUILD_FORCE_REMOVE=true：bootstrap 遇到已存在的 build/ 时自动删除重建，避免交互询问与旧 cmake 缓存残留
+    if ! BUILD_FORCE_REMOVE=true ./bootstrap -DPG_CONFIG="$pg_config" $ts_extra_args; then
+        echo -e "${RED}TimescaleDB 配置失败（bootstrap/cmake）${NC}"
+        echo -e "${YELLOW}请确认 cmake 版本 >= 3.15（可用 cmake3）、gcc、make 已安装，且 pg_config 正常${NC}"
+        echo -e "${YELLOW}若报 OpenSSL 相关错误，可为主程序加装 openssl 后用 --with-openssl 重编 PostgreSQL，或保持 -DUSE_OPENSSL=0${NC}"
+        return 1
+    fi
+
+    if [ ! -d "$src_dir/build" ]; then
+        echo -e "${RED}未找到构建目录 build，TimescaleDB 配置异常${NC}"
+        return 1
+    fi
+    cd "$src_dir/build" || return 1
+
+    echo -e "${CYAN}执行: make -j$jobs${NC}"
+    if ! make -j"$jobs"; then
+        echo -e "${YELLOW}TimescaleDB 并行编译失败（可能为内存不足），降为单线程 make -j1 重试...${NC}"
+        if ! make -j1; then
+            echo -e "${RED}TimescaleDB 编译失败${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${CYAN}执行: make install${NC}"
+    if ! make install; then
+        echo -e "${RED}TimescaleDB 安装失败（make install）${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✓ TimescaleDB 扩展文件已安装到 PostgreSQL 目录${NC}"
+    echo -e "${YELLOW}注意：TimescaleDB 需在 postgresql.conf 配置 shared_preload_libraries='timescaledb' 并重启后才能 CREATE EXTENSION${NC}"
+    return 0
+}
+
+# 启用 TimescaleDB：先配置 shared_preload_libraries，重启服务，再 CREATE EXTENSION
+enable_timescaledb_extension() {
+    echo ""
+    local psql_bin="$PG_INSTALL_DIR/bin/psql"
+    [ -x "$psql_bin" ] || psql_bin="psql"
+    local pg_isready_bin="$PG_INSTALL_DIR/bin/pg_isready"
+    [ -x "$pg_isready_bin" ] || pg_isready_bin="pg_isready"
+    local pg_user="${PG_USER:-${DEFAULT_PG_USER:-postgres}}"
+
+    echo -e "${GREEN}✓ TimescaleDB 扩展文件已安装完成（无需重新编译）。${NC}"
+    # TimescaleDB 启用会自动修改 shared_preload_libraries 并重启数据库服务，先交互确认（默认跳过，不擅自重启）
+    local enable_now="n"
+    read -r -p "$(echo -e "${CYAN}是否立即自动配置并启用 TimescaleDB？将修改 shared_preload_libraries 并重启服务 [y/N]（默认跳过）：${NC}")" enable_now
+    case "$enable_now" in
+        y|Y|yes|YES)
+            echo -e "${YELLOW}开始启用 TimescaleDB（配置 shared_preload_libraries → 重启服务 → CREATE EXTENSION）...${NC}"
+            ;;
+        *)
+            echo -e "${CYAN}已跳过自动启用。需手动：① 在 postgresql.conf 设 shared_preload_libraries = 'timescaledb'；② 重启数据库服务；③ 执行：${NC}"
+            echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION timescaledb;\""
+            return 0
+            ;;
+    esac
+
+    # 1) 配置 shared_preload_libraries
+    local preload_result need_restart=false
+    preload_result="$( _pg_ensure_preload_library "timescaledb" )"
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}⚠ 未能自动配置 shared_preload_libraries，请手动处理：${NC}"
+        echo "  在 $PG_DATA_DIR/postgresql.conf 设置: shared_preload_libraries = 'timescaledb'"
+        echo "  然后重启服务并执行: $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION timescaledb;\""
+        return 1
+    fi
+    case "$preload_result" in
+        present)
+            echo -e "${GREEN}✓ shared_preload_libraries 已包含 timescaledb${NC}"
+            ;;
+        altered|conf)
+            echo -e "${GREEN}✓ 已将 timescaledb 写入 shared_preload_libraries，需要重启服务生效${NC}"
+            need_restart=true
+            ;;
+    esac
+
+    # 2) 判断服务是否运行
+    local server_up=false
+    if [ -x "$PG_INSTALL_DIR/bin/pg_isready" ] || command -v pg_isready &>/dev/null; then
+        "$pg_isready_bin" -q 2>/dev/null && server_up=true
+    fi
+
+    if [ "$server_up" != true ]; then
+        echo -e "${YELLOW}检测到数据库服务未运行，跳过自动创建扩展。${NC}"
+        echo -e "${GREEN}TimescaleDB 扩展文件已安装完成。${NC}"
+        echo -e "${CYAN}请先启动/重启服务（使 shared_preload_libraries 生效），再在目标库执行：${NC}"
+        echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION timescaledb;\""
+        return 0
+    fi
+
+    # 3) 需要时重启服务
+    if [ "$need_restart" = true ]; then
+        local svc_name
+        svc_name="$(_pg_detect_service_name)"
+        if _pg_restart_service "$svc_name"; then
+            echo -e "${GREEN}✓ 服务已重启${NC}"
+        else
+            echo -e "${YELLOW}⚠ 自动重启服务失败，请手动重启后再执行 CREATE EXTENSION：${NC}"
+            echo "  systemctl restart $svc_name"
+            echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION timescaledb;\""
+            return 1
+        fi
+        echo -e "${CYAN}等待服务就绪...${NC}"
+        local i
+        for i in $(seq 1 15); do
+            "$pg_isready_bin" -q 2>/dev/null && break
+            sleep 2
+        done
+    fi
+
+    # 4) 创建扩展
+    local sql="CREATE EXTENSION IF NOT EXISTS timescaledb;"
+    local ok=false i
+    for i in 1 2 3; do
+        if _pg_ext_run_sql "$sql"; then
+            ok=true
+            break
+        fi
+        echo -e "${YELLOW}等待数据库服务就绪... ($i/3)${NC}"
+        sleep 2
+    done
+
+    if [ "$ok" = true ]; then
+        echo -e "${GREEN}✓ 已在 postgres 数据库创建扩展 timescaledb${NC}"
+        echo -e "${CYAN}在其它业务库使用时，请在对应库执行: $sql${NC}"
+    else
+        echo -e "${YELLOW}⚠ 自动创建扩展未成功，请确认服务已带 timescaledb 重启后手动执行：${NC}"
+        echo "  $psql_bin -U $pg_user -d postgres -c \"$sql\""
     fi
 }
 
@@ -4888,6 +6206,29 @@ cleanup_temp_files() {
         cleaned_files+=("pgvector_build/")
         ((cleaned_count++))
     fi
+
+    # 清理 PostGIS 编译构建目录
+    if [ -d "/tmp/postgis_build" ]; then
+        rm -rf "/tmp/postgis_build"
+        cleaned_files+=("postgis_build/")
+        ((cleaned_count++))
+    fi
+
+    # 清理 TimescaleDB 编译构建目录
+    if [ -d "/tmp/timescaledb_build" ]; then
+        rm -rf "/tmp/timescaledb_build"
+        cleaned_files+=("timescaledb_build/")
+        ((cleaned_count++))
+    fi
+
+    # 清理 PostGIS 依赖（GEOS/PROJ/SQLite）源码编译临时目录
+    for dep_dir in /tmp/geos_dep_build /tmp/proj_dep_build /tmp/sqlite_dep_build; do
+        if [ -d "$dep_dir" ]; then
+            rm -rf "$dep_dir"
+            cleaned_files+=("$(basename "$dep_dir")/")
+            ((cleaned_count++))
+        fi
+    done
 
     # 清理临时密码设置脚本
     if [ -f "/tmp/set_postgres_password.sh" ]; then
@@ -5135,6 +6476,11 @@ offline_install_flow() {
     # 重置 pgvector 标志
     INSTALL_PGVECTOR=""
     PGVECTOR_INSTALLED=""
+    # 重置 PostGIS / TimescaleDB 标志
+    INSTALL_POSTGIS=""
+    POSTGIS_INSTALLED=""
+    INSTALL_TIMESCALEDB=""
+    TIMESCALEDB_INSTALLED=""
 
     # 定义可用插件
     declare -A plugins
@@ -5150,6 +6496,8 @@ offline_install_flow() {
     plugins[bonjour]="Bonjour支持"
     plugins[systemd]="systemd集成支持"
     plugins[pgvector]="pgvector向量扩展 (独立第三方扩展，需在离线目录准备其源码包)"
+    plugins[postgis]="PostGIS空间扩展 (独立第三方扩展，需在离线目录准备源码包及geos/proj等依赖)"
+    plugins[timescaledb]="TimescaleDB时序扩展 (独立第三方扩展，需cmake，需在离线目录准备源码包)"
 
     # 显示插件选项
     echo "可用插件列表:"
@@ -5222,6 +6570,16 @@ offline_install_flow() {
                     # pgvector 是独立第三方扩展，不属于 ./configure 参数，编译后单独安装
                     INSTALL_PGVECTOR="true"
                     echo -e "${GREEN}已选择 pgvector，将在 PostgreSQL 编译安装后单独编译该扩展${NC}"
+                    ;;
+                "postgis")
+                    # PostGIS 是独立第三方扩展，autotools 构建，编译后单独安装
+                    INSTALL_POSTGIS="true"
+                    echo -e "${GREEN}已选择 postgis，将在 PostgreSQL 编译安装后单独编译该扩展${NC}"
+                    ;;
+                "timescaledb")
+                    # TimescaleDB 是独立第三方扩展，cmake 构建，需 shared_preload_libraries
+                    INSTALL_TIMESCALEDB="true"
+                    echo -e "${GREEN}已选择 timescaledb，将在 PostgreSQL 编译安装后单独编译该扩展（启用时自动配置 preload 并重启）${NC}"
                     ;;
                 *)
                     echo -e "${YELLOW}注意: 插件 '$plugin' 不在预定义列表中，将作为自定义参数处理${NC}"
@@ -5425,6 +6783,24 @@ offline_install_flow() {
         fi
     fi
 
+    # 编译安装 PostGIS 扩展（独立第三方扩展，autotools 构建）
+    if [ "$INSTALL_POSTGIS" = "true" ]; then
+        if install_postgis; then
+            POSTGIS_INSTALLED="true"
+        else
+            echo -e "${YELLOW}postgis 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
+    # 编译安装 TimescaleDB 扩展（独立第三方扩展，cmake 构建，启用时需 preload + 重启）
+    if [ "$INSTALL_TIMESCALEDB" = "true" ]; then
+        if install_timescaledb; then
+            TIMESCALEDB_INSTALLED="true"
+        else
+            echo -e "${YELLOW}timescaledb 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
     # 步骤10: 设置环境变量
     setup_environment
 
@@ -5451,6 +6827,16 @@ offline_install_flow() {
         enable_pgvector_extension
     fi
 
+    # PostGIS 扩展文件已安装时，在数据库中创建扩展
+    if [ "$POSTGIS_INSTALLED" = "true" ]; then
+        enable_postgis_extension
+    fi
+
+    # TimescaleDB 扩展文件已安装时，配置 preload/重启后创建扩展
+    if [ "$TIMESCALEDB_INSTALLED" = "true" ]; then
+        enable_timescaledb_extension
+    fi
+
     # 步骤16: 显示安装信息
     show_installation_info
 
@@ -5463,6 +6849,7 @@ offline_install_flow() {
 main() {
     echo -e "${GREEN}PostgreSQL 自动化安装脚本${NC}"
     echo -e "${GREEN}支持 x86 和 ARM 架构${NC}"
+    echo -e "${CYAN}构建版本: ${SCRIPT_BUILD_TAG}（含 PostGIS GEOS/PROJ 自动源码编译）${NC}"
     echo ""
 
     echo -e "${YELLOW}请选择操作:${NC}"
@@ -5619,6 +7006,9 @@ main() {
 
             # 设置变量
             PG_INSTALL_DIR="$pg_install_path"
+            # 该入口此前漏设 PG_USER，导致后续 sudo -u "" / psql -U "" 创建扩展全部失败
+            [ -z "$PG_USER" ] && PG_USER="${DEFAULT_PG_USER:-postgres}"
+            PG_GROUP="$PG_USER"
 
             # 检查PostgreSQL是否已安装
             if [ ! -f "$PG_INSTALL_DIR/bin/psql" ]; then
@@ -5907,6 +7297,16 @@ main() {
                 enable_pgvector_extension
             fi
 
+            # PostGIS 扩展文件已安装时，在数据库中创建扩展
+            if [ "$POSTGIS_INSTALLED" = "true" ]; then
+                enable_postgis_extension
+            fi
+
+            # TimescaleDB 扩展文件已安装时，配置 preload/重启后创建扩展
+            if [ "$TIMESCALEDB_INSTALLED" = "true" ]; then
+                enable_timescaledb_extension
+            fi
+
             show_installation_info
 
             echo -e "${GREEN}PostgreSQL ${PG_VERSION} 安装完成!${NC}"
@@ -5942,6 +7342,10 @@ main() {
                 UUID_LIBRARY=""
                 INSTALL_PGVECTOR=""
                 PGVECTOR_INSTALLED=""
+                INSTALL_POSTGIS=""
+                POSTGIS_INSTALLED=""
+                INSTALL_TIMESCALEDB=""
+                TIMESCALEDB_INSTALLED=""
                 continue  # 返回主程序循环开始
                 ;;
             *)
