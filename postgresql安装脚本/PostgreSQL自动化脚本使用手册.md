@@ -37,9 +37,10 @@
 - **pgvector 向量扩展**：独立第三方扩展，用 `pg_config` 单独编译，在线自动下载源码、离线支持本地源码包
 - **PostGIS 空间扩展**：独立第三方扩展（3.5.7），autotools 构建，在线自动下载源码、离线支持本地源码包，自动检测并安装 geos/proj/gdal 等依赖；老系统（如 CentOS 7）GEOS<3.8 / PROJ<6 时自动源码编译 GEOS 3.9.3 / PROJ 6.3.2 到 `/usr/local`
 - **TimescaleDB 时序扩展**：独立第三方扩展（2.29.2），cmake 构建，自动配置 `shared_preload_libraries` 并重启数据库后注册扩展
+- **pg_textsearch 全文检索扩展**：Timescale 出品的 BM25 全文检索扩展（1.4.0），仅支持 PostgreSQL 17/18；**优先使用官方预编译包免编译部署**（拷贝 `.so`/`.control`/`.sql`），无预编译包时回退源码 `make` 编译；需配置 `shared_preload_libraries` 并重启后注册扩展
 - **ICU 可用性探测**：采用真实编译+链接测试，避免仅有头文件而缺开发库导致的链接失败
 - **路径默认值**：离线 tar 包路径留空时默认使用脚本所在目录
-- **临时文件清理**：安装完成后自动清理临时文件（含 pgvector / PostGIS / TimescaleDB 构建目录）
+- **临时文件清理**：安装完成后自动清理临时文件（含 pgvector / PostGIS / TimescaleDB / pg_textsearch 构建目录）
 - **WAL归档**：完整归档配置、自动清理、定时清理、智能清理
 
 ---
@@ -173,8 +174,15 @@ sudo ./install_postgresql.sh
 >
 > # TimescaleDB 2.29.2（codeload 源码包，解压目录为 timescaledb-2.29.2）
 > wget https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/2.29.2 -O timescaledb-2.29.2.tar.gz
+>
+> # pg_textsearch 1.4.0 —— 推荐预编译二进制包（免编译，按 PG 大版本选择 pg17 或 pg18）
+> wget https://github.com/timescale/pg_textsearch/releases/download/v1.4.0/pg_textsearch-pg17-v1.4.0.tar.gz
+> #   若目标机缺编译工具链或预编译包不可用，再备源码包（纯 C / PGXS make 编译）：
+> wget https://github.com/timescale/pg_textsearch/archive/refs/tags/v1.4.0.tar.gz -O pg_textsearch-1.4.0.tar.gz
 > ```
 > 也可解压后把源码目录放到上述位置（pgvector 目录需含 `Makefile` 与 `vector.control`；PostGIS 目录顶层需含 `GNUmakefile.in`（`postgis.control.in` 实际在 `extensions/postgis/` 子目录）；TimescaleDB 目录需含 `bootstrap` 与 `timescaledb.control.in`）。脚本会按扩展标记自动识别，并归一化到真正的源码根目录（含 `configure`/`bootstrap` 的那一层）。
+>
+> **pg_textsearch 离线准备（两种方式，二选一）**：①（推荐）预编译包 `pg_textsearch-pg17-v1.4.0.tar.gz`（PG18 换成 `pg18`）——直接放上述目录即可，脚本自动解压并拷贝文件，**目标机无需 gcc/make**；② 源码包 `pg_textsearch-1.4.0.tar.gz`（或解压后含 `Makefile` 与 `pg_textsearch.control` 的目录）——目标机需有 gcc、make。预编译包与源码包同时存在时，**优先使用预编译包**。注意预编译包按 PostgreSQL 大版本发布，务必下载与目标库一致的 `pg17`/`pg18` 包。
 >
 > ⚠️ **PostGIS 注意**：从 GitHub/codeload 下载的源码包**不含已生成的 `configure`**（只有 `configure.ac` 与 `autogen.sh`）。脚本会自动运行 `./autogen.sh` 生成（需目标机装有 `autoconf`/`automake`/`libtool`，依赖检查阶段会自动安装）；若下载的是 PostGIS 官方 make dist 发布包（自带 `configure`），则跳过此步骤直接编译。
 
@@ -196,6 +204,7 @@ sudo ./install_postgresql.sh
 | pgvector | 向量检索扩展（独立扩展，非 `./configure` 插件） | gcc、make、pg_config |
 | postgis | 空间/GIS 扩展（独立扩展，autotools 构建） | geos≥3.8、proj≥6（老系统自动源码编译 GEOS 3.9.3/PROJ 6.3.2）、gdal、json-c、libxml2、protobuf-c |
 | timescaledb | 时序数据库扩展（独立扩展，cmake 构建，需 preload 并重启） | cmake ≥ 3.15（CentOS 7 用 cmake3）、gcc、openssl-devel |
+| pg_textsearch | BM25 全文检索扩展（独立扩展，Timescale 出品，仅 PG17/18，需 preload 并重启） | **推荐预编译包：免依赖**；源码编译回退需 gcc、make、pg_config |
 
 > ⚠️ **UUID插件说明**：脚本会自动检测系统中可用的UUID库（e2fsprogs或OSSP），优先使用e2fsprogs。如两者都未安装，会尝试自动安装。
 
@@ -375,6 +384,77 @@ systemctl restart postgresql17
 # 3. 在目标库创建扩展
 <prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION timescaledb;"
 ```
+
+#### pg_textsearch 全文检索扩展
+
+pg_textsearch 是 [Timescale](https://github.com/timescale/pg_textsearch) 出品的 BM25 全文检索扩展（前身 Tapir，纯 C 编写，PostgreSQL 许可、可商用），提供 BM25 排名（`<@>` 操作符）、`CREATE INDEX ... USING bm25`、Block-Max WAND top-k 优化等，复用 PostgreSQL 文本搜索配置。默认版本 `1.4.0`（由变量 `PG_TEXTSEARCH_VERSION` 控制）。
+
+> ⚠️ **硬性限制**：pg_textsearch **仅支持 PostgreSQL 17/18**，且与 TimescaleDB 一样**必须**出现在 `shared_preload_libraries` 中、**重启数据库**后才能 `CREATE EXTENSION`。脚本在安装前会用 `pg_config --version` 校验主版本，非 17/18 会跳过安装（不影响 PostgreSQL 主程序）。
+
+**安装机制：文件部署 → 配置 preload 并重启 → 注册扩展**。其中"文件部署"支持两种方式，脚本**自动优先使用预编译包**：
+
+**方式一（推荐）：官方预编译二进制包 —— 免编译、免工具链**
+
+Timescale 在 Releases 中按 PG 大版本提供预编译包 `pg_textsearch-pg17-v1.4.0.tar.gz` / `pg_textsearch-pg18-v1.4.0.tar.gz`，包内只有三类文件：
+
+```text
+pg_textsearch.control        # 扩展控制文件
+pg_textsearch--1.4.0.sql     # 扩展注册 SQL
+pg_textsearch.so             # 动态库
+```
+
+脚本流程：在脚本目录 / `/tmp` / 离线 tar 包同级目录 / 当前目录中查找 `pg_textsearch-pg<主版本>*.tar.gz`（或已解压且含 `pg_textsearch.so`+`pg_textsearch.control` 的目录）；在线模式下本地没有时自动从 GitHub Releases 下载对应 PG 大版本的包 → 解压 → 校验三类文件齐全 → 拷贝到 PostgreSQL 目录（`control`/`.sql` → `<prefix>/share/extension/`，`.so` → `<prefix>/lib/`）。**全程不需要 gcc/make/cmake**，适合精简系统或离线环境。
+
+> 📌 **版本必须匹配**：预编译包按 PostgreSQL 大版本发布（pg17 / pg18），脚本只匹配当前数据库主版本对应的包；放错版本（如 PG17 环境放了 pg18 包）不会被采用。
+
+**方式二（回退）：源码编译 —— 纯 C / PGXS**
+
+当预编译包不存在、下载失败或内容不完整时，自动回退源码编译：定位/下载源码包 → `make PG_CONFIG=<prefix>/bin/pg_config -jN`（失败自动降 `-j1` 重试）→ `make install PG_CONFIG=...`，需要目标机装有 `gcc`、`make`。
+
+**文件部署完成后**（与 TimescaleDB 相同的启用流程）：脚本询问是否立即启用 → 用 `ALTER SYSTEM`（服务未运行/离线时改写 `postgresql.conf`）把 `pg_textsearch` 幂等加入 `shared_preload_libraries` → 自动重启服务并等待就绪 → 执行 `CREATE EXTENSION IF NOT EXISTS pg_textsearch;`（默认在 `postgres` 库）。
+
+**下载地址**（版本由 `PG_TEXTSEARCH_VERSION` 控制）：
+
+```bash
+# 预编译包（推荐，按 PG 大版本二选一）
+wget https://github.com/timescale/pg_textsearch/releases/download/v1.4.0/pg_textsearch-pg17-v1.4.0.tar.gz
+wget https://github.com/timescale/pg_textsearch/releases/download/v1.4.0/pg_textsearch-pg18-v1.4.0.tar.gz
+# 源码包（回退编译用）
+wget https://github.com/timescale/pg_textsearch/archive/refs/tags/v1.4.0.tar.gz -O pg_textsearch-1.4.0.tar.gz
+```
+
+可通过环境变量指定版本：
+
+```bash
+export PG_TEXTSEARCH_VERSION=1.4.0
+sudo ./install_postgresql.sh
+```
+
+**事后加装**：已装好的 PostgreSQL（17/18）可通过主菜单 `3 → 1（外部插件向导）` 输入 `pg_textsearch` 单独加装；向导会自动部署文件、配置 preload、重启服务并创建扩展。
+
+**手动安装/启用**（不使用脚本时，对应预编译包 README 的三步）：
+
+```bash
+# 1. 部署文件（<prefix> 为 PostgreSQL 安装目录）
+cp pg_textsearch.control pg_textsearch--*.sql  <prefix>/share/extension/
+cp pg_textsearch.so                            <prefix>/lib/
+
+# 2. 配置预加载库（二选一）
+<prefix>/bin/psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries TO 'pg_textsearch';"
+#   或在 postgresql.conf 中设置：shared_preload_libraries = 'pg_textsearch'
+
+# 3. 重启数据库（服务名为 postgresql<主版本号>）
+systemctl restart postgresql17
+
+# 4. 在目标库创建扩展
+<prefix>/bin/psql -U postgres -d <数据库名> -c "CREATE EXTENSION pg_textsearch;"
+
+# 5. 建 BM25 索引示例
+#   CREATE INDEX idx_fts ON 表名 USING bm25(内容列) WITH (text_config='english');
+#   SELECT * FROM 表名 ORDER BY 内容列 <@> '检索词' LIMIT 10;
+```
+
+> 💡 **与 pg_search（ParadeDB）的区别**：pg_textsearch 为 Timescale 出品、纯 C、**PostgreSQL 许可（宽松、可商用）**、仅 PG17/18、专注 BM25 检索性能；pg_search 为 ParadeDB 出品、Rust/Tantivy、**AGPL-3.0 许可（SaaS 商用需商业授权）**、支持 PG13+，功能更广（高亮、facets 聚合、模糊/短语查询等）。
 
 #### 默认配置
 
@@ -847,8 +927,11 @@ PostGIS 的文件安装同样不需要数据库运行（仅 `CREATE EXTENSION po
 
 - **TimescaleDB**：它属于需要预加载的扩展，`shared_preload_libraries` 必须包含 `timescaledb`，且该参数只在数据库启动时读取。因此流程是：配置 preload → **重启** → `CREATE EXTENSION timescaledb`。脚本已自动完成 `ALTER SYSTEM`（或改写 `postgresql.conf`）、重启服务、等待就绪、创建扩展这一整套动作。手动安装时若漏了重启，`CREATE EXTENSION` 会报错提示必须先加入 preload 并重启。
 - **PostGIS / pgvector**：不需要 `shared_preload_libraries`，编译安装后直接 `CREATE EXTENSION` 即可，无需重启。
+- **pg_textsearch**：与 TimescaleDB 同属预加载扩展，`shared_preload_libraries` 必须包含 `pg_textsearch` 并重启后才能创建。脚本自动完成"配置 preload → 重启 → `CREATE EXTENSION pg_textsearch`"。另外它**仅支持 PostgreSQL 17/18**，低版本会在安装阶段被跳过。
 
-> 💡 若 TimescaleDB 扩展创建失败，请确认 `SHOW shared_preload_libraries;` 的输出中含有 `timescaledb`，且数据库在配置后已重启。
+> 💡 若 TimescaleDB / pg_textsearch 扩展创建失败，请确认 `SHOW shared_preload_libraries;` 的输出中含有对应库名，且数据库在配置后已重启。
+
+> 💡 **pg_textsearch 免编译**：脚本优先使用官方预编译包（`pg_textsearch-pg17/pg18-v*.tar.gz`），目标机无需 gcc/make；预编译包缺失或下载失败时才回退源码 `make` 编译。离线时把对应 PG 大版本的预编译包放到脚本目录 / tar 包同级目录 / `/tmp` 即可。
 
 ---
 
@@ -1002,6 +1085,14 @@ psql -U postgres -c "SELECT version();"
   - **内存感知的安全并行编译**：新增 `_pg_safe_jobs()`，按 `min(CPU核数, 可用内存MB/1500)` 自动限制 `make -j` 并行度，避免并行编译 C++（GEOS/PostGIS/TimescaleDB）时内存不足触发 GCC 内部错误（`internal compiler error ... likely a hardware or OS problem`）；编译失败时自动降级重试：先 `make -j1`（单线程降峰值内存），仍失败则以 `-O0` 低优化重新 configure/cmake 后再单线程编译。编译重型 C++ 前还会检测内存，物理内存+swap 低于 ~3GB 时**自动创建临时 swap 文件**（`_pg_ensure_swap()`，1~4GB，放在空间充足的分区）兜底，防止编译器进程被 OOM 杀死。**自动启用新版 GCC（devtoolset）**：CentOS/RHEL 7 自带 g++ 4.8.5 对现代 C++11/14 支持不全、编译 GEOS 3.9 等会随机触发 GCC 内部错误（`internal compiler error`，每次崩溃文件不同，与内存无关）；`_pg_enable_modern_gcc()` 检测到 g++ < 7 时自动安装并启用 SCL `devtoolset-8/9/10/11`（`centos-release-scl` + `devtoolset-N-toolchain`，source `/opt/rh/devtoolset-N/root/enable` 并导出 `CC/CXX`），同时 `export CCACHE_DISABLE=1` 禁用 ccache 排除缓存导致的偶发异常。源码下载统一启用进度条（`wget --progress=bar:force` / `curl --progress-bar`）
   - 新增服务名动态探测、服务重启、preload 幂等配置等通用辅助函数（同时复用于其他扩展）
   - **OpenSSL 检查与交互选择**：bootstrap 前用 `pg_config --configure` 探测主程序是否启用 OpenSSL；未启用（cmake 会报 `PostgreSQL was built without OpenSSL support`）时**暂停提示二选一**：选项 1（默认）以 `-DUSE_OPENSSL=0` 继续（核心时序功能不受影响）；选项 2 取消并指引安装 `openssl-devel`、带 `--with-openssl` 重编 PostgreSQL 后再来（仅装 openssl-devel 无效）。并统一加 `-DREGRESS_CHECKS=OFF` 跳过回归测试
+
+- **pg_textsearch 全文检索扩展支持（默认 1.4.0，Timescale 出品）**
+  - 在线安装、离线安装、外部插件向导三处均可选择 pg_textsearch
+  - 独立第三方扩展，纯 C / 标准 PGXS；**仅支持 PostgreSQL 17/18**，安装前用 `pg_config --version` 校验主版本，不匹配则跳过且不影响主程序
+  - **双模式文件部署，优先免编译**：① 优先使用官方预编译二进制包 `pg_textsearch-pg17/pg18-v<版本>.tar.gz`（本地查找 `pg_textsearch-pg<主版本>*.tar.gz` → 在线模式自动从 GitHub Releases 下载 → 解压校验 `pg_textsearch.control`/`pg_textsearch--*.sql`/`pg_textsearch.so` 三类文件齐全 → 拷贝到 `share/extension/` 与 `lib/`），**目标机无需 gcc/make**；② 预编译包缺失/下载失败/内容不完整时自动回退源码编译（`make PG_CONFIG=... -jN`，失败降 `-j1` 重试）
+  - 预编译包按 PG 大版本匹配（pg17/pg18），放错版本不会被采用；已解压目录中含 `.so`+`.control` 且无 `Makefile` 的也识别为预编译文件
+  - 自动配置 `shared_preload_libraries='pg_textsearch'`（优先 `ALTER SYSTEM`，离线改写 `postgresql.conf`）并**自动重启**服务、等待就绪后 `CREATE EXTENSION pg_textsearch`
+  - 离线支持本地预编译包 / 源码包 `pg_textsearch-*.tar.gz` / 已解压目录；临时构建目录 `/tmp/pg_textsearch_build` 自动清理
 
 #### 功能优化
 

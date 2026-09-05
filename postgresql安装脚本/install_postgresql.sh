@@ -46,6 +46,8 @@ OFFLINE_TARBALL_PATH=""
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.6}"
 POSTGIS_VERSION="${POSTGIS_VERSION:-3.5.7}"
 TIMESCALEDB_VERSION="${TIMESCALEDB_VERSION:-2.29.2}"
+# pg_textsearch（Timescale 出品的 BM25 全文检索扩展）仅支持 PostgreSQL 17/18，需 shared_preload_libraries
+PG_TEXTSEARCH_VERSION="${PG_TEXTSEARCH_VERSION:-1.4.0}"
 # PostGIS 3.5 要求 GEOS >= 3.8、PROJ >= 4.9；CentOS7 系统源为 GEOS 3.4 / PROJ 4.8，
 # 版本过低时从源码编译安装到 /usr/local（GEOS 选 3.9 以兼容 gcc 4.8 的 C++11；PROJ 6.3.2 用 autotools）
 # PROJ 6+ 编译要求 sqlite3 >= 3.11，而 CentOS7 自带 SQLite 仅 3.7.17，版本过低时同样从源码编译到 /usr/local
@@ -60,6 +62,8 @@ INSTALL_POSTGIS=""
 POSTGIS_INSTALLED=""
 INSTALL_TIMESCALEDB=""
 TIMESCALEDB_INSTALLED=""
+INSTALL_PG_TEXTSEARCH=""
+PG_TEXTSEARCH_INSTALLED=""
 
 # 脚本所在目录（用户未填写路径时的默认查找目录，离线包通常与脚本放在一起）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -931,6 +935,8 @@ select_plugins() {
     POSTGIS_INSTALLED=""
     INSTALL_TIMESCALEDB=""
     TIMESCALEDB_INSTALLED=""
+    INSTALL_PG_TEXTSEARCH=""
+    PG_TEXTSEARCH_INSTALLED=""
     
     echo -e "${YELLOW}请选择需要编译安装的插件:${NC}"
     echo ""
@@ -951,6 +957,7 @@ select_plugins() {
     plugins[pgvector]="pgvector向量扩展 (独立第三方扩展，编译后自动CREATE EXTENSION)"
     plugins[postgis]="PostGIS空间扩展 (独立第三方扩展，需geos/proj等依赖)"
     plugins[timescaledb]="TimescaleDB时序扩展 (独立第三方扩展，需cmake，自动配置preload并重启)"
+    plugins[pg_textsearch]="pg_textsearch全文检索扩展 (Timescale出品，BM25索引，仅支持PG17/18，需preload并重启)"
 
     # 显示插件选项
     echo "可用插件列表:"
@@ -1085,6 +1092,11 @@ select_plugins() {
                     # TimescaleDB 是独立第三方扩展，cmake 构建，需 shared_preload_libraries
                     INSTALL_TIMESCALEDB="true"
                     echo -e "${GREEN}已选择 timescaledb，将在 PostgreSQL 编译安装后单独编译该扩展（需 cmake，启用时自动配置 preload 并重启）${NC}"
+                    ;;
+                "pg_textsearch")
+                    # pg_textsearch 是独立第三方扩展（Timescale 出品），PGXS/make 构建，需 shared_preload_libraries，仅支持 PG17/18
+                    INSTALL_PG_TEXTSEARCH="true"
+                    echo -e "${GREEN}已选择 pg_textsearch，将在 PostgreSQL 编译安装后单独安装该扩展（优先使用官方预编译包免编译，回退源码编译；仅支持 PG17/18，启用时自动配置 preload 并重启）${NC}"
                     ;;
                 
                 *)
@@ -2454,6 +2466,15 @@ compile_install() {
         fi
     fi
 
+    # 编译安装 pg_textsearch 扩展（独立第三方扩展，make/PGXS 构建，仅支持 PG17/18，启用时需 preload + 重启）
+    if [ "$INSTALL_PG_TEXTSEARCH" = "true" ]; then
+        if install_pg_textsearch; then
+            PG_TEXTSEARCH_INSTALLED="true"
+        else
+            echo -e "${YELLOW}pg_textsearch 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
     # 显示编译统计
     echo ""
     echo -e "${CYAN}编译统计:${NC}"
@@ -3710,6 +3731,10 @@ check_plugin_dependencies() {
                 echo -e "${CYAN}TimescaleDB 为独立扩展，使用 cmake 构建（需 cmake >= 3.15）${NC}"
                 _pg_ensure_modern_cmake
                 ;;
+            "pg_textsearch")
+                # pg_textsearch 是独立第三方扩展（纯 C / PGXS make 构建），仅需 gcc/make 与 pg_config，但仅支持 PG17/18
+                echo -e "${GREEN}✓ pg_textsearch 为独立扩展，优先使用官方预编译包免编译部署，无预编译包时用 pg_config 源码编译（仅支持 PostgreSQL 17/18）${NC}"
+                ;;
             *)
                 echo -e "${YELLOW}⚠ 未知插件 '$plugin'，跳过依赖检查${NC}"
                 ;;
@@ -3971,6 +3996,7 @@ install_external_plugins() {
     echo "pgvector - pgvector向量扩展（独立扩展，用pg_config单独编译，无需重编PostgreSQL）"
     echo "postgis - PostGIS空间扩展（独立扩展，autotools编译，需geos/proj等依赖，无需重编PostgreSQL）"
     echo "timescaledb - TimescaleDB时序扩展（独立扩展，cmake编译，需shared_preload_libraries并重启）"
+    echo "pg_textsearch - pg_textsearch全文检索扩展（Timescale出品，BM25索引，make编译，仅支持PG17/18，需preload并重启）"
     echo "----------------------------------------"
     echo ""
 
@@ -3986,16 +4012,18 @@ install_external_plugins() {
     echo -e "${CYAN}选择的插件: $selected_plugins${NC}"
     echo ""
 
-    # pgvector / postgis / timescaledb 是独立第三方扩展，不走 ./configure，单独用 pg_config 编译安装
+    # pgvector / postgis / timescaledb / pg_textsearch 是独立第三方扩展，不走 ./configure，单独用 pg_config 编译安装
     local want_pgvector=false
     local want_postgis=false
     local want_timescaledb=false
+    local want_pg_textsearch=false
     local recompile_plugins=""
     for plugin in $selected_plugins; do
         case "$plugin" in
             pgvector) want_pgvector=true ;;
             postgis) want_postgis=true ;;
             timescaledb) want_timescaledb=true ;;
+            pg_textsearch) want_pg_textsearch=true ;;
             *) recompile_plugins="$recompile_plugins $plugin" ;;
         esac
     done
@@ -4013,6 +4041,9 @@ install_external_plugins() {
         if [ "$want_timescaledb" = true ]; then
             if install_timescaledb; then any_ok=true; enable_timescaledb_extension; else echo -e "${YELLOW}timescaledb 安装未完成（PostgreSQL 主程序不受影响）${NC}"; fi
         fi
+        if [ "$want_pg_textsearch" = true ]; then
+            if install_pg_textsearch; then any_ok=true; enable_pg_textsearch_extension; else echo -e "${YELLOW}pg_textsearch 安装未完成（PostgreSQL 主程序不受影响）${NC}"; fi
+        fi
         $any_ok
     }
 
@@ -4024,9 +4055,9 @@ install_external_plugins() {
 
     echo ""
 
-    # 仅选了独立扩展（pgvector/postgis/timescaledb）：无需重编 PostgreSQL，直接编译安装
+    # 仅选了独立扩展（pgvector/postgis/timescaledb/pg_textsearch）：无需重编 PostgreSQL，直接编译安装
     local want_any_standalone=false
-    if [ "$want_pgvector" = true ] || [ "$want_postgis" = true ] || [ "$want_timescaledb" = true ]; then
+    if [ "$want_pgvector" = true ] || [ "$want_postgis" = true ] || [ "$want_timescaledb" = true ] || [ "$want_pg_textsearch" = true ]; then
         want_any_standalone=true
     fi
     if [ "$want_any_standalone" = true ] && [ -z "$recompile_plugins" ]; then
@@ -4038,7 +4069,7 @@ install_external_plugins() {
             cd - > /dev/null 2>&1
             return 1
         fi
-        rm -rf "/tmp/pgvector_build" "/tmp/postgis_build" "/tmp/timescaledb_build" "/tmp/geos_dep_build" "/tmp/proj_dep_build" "/tmp/sqlite_dep_build"
+        rm -rf "/tmp/pgvector_build" "/tmp/postgis_build" "/tmp/timescaledb_build" "/tmp/pg_textsearch_build" "/tmp/geos_dep_build" "/tmp/proj_dep_build" "/tmp/sqlite_dep_build"
         echo -e "${GREEN}✓ 已清理扩展临时构建目录${NC}"
         cd - > /dev/null 2>&1
         return 0
@@ -6093,6 +6124,281 @@ enable_timescaledb_extension() {
     fi
 }
 
+# 安装 pg_textsearch（Timescale 出品的 BM25 全文检索扩展）。
+# 纯 C / 标准 PGXS（make + make install），构建方式与 pgvector 相同；
+# 但仅支持 PostgreSQL 17/18，且必须通过 shared_preload_libraries 加载并重启后才能 CREATE EXTENSION。
+install_pg_textsearch() {
+    echo ""
+    echo -e "${YELLOW}========== 安装 pg_textsearch 全文检索扩展（Timescale） ==========${NC}"
+
+    if [ ! -x "$PG_INSTALL_DIR/bin/pg_config" ]; then
+        echo -e "${RED}未找到 pg_config：$PG_INSTALL_DIR/bin/pg_config${NC}"
+        echo -e "${YELLOW}pg_textsearch 需在 PostgreSQL 主程序编译安装完成后再安装${NC}"
+        return 1
+    fi
+    local pg_config="$PG_INSTALL_DIR/bin/pg_config"
+
+    # pg_textsearch 仅支持 PostgreSQL 17/18，低版本直接跳过（不影响主程序）
+    local pg_ver
+    pg_ver=$("$pg_config" --version 2>/dev/null | sed -n 's/^PostgreSQL[[:space:]]\+\([0-9]\+\).*/\1/p')
+    if [ "$pg_ver" != "17" ] && [ "$pg_ver" != "18" ]; then
+        echo -e "${RED}pg_textsearch 仅支持 PostgreSQL 17/18，当前 PostgreSQL 版本为：$("$pg_config" --version 2>/dev/null)${NC}"
+        echo -e "${YELLOW}本次跳过 pg_textsearch 安装，不影响 PostgreSQL 主程序${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ PostgreSQL 版本检查通过（$pg_ver）${NC}"
+
+    local ts_version="${PG_TEXTSEARCH_VERSION:-1.4.0}"
+    local work_dir="/tmp/pg_textsearch_build"
+    local url="https://github.com/timescale/pg_textsearch/archive/refs/tags/v${ts_version}.tar.gz"
+    mkdir -p "$work_dir"
+
+    # ---- 优先方式：官方预编译二进制包（免编译，按 PG 大版本 pg17/pg18 匹配）----
+    # 包内文件：pg_textsearch.control、pg_textsearch--*.sql、pg_textsearch.so，
+    # 分别拷贝到 pg_config --sharedir/extension 与 --pkglibdir 即可，无需 gcc/make。
+    local ext_dir lib_dir
+    ext_dir="$("$pg_config" --sharedir 2>/dev/null)/extension"
+    lib_dir="$("$pg_config" --pkglibdir 2>/dev/null)"
+    local prebuilt_work="$work_dir/prebuilt"
+    local prebuilt_url="https://github.com/timescale/pg_textsearch/releases/download/v${ts_version}/pg_textsearch-pg${pg_ver}-v${ts_version}.tar.gz"
+    local prebuilt_glob="pg_textsearch-pg${pg_ver}*.tar.gz"
+    local search_roots=("$SCRIPT_DIR" "/tmp" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD" "$work_dir")
+
+    # 定位预编译文件来源：① 已解压目录（含 pg_textsearch.so 与 control）；② 本地压缩包；③ 在线下载
+    local deploy_root="" pre_archive="" root hit
+    for root in "${search_roots[@]}"; do
+        [ -d "$root" ] || continue
+        hit=$(find "$root" -maxdepth 6 -type f -name "pg_textsearch.so" 2>/dev/null | head -n1)
+        if [ -n "$hit" ]; then
+            local d
+            d=$(dirname "$hit")
+            # 含 Makefile 的是源码编译树（make 后也会生成 .so），不作为预编译目录，交回退源码流程处理
+            if [ -f "$d/pg_textsearch.control" ] && [ ! -f "$d/Makefile" ]; then
+                deploy_root="$d"
+                echo -e "${GREEN}找到已解压的 pg_textsearch 预编译文件: $d${NC}"
+                break
+            fi
+        fi
+    done
+    if [ -z "$deploy_root" ]; then
+        for root in "${search_roots[@]}"; do
+            [ -d "$root" ] || continue
+            pre_archive=$(find "$root" -maxdepth 2 -type f -name "$prebuilt_glob" 2>/dev/null | head -n1)
+            if [ -n "$pre_archive" ]; then
+                echo -e "${GREEN}找到 pg_textsearch 预编译包: $pre_archive${NC}"
+                break
+            fi
+        done
+    fi
+    if [ -z "$deploy_root" ] && [ -z "$pre_archive" ] && [ "$OFFLINE_MODE" != "true" ]; then
+        local dl_file="$work_dir/pg_textsearch-pg${pg_ver}-v${ts_version}.tar.gz"
+        echo -e "${CYAN}未找到本地预编译包，尝试在线下载 pg_textsearch pg${pg_ver} 预编译包（免编译）...${NC}"
+        echo -e "${CYAN}下载地址: $prebuilt_url${NC}"
+        local dl_ok=0
+        if command -v wget &>/dev/null; then
+            wget -q --timeout=120 --tries=2 -O "$dl_file" "$prebuilt_url" && dl_ok=1
+        elif command -v curl &>/dev/null; then
+            curl -sL --connect-timeout 30 --max-time 300 -f -o "$dl_file" "$prebuilt_url" && dl_ok=1
+        fi
+        if [ "$dl_ok" = "1" ] && [ -s "$dl_file" ]; then
+            pre_archive="$dl_file"
+        else
+            echo -e "${YELLOW}预编译包下载失败（可能该版本暂无 pg${pg_ver} 预编译包或网络不通），将回退源码编译${NC}"
+            rm -f "$dl_file"
+        fi
+    fi
+
+    # 解压预编译包
+    if [ -n "$pre_archive" ]; then
+        rm -rf "$prebuilt_work"; mkdir -p "$prebuilt_work"
+        if tar -zxf "$pre_archive" -C "$prebuilt_work" 2>/dev/null; then
+            deploy_root="$prebuilt_work"
+        else
+            echo -e "${YELLOW}预编译包解压失败: $pre_archive，回退源码编译${NC}"
+            deploy_root=""
+        fi
+    fi
+
+    # 校验三类文件齐全后拷贝部署（control 与 sql 到 extension 目录，so 到 pkglibdir）
+    if [ -n "$deploy_root" ]; then
+        local f_control f_so f_sql
+        f_control=$(find "$deploy_root" -type f -name 'pg_textsearch.control' 2>/dev/null | head -n1)
+        f_so=$(find "$deploy_root" -type f -name 'pg_textsearch.so' 2>/dev/null | head -n1)
+        f_sql=$(find "$deploy_root" -type f -name 'pg_textsearch--*.sql' 2>/dev/null | head -n1)
+        if [ -n "$f_control" ] && [ -n "$f_so" ] && [ -n "$f_sql" ] && [ -d "$ext_dir" ] && [ -d "$lib_dir" ]; then
+            echo -e "${GREEN}预编译文件校验通过（control/sql/so 齐全），开始部署到 PostgreSQL 目录${NC}"
+            cp -f "$f_control" "$ext_dir/" &&
+            find "$deploy_root" -type f -name 'pg_textsearch--*.sql' -exec cp -f {} "$ext_dir/" \; &&
+            cp -f "$f_so" "$lib_dir/" &&
+            chmod 755 "$lib_dir/pg_textsearch.so" &&
+            chmod 644 "$ext_dir"/pg_textsearch.control "$ext_dir"/pg_textsearch--*.sql
+            if [ -f "$lib_dir/pg_textsearch.so" ] && [ -f "$ext_dir/pg_textsearch.control" ]; then
+                echo -e "${GREEN}✓ pg_textsearch 预编译文件已部署（免编译）：${NC}"
+                echo "  扩展文件: $ext_dir/pg_textsearch.control 与 pg_textsearch--*.sql"
+                echo "  库文件:   $lib_dir/pg_textsearch.so"
+                echo -e "${YELLOW}注意：仍需配置 shared_preload_libraries='pg_textsearch' 并重启后才能 CREATE EXTENSION${NC}"
+                return 0
+            fi
+            echo -e "${YELLOW}预编译文件拷贝不完整，回退源码编译${NC}"
+        else
+            echo -e "${YELLOW}预编译包内容不完整（缺少 control/sql/so 或目标目录不存在），回退源码编译${NC}"
+        fi
+    fi
+
+    # ---- 回退方式：源码编译（纯 C / PGXS make）----
+    echo -e "${CYAN}改用源码编译方式安装 pg_textsearch（需要 gcc/make）...${NC}"
+    # 内存不足时自动创建临时 swap，避免编译阶段编译器被 OOM 杀死
+    _pg_ensure_swap
+
+    local jobs
+    jobs=$(_pg_safe_jobs 2>/dev/null)
+    [ -n "$jobs" ] || jobs=$(nproc 2>/dev/null || echo "1")
+
+    # pg_textsearch.control 与 Makefile(PGXS) 均在源码根目录。
+    # 注意：命令替换会吞掉函数内的所有输出，因此手动回显日志（最后一行是源码路径）
+    local prepared src_dir rc
+    prepared=$( _pg_ext_prepare_source "pg_textsearch" "$work_dir" "pg_textsearch.control" "pg_textsearch-*.tar.gz" "$url" )
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        [ -n "$prepared" ] && echo "$prepared"
+        echo -e "${RED}pg_textsearch 源码准备失败（见上方日志），可手动下载后放到 /tmp 或脚本目录再重试：${NC}"
+        echo "  wget $url -O pg_textsearch-${ts_version}.tar.gz"
+        return 1
+    fi
+    echo "$prepared" | head -n -1
+    src_dir=$(echo "$prepared" | tail -n1)
+
+    # 源码根必须含 Makefile（PGXS）；若命中的是 Releases 页的预编译二进制包（无 Makefile），给出明确提示
+    if [ ! -f "$src_dir/Makefile" ]; then
+        echo -e "${RED}pg_textsearch 源码目录中缺少 Makefile: $src_dir${NC}"
+        echo -e "${YELLOW}注意：Releases 页面的 pg_textsearch-pg17/pg18-*.tar.gz 是预编译二进制包，不能用于源码编译；${NC}"
+        echo -e "${YELLOW}请下载源码包：$url${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}使用 pg_textsearch 源码目录: $src_dir${NC}"
+    cd "$src_dir" || return 1
+
+    echo -e "${CYAN}执行: make PG_CONFIG=$pg_config -j$jobs${NC}"
+    if ! make PG_CONFIG="$pg_config" -j"$jobs"; then
+        echo -e "${YELLOW}pg_textsearch 并行编译失败（可能为内存不足），降为单线程 make -j1 重试...${NC}"
+        if ! make PG_CONFIG="$pg_config" -j1; then
+            echo -e "${RED}pg_textsearch 编译失败${NC}"
+            echo -e "${YELLOW}请确认已安装 gcc、make，且 PostgreSQL 开发文件可用（pg_config 正常）${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${CYAN}执行: make install PG_CONFIG=$pg_config${NC}"
+    if ! make install PG_CONFIG="$pg_config"; then
+        echo -e "${RED}pg_textsearch 安装失败（make install）${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✓ pg_textsearch 扩展文件已安装到 PostgreSQL 目录${NC}"
+    echo -e "${YELLOW}注意：pg_textsearch 需在 postgresql.conf 配置 shared_preload_libraries='pg_textsearch' 并重启后才能 CREATE EXTENSION${NC}"
+    return 0
+}
+
+# 启用 pg_textsearch：先配置 shared_preload_libraries，重启服务，再 CREATE EXTENSION
+enable_pg_textsearch_extension() {
+    echo ""
+    local psql_bin="$PG_INSTALL_DIR/bin/psql"
+    [ -x "$psql_bin" ] || psql_bin="psql"
+    local pg_isready_bin="$PG_INSTALL_DIR/bin/pg_isready"
+    [ -x "$pg_isready_bin" ] || pg_isready_bin="pg_isready"
+    local pg_user="${PG_USER:-${DEFAULT_PG_USER:-postgres}}"
+
+    echo -e "${GREEN}✓ pg_textsearch 扩展文件已安装完成（无需重新编译）。${NC}"
+    # pg_textsearch 启用会自动修改 shared_preload_libraries 并重启数据库服务，先交互确认（默认跳过，不擅自重启）
+    local enable_now="n"
+    read -r -p "$(echo -e "${CYAN}是否立即自动配置并启用 pg_textsearch？将修改 shared_preload_libraries 并重启服务 [y/N]（默认跳过）：${NC}")" enable_now
+    case "$enable_now" in
+        y|Y|yes|YES)
+            echo -e "${YELLOW}开始启用 pg_textsearch（配置 shared_preload_libraries → 重启服务 → CREATE EXTENSION）...${NC}"
+            ;;
+        *)
+            echo -e "${CYAN}已跳过自动启用。需手动：① 在 postgresql.conf 设 shared_preload_libraries = 'pg_textsearch'；② 重启数据库服务；③ 执行：${NC}"
+            echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION pg_textsearch;\""
+            return 0
+            ;;
+    esac
+
+    # 1) 配置 shared_preload_libraries
+    local preload_result need_restart=false
+    preload_result="$( _pg_ensure_preload_library "pg_textsearch" )"
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}⚠ 未能自动配置 shared_preload_libraries，请手动处理：${NC}"
+        echo "  在 $PG_DATA_DIR/postgresql.conf 设置: shared_preload_libraries = 'pg_textsearch'"
+        echo "  然后重启服务并执行: $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION pg_textsearch;\""
+        return 1
+    fi
+    case "$preload_result" in
+        present)
+            echo -e "${GREEN}✓ shared_preload_libraries 已包含 pg_textsearch${NC}"
+            ;;
+        altered|conf)
+            echo -e "${GREEN}✓ 已将 pg_textsearch 写入 shared_preload_libraries，需要重启服务生效${NC}"
+            need_restart=true
+            ;;
+    esac
+
+    # 2) 判断服务是否运行
+    local server_up=false
+    if [ -x "$PG_INSTALL_DIR/bin/pg_isready" ] || command -v pg_isready &>/dev/null; then
+        "$pg_isready_bin" -q 2>/dev/null && server_up=true
+    fi
+
+    if [ "$server_up" != true ]; then
+        echo -e "${YELLOW}检测到数据库服务未运行，跳过自动创建扩展。${NC}"
+        echo -e "${GREEN}pg_textsearch 扩展文件已安装完成。${NC}"
+        echo -e "${CYAN}请先启动/重启服务（使 shared_preload_libraries 生效），再在目标库执行：${NC}"
+        echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION pg_textsearch;\""
+        return 0
+    fi
+
+    # 3) 需要时重启服务
+    if [ "$need_restart" = true ]; then
+        local svc_name
+        svc_name="$(_pg_detect_service_name)"
+        if _pg_restart_service "$svc_name"; then
+            echo -e "${GREEN}✓ 服务已重启${NC}"
+        else
+            echo -e "${YELLOW}⚠ 自动重启服务失败，请手动重启后再执行 CREATE EXTENSION：${NC}"
+            echo "  systemctl restart $svc_name"
+            echo "  $psql_bin -U $pg_user -d postgres -c \"CREATE EXTENSION pg_textsearch;\""
+            return 1
+        fi
+        echo -e "${CYAN}等待服务就绪...${NC}"
+        local i
+        for i in $(seq 1 15); do
+            "$pg_isready_bin" -q 2>/dev/null && break
+            sleep 2
+        done
+    fi
+
+    # 4) 创建扩展
+    local sql="CREATE EXTENSION IF NOT EXISTS pg_textsearch;"
+    local ok=false i
+    for i in 1 2 3; do
+        if _pg_ext_run_sql "$sql"; then
+            ok=true
+            break
+        fi
+        echo -e "${YELLOW}等待数据库服务就绪... ($i/3)${NC}"
+        sleep 2
+    done
+
+    if [ "$ok" = true ]; then
+        echo -e "${GREEN}✓ 已在 postgres 数据库创建扩展 pg_textsearch${NC}"
+        echo -e "${CYAN}在其它业务库使用时，请在对应库执行: $sql${NC}"
+        echo -e "${CYAN}建索引示例: CREATE INDEX idx ON tbl USING bm25(content) WITH (text_config='english');${NC}"
+    else
+        echo -e "${YELLOW}⚠ 自动创建扩展未成功，请确认服务已带 pg_textsearch 重启后手动执行：${NC}"
+        echo "  $psql_bin -U $pg_user -d postgres -c \"$sql\""
+    fi
+}
+
 # 验证安装
 verify_installation() {
     echo -e "${YELLOW}验证安装...${NC}"
@@ -6481,6 +6787,8 @@ offline_install_flow() {
     POSTGIS_INSTALLED=""
     INSTALL_TIMESCALEDB=""
     TIMESCALEDB_INSTALLED=""
+    INSTALL_PG_TEXTSEARCH=""
+    PG_TEXTSEARCH_INSTALLED=""
 
     # 定义可用插件
     declare -A plugins
@@ -6498,6 +6806,7 @@ offline_install_flow() {
     plugins[pgvector]="pgvector向量扩展 (独立第三方扩展，需在离线目录准备其源码包)"
     plugins[postgis]="PostGIS空间扩展 (独立第三方扩展，需在离线目录准备源码包及geos/proj等依赖)"
     plugins[timescaledb]="TimescaleDB时序扩展 (独立第三方扩展，需cmake，需在离线目录准备源码包)"
+    plugins[pg_textsearch]="pg_textsearch全文检索扩展 (Timescale出品，BM25索引，仅支持PG17/18，需在离线目录准备源码包)"
 
     # 显示插件选项
     echo "可用插件列表:"
@@ -6580,6 +6889,11 @@ offline_install_flow() {
                     # TimescaleDB 是独立第三方扩展，cmake 构建，需 shared_preload_libraries
                     INSTALL_TIMESCALEDB="true"
                     echo -e "${GREEN}已选择 timescaledb，将在 PostgreSQL 编译安装后单独编译该扩展（启用时自动配置 preload 并重启）${NC}"
+                    ;;
+                "pg_textsearch")
+                    # pg_textsearch 是独立第三方扩展（Timescale 出品），PGXS/make 构建，需 shared_preload_libraries，仅支持 PG17/18
+                    INSTALL_PG_TEXTSEARCH="true"
+                    echo -e "${GREEN}已选择 pg_textsearch，将在 PostgreSQL 编译安装后单独安装该扩展（优先使用预编译包免编译，回退源码编译；仅支持 PG17/18，启用时自动配置 preload 并重启）${NC}"
                     ;;
                 *)
                     echo -e "${YELLOW}注意: 插件 '$plugin' 不在预定义列表中，将作为自定义参数处理${NC}"
@@ -6801,6 +7115,15 @@ offline_install_flow() {
         fi
     fi
 
+    # 编译安装 pg_textsearch 扩展（独立第三方扩展，make/PGXS 构建，仅支持 PG17/18，启用时需 preload + 重启）
+    if [ "$INSTALL_PG_TEXTSEARCH" = "true" ]; then
+        if install_pg_textsearch; then
+            PG_TEXTSEARCH_INSTALLED="true"
+        else
+            echo -e "${YELLOW}pg_textsearch 扩展安装未完成，PostgreSQL 主程序不受影响${NC}"
+        fi
+    fi
+
     # 步骤10: 设置环境变量
     setup_environment
 
@@ -6835,6 +7158,11 @@ offline_install_flow() {
     # TimescaleDB 扩展文件已安装时，配置 preload/重启后创建扩展
     if [ "$TIMESCALEDB_INSTALLED" = "true" ]; then
         enable_timescaledb_extension
+    fi
+
+    # pg_textsearch 扩展文件已安装时，配置 preload/重启后创建扩展
+    if [ "$PG_TEXTSEARCH_INSTALLED" = "true" ]; then
+        enable_pg_textsearch_extension
     fi
 
     # 步骤16: 显示安装信息
@@ -7307,6 +7635,11 @@ main() {
                 enable_timescaledb_extension
             fi
 
+            # pg_textsearch 扩展文件已安装时，配置 preload/重启后创建扩展
+            if [ "$PG_TEXTSEARCH_INSTALLED" = "true" ]; then
+                enable_pg_textsearch_extension
+            fi
+
             show_installation_info
 
             echo -e "${GREEN}PostgreSQL ${PG_VERSION} 安装完成!${NC}"
@@ -7346,6 +7679,8 @@ main() {
                 POSTGIS_INSTALLED=""
                 INSTALL_TIMESCALEDB=""
                 TIMESCALEDB_INSTALLED=""
+                INSTALL_PG_TEXTSEARCH=""
+                PG_TEXTSEARCH_INSTALLED=""
                 continue  # 返回主程序循环开始
                 ;;
             *)
