@@ -48,6 +48,10 @@ POSTGIS_VERSION="${POSTGIS_VERSION:-3.5.7}"
 TIMESCALEDB_VERSION="${TIMESCALEDB_VERSION:-2.29.2}"
 # pg_textsearch（Timescale 出品的 BM25 全文检索扩展）仅支持 PostgreSQL 17/18，需 shared_preload_libraries
 PG_TEXTSEARCH_VERSION="${PG_TEXTSEARCH_VERSION:-1.4.0}"
+# 部署方式（仅 pg_textsearch）：官方预编译包要求 glibc ≥ 2.38；glibc 达标时脚本交互询问
+# "预编译包免编译(1)/源码编译(2)"，默认 1。可设环境变量跳过交互/强制方式：
+#   PG_TEXTSEARCH_SKIP_CHOICE=1  非交互运行时不提问，直接用默认（预编译包）
+#   PG_TEXTSEARCH_FORCE_SOURCE=1 强制源码编译（忽略预编译包；glibc < 2.38 时本就自动源码编译）
 # PostGIS 3.5 要求 GEOS >= 3.8、PROJ >= 4.9；CentOS7 系统源为 GEOS 3.4 / PROJ 4.8，
 # 版本过低时从源码编译安装到 /usr/local（GEOS 选 3.9 以兼容 gcc 4.8 的 C++11；PROJ 6.3.2 用 autotools）
 # PROJ 6+ 编译要求 sqlite3 >= 3.11，而 CentOS7 自带 SQLite 仅 3.7.17，版本过低时同样从源码编译到 /usr/local
@@ -3733,7 +3737,7 @@ check_plugin_dependencies() {
                 ;;
             "pg_textsearch")
                 # pg_textsearch 是独立第三方扩展（纯 C / PGXS make 构建），仅需 gcc/make 与 pg_config，但仅支持 PG17/18
-                echo -e "${GREEN}✓ pg_textsearch 为独立扩展，优先使用官方预编译包免编译部署，无预编译包时用 pg_config 源码编译（仅支持 PostgreSQL 17/18）${NC}"
+                echo -e "${GREEN}✓ pg_textsearch 为独立扩展（仅支持 PostgreSQL 17/18）：安装时会先检测本机 glibc，≥ 2.38 可交互式选择"官方预编译包免编译部署"或"源码编译"，glibc 过低（如 CentOS 7）则自动源码编译${NC}"
                 ;;
             *)
                 echo -e "${YELLOW}⚠ 未知插件 '$plugin'，跳过依赖检查${NC}"
@@ -4405,8 +4409,8 @@ install_external_plugins() {
 
     # 清理独立扩展编译构建临时目录（本向导不经过完整安装流程的 cleanup_temp_files）
     if [ "$want_any_standalone" = true ]; then
-        rm -rf "/tmp/pgvector_build" "/tmp/postgis_build" "/tmp/timescaledb_build" "/tmp/geos_dep_build" "/tmp/proj_dep_build" "/tmp/sqlite_dep_build" 2>/dev/null
-        echo -e "${GREEN}✓ 已清理扩展临时构建目录（pgvector/postgis/timescaledb 及 geos/proj/sqlite 依赖）${NC}"
+        rm -rf "/tmp/pgvector_build" "/tmp/postgis_build" "/tmp/timescaledb_build" "/tmp/pg_textsearch_build" "/tmp/geos_dep_build" "/tmp/proj_dep_build" "/tmp/sqlite_dep_build" 2>/dev/null
+        echo -e "${GREEN}✓ 已清理扩展临时构建目录（pgvector/postgis/timescaledb/pg_textsearch 及 geos/proj/sqlite 依赖）${NC}"
     fi
 
     # 提示如何使用安装的插件和扩展
@@ -5178,14 +5182,15 @@ _pg_ext_prepare_source() {
     rm -rf "$work_dir"
     mkdir -p "$work_dir"
 
-    # 在 $1 目录下定位标记文件（已生成的 control 优先，其次未配置的 marker），回显其绝对路径
+    # 在 $1 目录下收集标记文件命中列表（已生成的 control 优先，其次未配置的 marker），
+    # 每行一个绝对路径。宽匹配下可能同时命中"预编译包解压目录"与"源码目录"里的同名 control，
+    # 由调用方逐个做根锚点校验、失败继续，不能只取第一个。
     _find_marker() {
-        local base="$1" hit=""
-        hit=$(find "$base" -maxdepth 6 -type f -name "$control_file" 2>/dev/null | head -n1)
-        if [ -z "$hit" ] && [ -n "$marker_file" ]; then
-            hit=$(find "$base" -maxdepth 6 -type f -name "$marker_file" 2>/dev/null | head -n1)
+        local base="$1"
+        find "$base" -maxdepth 6 -type f -name "$control_file" 2>/dev/null
+        if [ -n "$marker_file" ]; then
+            find "$base" -maxdepth 6 -type f -name "$marker_file" 2>/dev/null
         fi
-        [ -n "$hit" ] && echo "$hit"
     }
 
     # 由标记文件路径归一化出真正的源码根：沿目录向上，找到第一个含根锚点文件的目录
@@ -5207,15 +5212,22 @@ _pg_ext_prepare_source() {
             [ "$parent" = "$d" ] && break
             d="$parent"
         done
-        # 未找到锚点：回退为标记文件所在目录
-        dirname "$hit"
+        # 指定了根锚点但整条上级链都没找到：该目录不是完整源码根
+        # （例如 pg_textsearch 已解压的"预编译包"目录里有 control 但没有 Makefile），
+        # 返回失败让调用方跳过此目录、继续寻找其它位置（本地 tar / 在线下载）
+        return 1
     }
 
-    # 在指定目录下查找源码，命中时 echo 归一化后的源码根目录
+    # 在指定目录下查找源码，命中时 echo 归一化后的源码根目录。
+    # 标记文件可能有多个命中（如预编译解压目录与源码目录同处一棵树下），
+    # 逐个做根锚点校验，第一个归一化成功的即为有效源码根。
     _find_src_root() {
-        local base="$1" hit=""
-        hit=$( _find_marker "$base" )
-        [ -n "$hit" ] && _normalize_root "$hit"
+        local base="$1" hit d
+        while IFS= read -r hit; do
+            [ -z "$hit" ] && continue
+            d=$( _normalize_root "$hit" ) && { echo "$d"; return 0; }
+        done < <(_find_marker "$base")
+        return 1
     }
 
     local src_dir="" hit root archive
@@ -5231,27 +5243,34 @@ _pg_ext_prepare_source() {
     done
 
     # 2) 本地压缩包
+    # 注意：宽 glob（如 pg_textsearch-*.tar.gz）可能同时匹配源码包与 release 预编译包
+    # （pg_textsearch-pg17-v<ver>.tar.gz），后者解压后无根锚点 Makefile，因此这里收集
+    # 所有匹配包逐个解压、用 _find_src_root（含根锚点校验）验证，命中有效源码才采用，
+    # 跳过无效包继续尝试，避免取到第一个匹配包（可能是预编译包）就直接报错。
     if [ -z "$src_dir" ]; then
+        local archive_list=()
         for root in "${search_roots[@]}"; do
             [ -d "$root" ] || continue
-            archive=$(find "$root" -maxdepth 2 -type f -name "$archive_glob" 2>/dev/null | head -n1)
-            if [ -n "$archive" ]; then
-                echo -e "${GREEN}找到 $ext_name 压缩包: $archive${NC}"
-                break
-            fi
+            while IFS= read -r f; do
+                [ -n "$f" ] && archive_list+=("$f")
+            done < <(find "$root" -maxdepth 2 -type f -name "$archive_glob" 2>/dev/null)
         done
 
-        if [ -n "$archive" ]; then
-            if ! tar -zxf "$archive" -C "$work_dir"; then
-                echo -e "${RED}解压失败: $archive${NC}"
-                return 1
+        for archive in "${archive_list[@]}"; do
+            echo -e "${GREEN}尝试 $ext_name 压缩包: $archive${NC}"
+            rm -rf "$work_dir"/* 2>/dev/null
+            if ! tar -zxf "$archive" -C "$work_dir" 2>/dev/null; then
+                echo -e "${YELLOW}解压失败，跳过: $archive${NC}"
+                continue
             fi
             src_dir=$( _find_src_root "$work_dir" )
-            if [ -z "$src_dir" ]; then
-                echo -e "${RED}压缩包中未找到 $ext_name 源码（缺少 $control_file${marker_file:+ 或 $marker_file}）${NC}"
-                return 1
+            if [ -n "$src_dir" ]; then
+                echo -e "${GREEN}已从压缩包定位 $ext_name 源码根: $src_dir${NC}"
+                break
             fi
-        fi
+            echo -e "${YELLOW}该压缩包不是 $ext_name 源码（缺少 $control_file${marker_file:+ 或 $marker_file} 或根锚点 $root_anchors），继续查找...${NC}"
+            src_dir=""
+        done
     fi
 
     # 3) 在线下载
@@ -5259,7 +5278,12 @@ _pg_ext_prepare_source() {
         if [ "$OFFLINE_MODE" = "true" ]; then
             echo -e "${RED}离线模式下未找到 $ext_name 源码包${NC}"
             echo -e "${YELLOW}请在联网机下载源码，并与 PostgreSQL tar 包放在同一目录后重试：${NC}"
-            echo "  wget $url -O ${ext_name}-src.tar.gz"
+            # 建议的保存名必须匹配本扩展的本地扫描 glob（archive_glob 中的 * 替换为 src），
+            # 否则按此命名放置后扫描仍找不到（例如旧版统一提示 <扩展名>-src.tar.gz 时，
+            # pg_textsearch 的历史精确 glob 无法命中；现在各扩展 glob 均为 <扩展名>-*.tar.gz 宽匹配，
+            # 派生出的 <扩展名>-src.tar.gz 一定可被扫描识别）
+            local hint_name="${archive_glob/\*/src}"
+            echo "  wget $url -O $hint_name"
             echo -e "${YELLOW}也可解压后把源码目录放到 /tmp 或离线包同级目录${NC}"
             echo -e "${YELLOW}本次跳过 $ext_name 安装，不影响 PostgreSQL 主程序${NC}"
             return 1
@@ -6127,6 +6151,13 @@ enable_timescaledb_extension() {
 # 安装 pg_textsearch（Timescale 出品的 BM25 全文检索扩展）。
 # 纯 C / 标准 PGXS（make + make install），构建方式与 pgvector 相同；
 # 但仅支持 PostgreSQL 17/18，且必须通过 shared_preload_libraries 加载并重启后才能 CREATE EXTENSION。
+#
+# 重要：官方 Releases 预编译包（pg_textsearch-pg17-v*.tar.gz）在 EL9 / 新版 Ubuntu
+# （glibc ≥ 2.38）上构建，其中 pg_textsearch.so 链接了 GLIBC_2.38 符号；
+# 在 glibc < 2.38 的系统（如 CentOS 7，glibc 2.17）上直接使用会导致 PostgreSQL
+# 启动时报 "GLIBC_2.38 not found" 而 FATAL 无法启动（glibc 为系统核心库，不可单独升级）。
+# 本函数会先探测本机 glibc 版本：< 2.38 时自动跳过预编译包（不查找/不下载/不解压），
+# 直接回退源码编译；部署前还会用 ldd 对 .so 做一次可加载性兜底校验。
 install_pg_textsearch() {
     echo ""
     echo -e "${YELLOW}========== 安装 pg_textsearch 全文检索扩展（Timescale） ==========${NC}"
@@ -6148,6 +6179,21 @@ install_pg_textsearch() {
     fi
     echo -e "${GREEN}✓ PostgreSQL 版本检查通过（$pg_ver）${NC}"
 
+    # 探测本机 glibc 版本：官方预编译包在 glibc ≥ 2.38 的系统（EL9/Rocky 9/新版 Ubuntu）上构建，
+    # 低版本系统（如 CentOS 7 的 glibc 2.17）加载其 .so 会报 GLIBC_2.38 not found 导致 PG 无法启动。
+    # glibc 是系统核心库不能单独升级，因此低于 2.38 时必须本机源码编译，不能使用预编译包。
+    local host_glibc prebuilt_blocked=""
+    host_glibc=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [ -n "$host_glibc" ] && [ "$(printf '%s\n2.38\n' "$host_glibc" | sort -V | head -1)" != "2.38" ]; then
+        prebuilt_blocked=1
+        echo -e "${YELLOW}⚠ 本机 glibc 版本为 $host_glibc（< 2.38），官方 pg_textsearch 预编译包要求 glibc ≥ 2.38，${NC}"
+        echo -e "${YELLOW}  直接使用 github 上编译好的 pg_textsearch-pg${pg_ver}-v*.tar.gz 会在数据库启动时报${NC}"
+        echo -e "${YELLOW}  'GLIBC_2.38 not found' 并导致 PostgreSQL 无法启动。${NC}"
+        echo -e "${YELLOW}  本次自动跳过预编译包，改用源码编译（glibc 为系统核心库不可单独升级）。${NC}"
+    elif [ -n "$host_glibc" ]; then
+        echo -e "${GREEN}✓ 本机 glibc 版本为 $host_glibc（≥ 2.38），可使用官方预编译包${NC}"
+    fi
+
     local ts_version="${PG_TEXTSEARCH_VERSION:-1.4.0}"
     local work_dir="/tmp/pg_textsearch_build"
     local url="https://github.com/timescale/pg_textsearch/archive/refs/tags/v${ts_version}.tar.gz"
@@ -6164,33 +6210,94 @@ install_pg_textsearch() {
     local prebuilt_glob="pg_textsearch-pg${pg_ver}*.tar.gz"
     local search_roots=("$SCRIPT_DIR" "/tmp" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD" "$work_dir")
 
-    # 定位预编译文件来源：① 已解压目录（含 pg_textsearch.so 与 control）；② 本地压缩包；③ 在线下载
-    local deploy_root="" pre_archive="" root hit
-    for root in "${search_roots[@]}"; do
-        [ -d "$root" ] || continue
-        hit=$(find "$root" -maxdepth 6 -type f -name "pg_textsearch.so" 2>/dev/null | head -n1)
-        if [ -n "$hit" ]; then
-            local d
-            d=$(dirname "$hit")
-            # 含 Makefile 的是源码编译树（make 后也会生成 .so），不作为预编译目录，交回退源码流程处理
-            if [ -f "$d/pg_textsearch.control" ] && [ ! -f "$d/Makefile" ]; then
-                deploy_root="$d"
-                echo -e "${GREEN}找到已解压的 pg_textsearch 预编译文件: $d${NC}"
-                break
-            fi
-        fi
-    done
-    if [ -z "$deploy_root" ]; then
+    # 部署方式选择前，先探测本地已有的预编译包（已解压目录 / tar 压缩包）。
+    # 注意：本机 glibc < 2.38 时预编译包不可用（prebuilt_blocked=1），跳过预编译探测。
+    local deploy_root="" pre_archive="" root hit d
+    if [ -z "$prebuilt_blocked" ]; then
+        # ① 已解压目录（含 pg_textsearch.so 与 control；含 Makefile 的是源码编译树，不算预编译）。
+        # 注意：源码编译树 make 后同样会产出 pg_textsearch.so，故不能命中第一个 .so 就下结论，
+        # 需遍历所有 .so 命中、逐个校验同目录有 control 且无 Makefile，找到有效预编译目录为止。
         for root in "${search_roots[@]}"; do
             [ -d "$root" ] || continue
-            pre_archive=$(find "$root" -maxdepth 2 -type f -name "$prebuilt_glob" 2>/dev/null | head -n1)
-            if [ -n "$pre_archive" ]; then
-                echo -e "${GREEN}找到 pg_textsearch 预编译包: $pre_archive${NC}"
-                break
-            fi
+            while IFS= read -r hit; do
+                [ -z "$hit" ] && continue
+                d=$(dirname "$hit")
+                if [ -f "$d/pg_textsearch.control" ] && [ ! -f "$d/Makefile" ]; then
+                    deploy_root="$d"
+                    break 2
+                fi
+            done < <(find "$root" -maxdepth 6 -type f -name "pg_textsearch.so" 2>/dev/null)
         done
+        # ② 本地预编译压缩包（在线下载留到用户确认方式之后）
+        if [ -z "$deploy_root" ]; then
+            for root in "${search_roots[@]}"; do
+                [ -d "$root" ] || continue
+                pre_archive=$(find "$root" -maxdepth 2 -type f -name "$prebuilt_glob" 2>/dev/null | head -n1)
+                [ -n "$pre_archive" ] && break
+            done
+        fi
     fi
-    if [ -z "$deploy_root" ] && [ -z "$pre_archive" ] && [ "$OFFLINE_MODE" != "true" ]; then
+    local prebuilt_local_desc
+    if [ -n "$deploy_root" ]; then
+        prebuilt_local_desc="${GREEN}本地已找到已解压预编译文件: $deploy_root${NC}"
+    elif [ -n "$pre_archive" ]; then
+        prebuilt_local_desc="${GREEN}本地已找到预编译包: $pre_archive${NC}"
+    else
+        prebuilt_local_desc="${YELLOW}本地未找到预编译包（在线模式稍后自动联网下载；离线模式将不可用）${NC}"
+    fi
+
+    # 部署方式选择：glibc ≥ 2.38 时由用户选择"官方预编译包免编译部署"还是"本机源码编译"。
+    # 菜单已展示本地预编译包探测结果；本地优先：有本地包直接用，没有且选预编译时才在线下载。
+    # 交互默认 1（预编译包）；非交互（管道/重定向输入）或 PG_TEXTSEARCH_SKIP_CHOICE=1 时自动取默认；
+    # PG_TEXTSEARCH_FORCE_SOURCE=1 可在非交互场景强制源码编译。
+    local use_source=""
+    if [ -n "$prebuilt_blocked" ]; then
+        use_source=1
+        echo -e "${CYAN}本机 glibc < 2.38，预编译包不可用；源码编译同样本地优先（本地有源码包/已解压源码直接用，没有再联网下载）。${NC}"
+    elif [ "${PG_TEXTSEARCH_FORCE_SOURCE:-}" = "1" ] || [ "${PG_TEXTSEARCH_FORCE_SOURCE:-}" = "true" ]; then
+        use_source=1
+        echo -e "${CYAN}已设置 PG_TEXTSEARCH_FORCE_SOURCE=1，跳过预编译包，直接源码编译（本地有源码包优先用本地）。${NC}"
+    elif [ -t 0 ] && [ "${PG_TEXTSEARCH_SKIP_CHOICE:-}" != "1" ]; then
+        local ts_choice=""
+        echo ""
+        echo -e "${CYAN}请选择 pg_textsearch 的部署方式：${NC}"
+        echo -e "  ${GREEN}1${NC}) 使用官方预编译包（${GREEN}免编译${NC}，直接 cp .so/.control/.sql；glibc ≥ 2.38 本机已满足）"
+        echo -e "       $prebuilt_local_desc"
+        echo -e "  ${GREEN}2${NC}) 本机源码编译（make + make install；产物与本机完全适配，需 gcc/make）"
+        echo -e "       ${CYAN}本地优先：有本地源码 tar 包/已解压源码直接用，没有时联网下载源码${NC}"
+        read -rp "请选择 [1/2，默认 1]: " ts_choice
+        case "$ts_choice" in
+            2)
+                use_source=1
+                echo -e "${CYAN}已选择源码编译（本地优先，无本地源码包时联网下载），跳过预编译包。${NC}"
+                ;;
+            *)
+                use_source=""
+                if [ -n "$deploy_root" ] || [ -n "$pre_archive" ]; then
+                    echo -e "${CYAN}已选择官方预编译包免编译部署，使用上面本地找到的文件。${NC}"
+                else
+                    echo -e "${CYAN}已选择官方预编译包免编译部署，本地未找到，稍后在线下载。${NC}"
+                fi
+                ;;
+        esac
+    fi
+    if [ -n "$use_source" ]; then
+        # 用户选择源码编译（或 glibc 不达标）：屏蔽预编译包的下载/解压/部署，
+        # 并清空菜单前本地扫描已命中的预编译文件，避免下方解压/部署块仍然采用
+        prebuilt_blocked=1
+        deploy_root=""
+        pre_archive=""
+    fi
+
+    # 非交互/默认选预编译时，统一回显本地探测结果
+    if [ -z "$prebuilt_blocked" ]; then
+        [ -n "$deploy_root" ] && echo -e "${GREEN}找到已解压的 pg_textsearch 预编译文件: $deploy_root${NC}"
+        if [ -z "$deploy_root" ] && [ -n "$pre_archive" ]; then
+            echo -e "${GREEN}找到 pg_textsearch 预编译包: $pre_archive${NC}"
+        fi
+    fi
+
+    if [ -z "$deploy_root" ] && [ -z "$pre_archive" ] && [ -z "$prebuilt_blocked" ] && [ "$OFFLINE_MODE" != "true" ]; then
         local dl_file="$work_dir/pg_textsearch-pg${pg_ver}-v${ts_version}.tar.gz"
         echo -e "${CYAN}未找到本地预编译包，尝试在线下载 pg_textsearch pg${pg_ver} 预编译包（免编译）...${NC}"
         echo -e "${CYAN}下载地址: $prebuilt_url${NC}"
@@ -6226,20 +6333,32 @@ install_pg_textsearch() {
         f_so=$(find "$deploy_root" -type f -name 'pg_textsearch.so' 2>/dev/null | head -n1)
         f_sql=$(find "$deploy_root" -type f -name 'pg_textsearch--*.sql' 2>/dev/null | head -n1)
         if [ -n "$f_control" ] && [ -n "$f_so" ] && [ -n "$f_sql" ] && [ -d "$ext_dir" ] && [ -d "$lib_dir" ]; then
-            echo -e "${GREEN}预编译文件校验通过（control/sql/so 齐全），开始部署到 PostgreSQL 目录${NC}"
-            cp -f "$f_control" "$ext_dir/" &&
-            find "$deploy_root" -type f -name 'pg_textsearch--*.sql' -exec cp -f {} "$ext_dir/" \; &&
-            cp -f "$f_so" "$lib_dir/" &&
-            chmod 755 "$lib_dir/pg_textsearch.so" &&
-            chmod 644 "$ext_dir"/pg_textsearch.control "$ext_dir"/pg_textsearch--*.sql
-            if [ -f "$lib_dir/pg_textsearch.so" ] && [ -f "$ext_dir/pg_textsearch.control" ]; then
-                echo -e "${GREEN}✓ pg_textsearch 预编译文件已部署（免编译）：${NC}"
-                echo "  扩展文件: $ext_dir/pg_textsearch.control 与 pg_textsearch--*.sql"
-                echo "  库文件:   $lib_dir/pg_textsearch.so"
-                echo -e "${YELLOW}注意：仍需配置 shared_preload_libraries='pg_textsearch' 并重启后才能 CREATE EXTENSION${NC}"
-                return 0
-            fi
-            echo -e "${YELLOW}预编译文件拷贝不完整，回退源码编译${NC}"
+            # 兜底校验：用 ldd 确认 .so 能在本机加载。glibc 版本过低时会出现
+            # "libc.so.6: version `GLIBC_2.38' not found"，此类 .so 绝不能部署，
+            # 否则 PostgreSQL 启动即 FATAL（shared_preload_libraries 加载失败）。
+            local miss_libs
+            miss_libs=$(ldd "$f_so" 2>&1 | grep 'not found' | sed 's/^[[:space:]]*//' | sort -u)
+            if [ -n "$miss_libs" ]; then
+                echo -e "${YELLOW}⚠ 预编译 pg_textsearch.so 在本机无法加载，ldd 检查缺失依赖：${NC}"
+                echo "$miss_libs" | sed 's/^/    /'
+                echo -e "${YELLOW}  通常是本机 glibc 版本过低（官方预编译包要求 glibc ≥ 2.38，CentOS 7 为 2.17）。${NC}"
+                echo -e "${YELLOW}  不部署该预编译包，回退源码编译。${NC}"
+            else
+                echo -e "${GREEN}预编译文件校验通过（control/sql/so 齐全），开始部署到 PostgreSQL 目录${NC}"
+                cp -f "$f_control" "$ext_dir/" &&
+                find "$deploy_root" -type f -name 'pg_textsearch--*.sql' -exec cp -f {} "$ext_dir/" \; &&
+                cp -f "$f_so" "$lib_dir/" &&
+                chmod 755 "$lib_dir/pg_textsearch.so" &&
+                chmod 644 "$ext_dir"/pg_textsearch.control "$ext_dir"/pg_textsearch--*.sql
+                if [ -f "$lib_dir/pg_textsearch.so" ] && [ -f "$ext_dir/pg_textsearch.control" ]; then
+                    echo -e "${GREEN}✓ pg_textsearch 预编译文件已部署（免编译）：${NC}"
+                    echo "  扩展文件: $ext_dir/pg_textsearch.control 与 pg_textsearch--*.sql"
+                    echo "  库文件:   $lib_dir/pg_textsearch.so"
+                    echo -e "${YELLOW}注意：仍需配置 shared_preload_libraries='pg_textsearch' 并重启后才能 CREATE EXTENSION${NC}"
+                    return 0
+                fi
+                echo -e "${YELLOW}预编译文件拷贝不完整，回退源码编译${NC}"
+            fi # ldd 可加载性校验结束：不通过时不部署，继续向下走源码编译
         else
             echo -e "${YELLOW}预编译包内容不完整（缺少 control/sql/so 或目标目录不存在），回退源码编译${NC}"
         fi
@@ -6257,11 +6376,17 @@ install_pg_textsearch() {
     # pg_textsearch.control 与 Makefile(PGXS) 均在源码根目录。
     # 注意：命令替换会吞掉函数内的所有输出，因此手动回显日志（最后一行是源码路径）
     local prepared src_dir rc
-    prepared=$( _pg_ext_prepare_source "pg_textsearch" "$work_dir" "pg_textsearch.control" "pg_textsearch-*.tar.gz" "$url" )
+    # 第 7 个参数 root_anchors=Makefile：只有根目录含 Makefile 的才算源码树。
+    # 源码包（GitHub archive）命名为 pg_textsearch-<版本>.tar.gz（tag 的 v 前缀会被去掉，无 v），
+    # 故第 4 个参数 glob 用宽匹配 pg_textsearch-*.tar.gz；release 预编译包
+    # pg_textsearch-pg17/pg18-v<版本>.tar.gz 虽也匹配此 glob，但解压后无 Makefile（只有
+    # control/sql/so），会被 Makefile 锚点校验剔除、继续寻找其它来源，不会被当作源码误用。
+    prepared=$( _pg_ext_prepare_source "pg_textsearch" "$work_dir" "pg_textsearch.control" "pg_textsearch-*.tar.gz" "$url" "" "Makefile" )
     rc=$?
     if [ $rc -ne 0 ]; then
         [ -n "$prepared" ] && echo "$prepared"
         echo -e "${RED}pg_textsearch 源码准备失败（见上方日志），可手动下载后放到 /tmp 或脚本目录再重试：${NC}"
+        echo -e "${YELLOW}注意：源码包请保存为 pg_textsearch-${ts_version}.tar.gz（无 v；用 -O 指定文件名，否则默认存为 v${ts_version}.tar.gz 无法被本地扫描识别）${NC}"
         echo "  wget $url -O pg_textsearch-${ts_version}.tar.gz"
         return 1
     fi
@@ -6524,6 +6649,13 @@ cleanup_temp_files() {
     if [ -d "/tmp/timescaledb_build" ]; then
         rm -rf "/tmp/timescaledb_build"
         cleaned_files+=("timescaledb_build/")
+        ((cleaned_count++))
+    fi
+
+    # 清理 pg_textsearch 编译构建目录（含 prebuilt 解压子目录与下载的 tar 包）
+    if [ -d "/tmp/pg_textsearch_build" ]; then
+        rm -rf "/tmp/pg_textsearch_build"
+        cleaned_files+=("pg_textsearch_build/")
         ((cleaned_count++))
     fi
 

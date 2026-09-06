@@ -37,7 +37,7 @@
 - **pgvector 向量扩展**：独立第三方扩展，用 `pg_config` 单独编译，在线自动下载源码、离线支持本地源码包
 - **PostGIS 空间扩展**：独立第三方扩展（3.5.7），autotools 构建，在线自动下载源码、离线支持本地源码包，自动检测并安装 geos/proj/gdal 等依赖；老系统（如 CentOS 7）GEOS<3.8 / PROJ<6 时自动源码编译 GEOS 3.9.3 / PROJ 6.3.2 到 `/usr/local`
 - **TimescaleDB 时序扩展**：独立第三方扩展（2.29.2），cmake 构建，自动配置 `shared_preload_libraries` 并重启数据库后注册扩展
-- **pg_textsearch 全文检索扩展**：Timescale 出品的 BM25 全文检索扩展（1.4.0），仅支持 PostgreSQL 17/18；**优先使用官方预编译包免编译部署**（拷贝 `.so`/`.control`/`.sql`），无预编译包时回退源码 `make` 编译；需配置 `shared_preload_libraries` 并重启后注册扩展
+- **pg_textsearch 全文检索扩展**：Timescale 出品的 BM25 全文检索扩展（1.4.0），仅支持 PostgreSQL 17/18；glibc ≥ 2.38 的新系统安装时**交互询问**"官方预编译包免编译部署（默认）/ 本机源码编译"，预编译包即拷贝 `.so`/`.control`/`.sql`；需配置 `shared_preload_libraries` 并重启后注册扩展。**注意：官方预编译包要求本机 glibc ≥ 2.38**（在 EL9/新版 Ubuntu 上构建），CentOS 7 等老系统（glibc 2.17）使用会报 `GLIBC_2.38 not found` 导致数据库无法启动；脚本会自动探测本机 glibc，低于 2.38 时不弹菜单、直接源码编译
 - **ICU 可用性探测**：采用真实编译+链接测试，避免仅有头文件而缺开发库导致的链接失败
 - **路径默认值**：离线 tar 包路径留空时默认使用脚本所在目录
 - **临时文件清理**：安装完成后自动清理临时文件（含 pgvector / PostGIS / TimescaleDB / pg_textsearch 构建目录）
@@ -175,14 +175,20 @@ sudo ./install_postgresql.sh
 > # TimescaleDB 2.29.2（codeload 源码包，解压目录为 timescaledb-2.29.2）
 > wget https://codeload.github.com/timescale/timescaledb/tar.gz/refs/tags/2.29.2 -O timescaledb-2.29.2.tar.gz
 >
-> # pg_textsearch 1.4.0 —— 推荐预编译二进制包（免编译，按 PG 大版本选择 pg17 或 pg18）
+> # pg_textsearch 1.4.0 —— 预编译二进制包（免编译，按 PG 大版本选择 pg17 或 pg18）
+> # ⚠️ 预编译包在 glibc ≥ 2.38 的系统（EL9/Rocky 9/Ubuntu 22.04+ 等）上构建；
+> #    目标机为 CentOS 7 等老系统（glibc 2.17）时切勿使用，否则数据库启动报 GLIBC_2.38 not found。
+> #    老系统请只备源码包（脚本会自动探测 glibc 版本，< 2.38 时跳过预编译包强制源码编译）。
 > wget https://github.com/timescale/pg_textsearch/releases/download/v1.4.0/pg_textsearch-pg17-v1.4.0.tar.gz
-> #   若目标机缺编译工具链或预编译包不可用，再备源码包（纯 C / PGXS make 编译）：
+> #   源码包（纯 C / PGXS make 编译，老系统必备；glibc ≥ 2.38 的机器上也作为回退）：
+> #   GitHub archive 解压目录为 pg_textsearch-1.4.0，用 -O 保存为 pg_textsearch-1.4.0.tar.gz（无 v）；
+> #   脚本源码包扫描按 pg_textsearch-*.tar.gz 宽匹配，release 预编译包（含 pg17/pg18 段）
+> #   虽也匹配此 glob，但解压后无 Makefile 会被自动跳过，不会误当作源码编译
 > wget https://github.com/timescale/pg_textsearch/archive/refs/tags/v1.4.0.tar.gz -O pg_textsearch-1.4.0.tar.gz
 > ```
-> 也可解压后把源码目录放到上述位置（pgvector 目录需含 `Makefile` 与 `vector.control`；PostGIS 目录顶层需含 `GNUmakefile.in`（`postgis.control.in` 实际在 `extensions/postgis/` 子目录）；TimescaleDB 目录需含 `bootstrap` 与 `timescaledb.control.in`）。脚本会按扩展标记自动识别，并归一化到真正的源码根目录（含 `configure`/`bootstrap` 的那一层）。
+> 也可解压后把源码目录放到上述位置（pgvector 目录需含 `Makefile` 与 `vector.control`；PostGIS 目录顶层需含 `configure`、`GNUmakefile.in` 或 `autogen.sh` 中任一锚点文件——脚本按 `postgis.control.in`（实际在 `extensions/postgis/` 子目录）定位后，再沿目录向上归一化到含锚点的源码根；TimescaleDB 目录需含 `bootstrap` 与 `timescaledb.control.in`）。脚本会按扩展标记自动识别，并归一化到真正的源码根目录（含 `configure`/`GNUmakefile.in`/`autogen.sh`/`bootstrap` 等锚点的那一层）。
 >
-> **pg_textsearch 离线准备（两种方式，二选一）**：①（推荐）预编译包 `pg_textsearch-pg17-v1.4.0.tar.gz`（PG18 换成 `pg18`）——直接放上述目录即可，脚本自动解压并拷贝文件，**目标机无需 gcc/make**；② 源码包 `pg_textsearch-1.4.0.tar.gz`（或解压后含 `Makefile` 与 `pg_textsearch.control` 的目录）——目标机需有 gcc、make。预编译包与源码包同时存在时，**优先使用预编译包**。注意预编译包按 PostgreSQL 大版本发布，务必下载与目标库一致的 `pg17`/`pg18` 包。
+> **pg_textsearch 离线准备（两种方式，二选一）**：① 预编译包 `pg_textsearch-pg17-v1.4.0.tar.gz`（PG18 换成 `pg18`）——直接放上述目录即可，脚本自动解压并拷贝文件，**目标机无需 gcc/make**，但**仅限目标机 glibc ≥ 2.38**（EL9/Rocky 9/Ubuntu 22.04+ 等新系统）；② 源码包 `pg_textsearch-1.4.0.tar.gz`（GitHub archive，**无 v**；或解压后含 `Makefile` 与 `pg_textsearch.control` 的目录）——目标机需有 gcc、make，**CentOS 7 等老系统（glibc 2.17）必须选这种**。预编译包与源码包同时存在且 glibc ≥ 2.38 时，脚本安装时会**弹出菜单让你选择**（`1` 预编译包＝默认 / `2` 源码编译）；脚本安装前自动探测本机 glibc 版本（`ldd --version`），**低于 2.38 一律不弹菜单、跳过预编译包（即使包已放在目录中也不会使用）直接源码编译**，选择预编译包部署前还会用 `ldd` 校验 `.so` 是否可加载。注意预编译包按 PostgreSQL 大版本发布，务必下载与目标库一致的 `pg17`/`pg18` 包。
 >
 > ⚠️ **PostGIS 注意**：从 GitHub/codeload 下载的源码包**不含已生成的 `configure`**（只有 `configure.ac` 与 `autogen.sh`）。脚本会自动运行 `./autogen.sh` 生成（需目标机装有 `autoconf`/`automake`/`libtool`，依赖检查阶段会自动安装）；若下载的是 PostGIS 官方 make dist 发布包（自带 `configure`），则跳过此步骤直接编译。
 
@@ -204,7 +210,7 @@ sudo ./install_postgresql.sh
 | pgvector | 向量检索扩展（独立扩展，非 `./configure` 插件） | gcc、make、pg_config |
 | postgis | 空间/GIS 扩展（独立扩展，autotools 构建） | geos≥3.8、proj≥6（老系统自动源码编译 GEOS 3.9.3/PROJ 6.3.2）、gdal、json-c、libxml2、protobuf-c |
 | timescaledb | 时序数据库扩展（独立扩展，cmake 构建，需 preload 并重启） | cmake ≥ 3.15（CentOS 7 用 cmake3）、gcc、openssl-devel |
-| pg_textsearch | BM25 全文检索扩展（独立扩展，Timescale 出品，仅 PG17/18，需 preload 并重启） | **推荐预编译包：免依赖**；源码编译回退需 gcc、make、pg_config |
+| pg_textsearch | BM25 全文检索扩展（独立扩展，Timescale 出品，仅 PG17/18，需 preload 并重启） | 预编译包免依赖但**要求 glibc ≥ 2.38**（CentOS 7 等老系统不可用，脚本自动改源码编译）；源码编译需 gcc、make、pg_config |
 
 > ⚠️ **UUID插件说明**：脚本会自动检测系统中可用的UUID库（e2fsprogs或OSSP），优先使用e2fsprogs。如两者都未安装，会尝试自动安装。
 
@@ -391,9 +397,22 @@ pg_textsearch 是 [Timescale](https://github.com/timescale/pg_textsearch) 出品
 
 > ⚠️ **硬性限制**：pg_textsearch **仅支持 PostgreSQL 17/18**，且与 TimescaleDB 一样**必须**出现在 `shared_preload_libraries` 中、**重启数据库**后才能 `CREATE EXTENSION`。脚本在安装前会用 `pg_config --version` 校验主版本，非 17/18 会跳过安装（不影响 PostgreSQL 主程序）。
 
-**安装机制：文件部署 → 配置 preload 并重启 → 注册扩展**。其中"文件部署"支持两种方式，脚本**自动优先使用预编译包**：
+> 🚫 **预编译包的 glibc 限制（重要，老系统必读）**：官方 Releases 中的预编译包 `pg_textsearch-pg17/pg18-v*.tar.gz` 是在**新系统**（EL9 / Rocky 9 / Ubuntu 22.04+ 等，**glibc ≥ 2.38**）上编译的，包内 `pg_textsearch.so` 链接了 `GLIBC_2.38` 符号。在 **glibc < 2.38** 的系统（典型如 **CentOS 7，glibc 2.17**）上直接使用，PostgreSQL 启动时会报：
+>
+> ```text
+> FATAL: could not load library ".../lib/pg_textsearch.so":
+> /lib64/libc.so.6: version `GLIBC_2.38' not found (required by .../pg_textsearch.so)
+> ```
+>
+> 由于 pg_textsearch 在 `shared_preload_libraries` 中，该错误会导致**数据库直接无法启动**（systemd 反复重启失败）。**glibc 是系统核心库，不能单独升级/替换**，唯一根治办法是在本机（或同版本系统）**源码编译**。
+>
+> **脚本已自动处理**：安装 pg_textsearch 前先用 `ldd --version` 探测本机 glibc —— **低于 2.38 时不询问、直接源码编译**（不查找、不下载、不采用目录中已有的预编译包）；**glibc ≥ 2.38 时会弹出交互菜单让你选择部署方式**：`1` 官方预编译包免编译（默认，回车即可）/ `2` 本机源码编译。选定预编译包后，部署前还用 `ldd` 对 `.so` 做一次可加载性校验，发现 `not found` 依赖同样放弃预编译包转源码编译。
+>
+> 非交互/自动化场景（标准输入不是终端，如管道、`<<EOF`、后台执行）不弹菜单，默认走预编译包；可用环境变量控制：`PG_TEXTSEARCH_SKIP_CHOICE=1` 显式跳过提问取默认，`PG_TEXTSEARCH_FORCE_SOURCE=1` 强制源码编译。
 
-**方式一（推荐）：官方预编译二进制包 —— 免编译、免工具链**
+**安装机制：文件部署 → 配置 preload 并重启 → 注册扩展**。其中"文件部署"支持两种方式：glibc ≥ 2.38 的新系统安装时**交互询问**（默认预编译包，可选择源码编译），glibc < 2.38 的老系统自动走源码编译：
+
+**方式一：官方预编译二进制包 —— 免编译、免工具链（要求本机 glibc ≥ 2.38，交互菜单选 1 / 默认）**
 
 Timescale 在 Releases 中按 PG 大版本提供预编译包 `pg_textsearch-pg17-v1.4.0.tar.gz` / `pg_textsearch-pg18-v1.4.0.tar.gz`，包内只有三类文件：
 
@@ -403,39 +422,64 @@ pg_textsearch--1.4.0.sql     # 扩展注册 SQL
 pg_textsearch.so             # 动态库
 ```
 
-脚本流程：在脚本目录 / `/tmp` / 离线 tar 包同级目录 / 当前目录中查找 `pg_textsearch-pg<主版本>*.tar.gz`（或已解压且含 `pg_textsearch.so`+`pg_textsearch.control` 的目录）；在线模式下本地没有时自动从 GitHub Releases 下载对应 PG 大版本的包 → 解压 → 校验三类文件齐全 → 拷贝到 PostgreSQL 目录（`control`/`.sql` → `<prefix>/share/extension/`，`.so` → `<prefix>/lib/`）。**全程不需要 gcc/make/cmake**，适合精简系统或离线环境。
+脚本流程（**本地优先**）：先用 `ldd --version` 探测本机 glibc → **glibc ≥ 2.38 时先扫描本地**（脚本目录 / `/tmp` / 离线 tar 包同级目录 / 当前目录，顺序为：已解压的预编译目录 → `pg_textsearch-pg<主版本>*.tar.gz` 压缩包）→ **弹出选择菜单并在选项下方显示本地探测结果**（`1` 预编译包免编译＝默认 / `2` 源码编译）：
+
+- **本地已找到预编译包**：菜单选项 1 下方绿色显示"本地已找到预编译包: <路径>"，选择后直接解压/校验/拷贝，**不联网**；
+- **本地未找到**：菜单选项 1 下方黄色提示"本地未找到预编译包（在线模式稍后自动联网下载；离线模式将不可用）"，选 1 且在线模式才从 GitHub Releases 下载；离线模式选 1 会在部署失败后自动回退源码。
+
+选择预编译包后：解压 → 校验三类文件齐全 → **`ldd` 校验 `.so` 无缺失符号/依赖** → 拷贝到 PostgreSQL 目录（`control`/`.sql` → `<prefix>/share/extension/`，`.so` → `<prefix>/lib/`）。**全程不需要 gcc/make/cmake**，适合精简系统，但**仅限 glibc ≥ 2.38 的新系统且选择了方式一**；本机 glibc < 2.38、或菜单选 `2`（含 `PG_TEXTSEARCH_FORCE_SOURCE=1`）时，上述预编译查找/下载/部署全部跳过，直接转方式二源码编译。菜单示例：
+
+```text
+请选择 pg_textsearch 的部署方式：
+  1) 使用官方预编译包（免编译，直接 cp .so/.control/.sql；glibc ≥ 2.38 本机已满足）
+       本地已找到预编译包: /opt/pkg/pg_textsearch-pg17-v1.4.0.tar.gz   ← 本地有：绿色显示，直接用
+       （或）本地未找到预编译包（在线模式稍后自动联网下载；离线模式将不可用）  ← 本地无：黄色提示
+  2) 本机源码编译（make + make install；产物与本机完全适配，需 gcc/make）
+       本地优先：有本地源码 tar 包/已解压源码直接用，没有时联网下载源码
+请选择 [1/2，默认 1]:
+```
 
 > 📌 **版本必须匹配**：预编译包按 PostgreSQL 大版本发布（pg17 / pg18），脚本只匹配当前数据库主版本对应的包；放错版本（如 PG17 环境放了 pg18 包）不会被采用。
 
-**方式二（回退）：源码编译 —— 纯 C / PGXS**
+**方式二：源码编译 —— 纯 C / PGXS（glibc < 2.38 自动采用；glibc ≥ 2.38 可在菜单选 2）**
 
-当预编译包不存在、下载失败或内容不完整时，自动回退源码编译：定位/下载源码包 → `make PG_CONFIG=<prefix>/bin/pg_config -jN`（失败自动降 `-j1` 重试）→ `make install PG_CONFIG=...`，需要目标机装有 `gcc`、`make`。
+当**本机 glibc < 2.38**（如 CentOS 7，自动进入、不弹菜单）、**交互菜单选了 `2`**（或设置了 `PG_TEXTSEARCH_FORCE_SOURCE=1`）、预编译包不存在、下载失败、内容不完整或 `ldd` 校验发现 `.so` 缺失依赖时，采用源码编译。源码侧同样**本地优先**：先在脚本目录 / `/tmp` / 离线 tar 包同级目录 / 当前目录查找已解压源码（目录中须同时含 `pg_textsearch.control` 与 `Makefile`；只有 control 没有 Makefile 的是**已解压的预编译包**，会被自动跳过）或本地源码压缩包（扫描 glob 为 `pg_textsearch-*.tar.gz`：GitHub 源码包解压目录为 `pg_textsearch-<版本>`，应保存为 `pg_textsearch-1.4.0.tar.gz` 等**无 `v`** 命名；release 预编译包 `pg_textsearch-pg17-v1.4.0.tar.gz` 虽也匹配该 glob，但脚本会**逐个解压校验根锚点 `Makefile`**，预编译包解压后无 `Makefile` 会被自动跳过、继续找真正的源码包），本地有就直接用、不联网，本地没有才在线下载源码：定位/下载源码包 → `make PG_CONFIG=<prefix>/bin/pg_config -jN`（失败自动降 `-j1` 重试）→ `make install PG_CONFIG=...`，需要目标机装有 `gcc`、`make`。本机源码编译产出的 `.so` 链接本机 glibc，不存在 `GLIBC_2.38 not found` 问题。
+
+> 📌 **离线准备源码包的文件名**：GitHub archive 的源码包请用 `-O` 保存为 `pg_textsearch-1.4.0.tar.gz`（**无 `v`**，与解压目录 `pg_textsearch-1.4.0/` 一致；不指定 `-O` 时浏览器/wget 默认存为 `v1.4.0.tar.gz`，无法被本地扫描识别）。脚本按 `pg_textsearch-*.tar.gz` 宽匹配扫描，若目录里同时存在 release 预编译包（`pg_textsearch-pg17-v1.4.0.tar.gz`）也无妨——脚本会逐个解压、校验根目录 `Makefile`，预编译包无 `Makefile` 会被跳过；也可直接**解压后**放置（解压目录含 `Makefile` 与 `pg_textsearch.control` 即可被识别）。
 
 **文件部署完成后**（与 TimescaleDB 相同的启用流程）：脚本询问是否立即启用 → 用 `ALTER SYSTEM`（服务未运行/离线时改写 `postgresql.conf`）把 `pg_textsearch` 幂等加入 `shared_preload_libraries` → 自动重启服务并等待就绪 → 执行 `CREATE EXTENSION IF NOT EXISTS pg_textsearch;`（默认在 `postgres` 库）。
 
 **下载地址**（版本由 `PG_TEXTSEARCH_VERSION` 控制）：
 
 ```bash
-# 预编译包（推荐，按 PG 大版本二选一）
+# 预编译包（按 PG 大版本二选一；⚠️ 仅适用于 glibc ≥ 2.38 的新系统，CentOS 7 等老系统勿用）
 wget https://github.com/timescale/pg_textsearch/releases/download/v1.4.0/pg_textsearch-pg17-v1.4.0.tar.gz
 wget https://github.com/timescale/pg_textsearch/releases/download/v1.4.0/pg_textsearch-pg18-v1.4.0.tar.gz
-# 源码包（回退编译用）
+# 源码包（老系统必须用此包本机编译；新系统也作为回退）
+# GitHub archive 解压目录为 pg_textsearch-1.4.0，用 -O 保存为 pg_textsearch-1.4.0.tar.gz（无 v）；
+# 脚本源码包扫描按 pg_textsearch-*.tar.gz 宽匹配，预编译包（含 pg17/pg18 段）会因无 Makefile 被自动跳过
 wget https://github.com/timescale/pg_textsearch/archive/refs/tags/v1.4.0.tar.gz -O pg_textsearch-1.4.0.tar.gz
 ```
 
-可通过环境变量指定版本：
+可通过环境变量指定版本或控制部署方式：
 
 ```bash
-export PG_TEXTSEARCH_VERSION=1.4.0
+export PG_TEXTSEARCH_VERSION=1.4.0        # 指定扩展版本
+export PG_TEXTSEARCH_SKIP_CHOICE=1        # 跳过"预编译/源码"交互菜单，直接用默认（预编译包）
+export PG_TEXTSEARCH_FORCE_SOURCE=1       # 强制源码编译（忽略预编译包；glibc<2.38 时本就自动源码编译）
 sudo ./install_postgresql.sh
 ```
+
+> 💡 交互菜单仅在标准输入为终端时弹出（直接在终端运行脚本）；管道/重定向/后台等非交互场景默认走预编译包，可用上面两个环境变量改变行为。glibc < 2.38 的老系统**任何情况下都不会使用预编译包**（菜单不出现）。
 
 **事后加装**：已装好的 PostgreSQL（17/18）可通过主菜单 `3 → 1（外部插件向导）` 输入 `pg_textsearch` 单独加装；向导会自动部署文件、配置 preload、重启服务并创建扩展。
 
 **手动安装/启用**（不使用脚本时，对应预编译包 README 的三步）：
 
+> ⚠️ 手动拷贝预编译包前，先确认本机 glibc ≥ 2.38（`ldd --version | head -1`），并最好执行 `ldd pg_textsearch.so | grep 'not found'` 确认无缺失；CentOS 7（glibc 2.17）等老系统**不要**拷贝预编译 `.so`，请改用源码 `make && make install PG_CONFIG=<prefix>/bin/pg_config`，否则数据库启动即报 `GLIBC_2.38 not found`。
+
 ```bash
-# 1. 部署文件（<prefix> 为 PostgreSQL 安装目录）
+# 1. 部署文件（<prefix> 为 PostgreSQL 安装目录；仅 glibc ≥ 2.38 的新系统可直接 cp 预编译文件）
 cp pg_textsearch.control pg_textsearch--*.sql  <prefix>/share/extension/
 cp pg_textsearch.so                            <prefix>/lib/
 
@@ -931,7 +975,9 @@ PostGIS 的文件安装同样不需要数据库运行（仅 `CREATE EXTENSION po
 
 > 💡 若 TimescaleDB / pg_textsearch 扩展创建失败，请确认 `SHOW shared_preload_libraries;` 的输出中含有对应库名，且数据库在配置后已重启。
 
-> 💡 **pg_textsearch 免编译**：脚本优先使用官方预编译包（`pg_textsearch-pg17/pg18-v*.tar.gz`），目标机无需 gcc/make；预编译包缺失或下载失败时才回退源码 `make` 编译。离线时把对应 PG 大版本的预编译包放到脚本目录 / tar 包同级目录 / `/tmp` 即可。
+> 💡 **pg_textsearch 免编译（可交互选择）**：glibc ≥ 2.38 的新系统（EL9/Rocky 9/Ubuntu 22.04+）上，安装 pg_textsearch 时会弹出菜单：`1` 使用官方预编译包（`pg_textsearch-pg17/pg18-v*.tar.gz`，默认、目标机无需 gcc/make）/ `2` 本机源码编译；直接回车即选预编译包。预编译包缺失或下载失败时自动回退源码 `make` 编译。离线时把对应 PG 大版本的预编译包放到脚本目录 / tar 包同级目录 / `/tmp` 即可。非交互运行（管道/后台）不弹菜单默认走预编译包；想跳过提问可设 `PG_TEXTSEARCH_SKIP_CHOICE=1`，想强制源码编译可设 `PG_TEXTSEARCH_FORCE_SOURCE=1`。
+>
+> ⚠️ **老系统（CentOS 7 等，glibc < 2.38）不能免编译、也不弹选择菜单**：官方预编译包在新系统上构建，`.so` 要求 `GLIBC_2.38`，老系统强行使用会导致 PostgreSQL 启动 FATAL（`version 'GLIBC_2.38' not found`）且无法拉起服务。脚本会自动探测 glibc 版本，低于 2.38 时**即使目录里放了预编译包也不会使用**，直接源码编译（老系统离线时请务必准备**源码包** `pg_textsearch-1.4.0.tar.gz`（GitHub archive，无 `v`）而非预编译包；也可解压后放置含 `Makefile` 的源码目录）。手动排查命令：`ldd --version | head -1` 看本机 glibc；`ldd <prefix>/lib/pg_textsearch.so | grep 'not found'` 看 `.so` 是否可加载。
 
 ---
 
@@ -1089,10 +1135,12 @@ psql -U postgres -c "SELECT version();"
 - **pg_textsearch 全文检索扩展支持（默认 1.4.0，Timescale 出品）**
   - 在线安装、离线安装、外部插件向导三处均可选择 pg_textsearch
   - 独立第三方扩展，纯 C / 标准 PGXS；**仅支持 PostgreSQL 17/18**，安装前用 `pg_config --version` 校验主版本，不匹配则跳过且不影响主程序
-  - **双模式文件部署，优先免编译**：① 优先使用官方预编译二进制包 `pg_textsearch-pg17/pg18-v<版本>.tar.gz`（本地查找 `pg_textsearch-pg<主版本>*.tar.gz` → 在线模式自动从 GitHub Releases 下载 → 解压校验 `pg_textsearch.control`/`pg_textsearch--*.sql`/`pg_textsearch.so` 三类文件齐全 → 拷贝到 `share/extension/` 与 `lib/`），**目标机无需 gcc/make**；② 预编译包缺失/下载失败/内容不完整时自动回退源码编译（`make PG_CONFIG=... -jN`，失败降 `-j1` 重试）
-  - 预编译包按 PG 大版本匹配（pg17/pg18），放错版本不会被采用；已解压目录中含 `.so`+`.control` 且无 `Makefile` 的也识别为预编译文件
+  - **双模式文件部署 + glibc 自动探测 + 交互选择（本地优先）**：安装前先用 `ldd --version` 探测本机 glibc —— `< 2.38`（如 CentOS 7 的 2.17）时不弹菜单、不查找/下载预编译包，直接源码编译（官方预编译包链接 `GLIBC_2.38`，老系统使用会导致 PG 启动 FATAL）；`≥ 2.38` 时弹出菜单让用户选择：`1` 官方预编译包免编译（默认）/ `2` 本机源码编译。菜单弹出前先**扫描本地预编译包**（脚本目录 / `/tmp` / 离线 tar 同级目录 / 当前目录：已解压的预编译目录 → `pg_textsearch-pg<主版本>*.tar.gz`），结果直接显示在选项 1 下方（绿色本地路径 / 黄色未找到），本地有直接用不联网，本地无且选预编译才在线下载
+  - 预编译部署：解压 → 校验 `pg_textsearch.control`/`pg_textsearch--*.sql`/`pg_textsearch.so` 三类文件齐全 → 部署前用 `ldd` 对 `.so` 做可加载性兜底校验（发现 `not found` 依赖则放弃、回退源码）→ 拷贝到 `share/extension/` 与 `lib/`，**目标机无需 gcc/make**；预编译包按 PG 大版本匹配（pg17/pg18），放错版本不采用；已解压目录中含 `.so`+`.control` 且无 `Makefile` 的也识别为预编译文件
+  - 源码编译（glibc<2.38 自动 / 菜单选 2 / `PG_TEXTSEARCH_FORCE_SOURCE=1` / 预编译不可用时回退）：同样**本地优先**——已解压源码目录须同时含 `pg_textsearch.control` 与 `Makefile`（只有 control 无 Makefile 的是已解压预编译包，自动跳过）；本地源码压缩包按 `pg_textsearch-*.tar.gz` 宽匹配（GitHub 源码包为 `pg_textsearch-<版本>.tar.gz`，**无 v**；release 预编译包 `pg_textsearch-pg17/pg18-v<版本>.tar.gz` 虽也匹配，但解压后无 `Makefile`，会被逐个根锚点校验跳过），本地无则在线下载；`make PG_CONFIG=... -jN`（失败降 `-j1` 重试）
+  - 非交互运行（管道/重定向/后台）不弹菜单、默认预编译包；`PG_TEXTSEARCH_SKIP_CHOICE=1` 显式跳过提问，`PG_TEXTSEARCH_FORCE_SOURCE=1` 强制源码编译
   - 自动配置 `shared_preload_libraries='pg_textsearch'`（优先 `ALTER SYSTEM`，离线改写 `postgresql.conf`）并**自动重启**服务、等待就绪后 `CREATE EXTENSION pg_textsearch`
-  - 离线支持本地预编译包 / 源码包 `pg_textsearch-*.tar.gz` / 已解压目录；临时构建目录 `/tmp/pg_textsearch_build` 自动清理
+  - 临时构建目录 `/tmp/pg_textsearch_build` 自动清理
 
 #### 功能优化
 
@@ -1104,6 +1152,11 @@ psql -U postgres -c "SELECT version();"
 - TimescaleDB 源码根自动归一化（命中 `build/src` 时回溯到含 `bootstrap` 的源码根）
 - 外部插件向导支持 pgvector / postgis / timescaledb 与 contrib 插件任意混选，独立扩展统一走"编译→启用"流程
 - 临时文件清理新增 `/tmp/postgis_build`、`/tmp/timescaledb_build`
+- **pg_textsearch 部署选择修复**：菜单选 `2` 源码编译（或 `PG_TEXTSEARCH_FORCE_SOURCE=1`）后，同时清空菜单前本地扫描命中的预编译包变量，修复原先 `prebuilt_blocked=1` 但解压/部署块无守卫、仍会部署预编译包导致选择被忽略的问题
+- **pg_textsearch 源码包定位加固**：源码准备传入根锚点 `Makefile`，已解压的预编译包目录（有 `pg_textsearch.control` 无 `Makefile`）不再被误判为源码根；本地源码压缩包按 `pg_textsearch-*.tar.gz` 宽匹配（GitHub 源码包为 `pg_textsearch-<版本>.tar.gz`，**无 v**；release 预编译包 `pg_textsearch-pg17/pg18-v<版本>.tar.gz` 虽也匹配该 glob，但解压后无 `Makefile`），本地压缩包/已解压目录的扫描都改为**逐个命中、逐个做根锚点校验**，命中预编译包时自动跳过并继续寻找真正的源码包/在线下载，不再取第一个匹配包就报错
+- **离线/失败提示文件名与本地扫描规则对齐**：`_pg_ext_prepare_source` 离线提示的建议保存名改为从各扩展自己的扫描 glob 派生（glob 中的 `*` 替换为 `src`），修复原先统一提示 `<扩展名>-src.tar.gz` 与部分扩展 glob 不匹配、用户按提示放置后仍扫描不到的问题；pg_textsearch 源码准备失败的手动下载提示同步改为 GitHub archive 真实命名 `pg_textsearch-<版本>.tar.gz`（**无 v**，用 `-O` 指定，否则默认存为 `v<版本>.tar.gz` 无法被扫描识别）
+- **补全 `/tmp/pg_textsearch_build` 临时目录清理**：完整安装流程的 `cleanup_temp_files` 与外部插件向导结尾的清理列表原先只覆盖 pgvector/postgis/timescaledb，pg_textsearch 的构建目录（含 prebuilt 解压子目录与下载的 tar 包）会残留，现已纳入两处清理
+- **预编译已解压目录扫描加固**：已解压目录按 `pg_textsearch.so` 探测时，不再命中第一个 `.so` 就下结论——源码编译树 `make` 后同样会产出 `pg_textsearch.so`（同目录含 `Makefile`），现改为遍历所有 `.so` 命中、逐个校验"同目录有 `pg_textsearch.control` 且无 `Makefile`"，避免首个命中是源码树时漏掉同目录树下真正的预编译解压目录
 
 ### v2.2.0
 

@@ -19,8 +19,8 @@
 #   bash migrate_pg17_pack.sh <PG目录> <data目录> <输出目录>   # 全参数免交互
 #
 # 只需确认三个路径：
-#   ① 源机 PG 安装目录（bin/、lib/ 所在目录，如 .../postgresql-17.11）→ 打成 pg17-bin.tar.gz
-#   ② 源机 data 数据目录（postgresql.conf 所在目录，仅取配置，不打包数据）→ pg17-conf.tar.gz
+#   ① 源机 PG 安装目录（bin/、lib/ 所在目录，如 .../postgresql-17.11，即环境变量 PG_HOME）→ 打成 pg17-bin.tar.gz
+#   ② 源机 data 数据目录（postgresql.conf 所在目录，仅取配置，不打包数据，即环境变量 PGDATA）→ pg17-conf.tar.gz
 #   ③ 压缩包输出目录（打包产物存放处，供 scp 传到目标机）
 # =============================================================
 set -euo pipefail
@@ -35,35 +35,49 @@ echo "=============================================="
 echo "  PostgreSQL 17 源机打包"
 echo "=============================================="
 
-# ---------- 自动探测源机 PG 环境 ----------
+# ---------- 自动探测源机 PG 环境（优先读环境变量 PG_HOME/PGDATA） ----------
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-AUTO_PGHOME=""
+AUTO_PG_HOME=""
 AUTO_PGDATA=""
 
-# ① 优先从正在运行的 postgres 进程获取（ps 取进程命令行；CentOS 7 兼容：ps -eo args）
-pg_proc=$(ps -eo args 2>/dev/null | grep -E '[p]ostgres( |$).*-D ' | head -1 || true)
-if [ -n "$pg_proc" ]; then
-  proc_bin=${pg_proc%% *}
-  case "$proc_bin" in
-    */bin/postgres) AUTO_PGHOME=${proc_bin%/bin/postgres} ;;
-    postgres)
-      p=$(command -v postgres 2>/dev/null || true)
-      [ -n "$p" ] && AUTO_PGHOME=${p%/bin/postgres} ;;
-  esac
-  d=$(printf '%s\n' "$pg_proc" | sed -n 's/.*-D[[:space:]]*\([^[:space:]]*\).*/\1/p')
-  [ -n "$d" ] && AUTO_PGDATA=$d
+# ① 优先读 /etc/profile 等写入的 PG_HOME / PGDATA 环境变量
+if [ -n "${PG_HOME:-}" ] && [ -x "$PG_HOME/bin/postgres" ]; then
+  AUTO_PG_HOME=$PG_HOME
+fi
+if [ -n "${PGDATA:-}" ] && [ -f "$PGDATA/postgresql.conf" ]; then
+  AUTO_PGDATA=$PGDATA
 fi
 
-# ② 进程没拿到则扫描常见安装位置
-if [ -z "$AUTO_PGHOME" ]; then
+# ② 其次从正在运行的 postgres 进程获取（ps 取进程命令行；CentOS 7 兼容：ps -eo args）
+if [ -z "$AUTO_PG_HOME" ] || [ -z "$AUTO_PGDATA" ]; then
+  pg_proc=$(ps -eo args 2>/dev/null | grep -E '[p]ostgres( |$).*-D ' | head -1 || true)
+  if [ -n "$pg_proc" ]; then
+    proc_bin=${pg_proc%% *}
+    if [ -z "$AUTO_PG_HOME" ]; then
+      case "$proc_bin" in
+        */bin/postgres) AUTO_PG_HOME=${proc_bin%/bin/postgres} ;;
+        postgres)
+          p=$(command -v postgres 2>/dev/null || true)
+          [ -n "$p" ] && AUTO_PG_HOME=${p%/bin/postgres} ;;
+      esac
+    fi
+    if [ -z "$AUTO_PGDATA" ]; then
+      d=$(printf '%s\n' "$pg_proc" | sed -n 's/.*-D[[:space:]]*\([^[:space:]]*\).*/\1/p')
+      [ -n "$d" ] && AUTO_PGDATA=$d
+    fi
+  fi
+fi
+
+# ③ 进程也没拿到则扫描常见安装位置
+if [ -z "$AUTO_PG_HOME" ]; then
   for d in /home/data/postgresql/postgresql-17* /mnt/data/postgresql/postgresql-17* \
            /usr/local/pgsql* /opt/postgresql*/postgresql-17*; do
-    [ -x "$d/bin/postgres" ] && { AUTO_PGHOME="$d"; break; }
+    [ -x "$d/bin/postgres" ] && { AUTO_PG_HOME="$d"; break; }
   done
 fi
 # data 目录：先看探测值，再看 PG 目录同级
-if [ -z "$AUTO_PGDATA" ] && [ -n "$AUTO_PGHOME" ]; then
-  for d in "$(dirname "$AUTO_PGHOME")/data" /home/data/postgresql/data /mnt/data/postgresql/data; do
+if [ -z "$AUTO_PGDATA" ] && [ -n "$AUTO_PG_HOME" ]; then
+  for d in "$(dirname "$AUTO_PG_HOME")/data" /home/data/postgresql/data /mnt/data/postgresql/data; do
     [ -f "$d/postgresql.conf" ] && { AUTO_PGDATA="$d"; break; }
   done
 fi
@@ -73,14 +87,14 @@ AUTO_OUT=/mnt/data
 
 # ---------- 交互确认（仅确认/修改三个路径；命令行传参则跳过对应提问） ----------
 if [ -n "${1:-}" ]; then
-  SRC_PGHOME=$1
+  SRC_PG_HOME=$1
 else
-  if [ -n "$AUTO_PGHOME" ]; then
-    info "自动探测到 PG 安装目录：$AUTO_PGHOME"
-    read -r -p "① PG 安装目录（bin/、lib/ 所在目录，直接回车用探测值）: " SRC_PGHOME
-    SRC_PGHOME=${SRC_PGHOME:-$AUTO_PGHOME}
+  if [ -n "$AUTO_PG_HOME" ]; then
+    info "自动探测到 PG 安装目录（PG_HOME）：$AUTO_PG_HOME"
+    read -r -p "① PG 安装目录（bin/、lib/ 所在目录，直接回车用探测值）: " SRC_PG_HOME
+    SRC_PG_HOME=${SRC_PG_HOME:-$AUTO_PG_HOME}
   else
-    read -r -p "① PG 安装目录（bin/、lib/ 所在目录，如 /home/data/postgresql/postgresql-17.11）: " SRC_PGHOME
+    read -r -p "① PG 安装目录（bin/、lib/ 所在目录，如 /home/data/postgresql/postgresql-17.11）: " SRC_PG_HOME
   fi
 fi
 
@@ -88,7 +102,7 @@ if [ -n "${2:-}" ]; then
   SRC_PGDATA=$2
 else
   if [ -n "$AUTO_PGDATA" ]; then
-    info "自动探测到 data 数据目录：$AUTO_PGDATA"
+    info "自动探测到 data 数据目录（PGDATA）：$AUTO_PGDATA"
     read -r -p "② data 数据目录（postgresql.conf 所在目录，仅取配置不打包数据，回车用探测值）: " SRC_PGDATA
     SRC_PGDATA=${SRC_PGDATA:-$AUTO_PGDATA}
   else
@@ -104,7 +118,7 @@ else
 fi
 
 # ---------- 校验 ----------
-[ -x "$SRC_PGHOME/bin/postgres" ] || { err "未找到 $SRC_PGHOME/bin/postgres，请检查 ① PG 安装目录"; exit 1; }
+[ -x "$SRC_PG_HOME/bin/postgres" ] || { err "未找到 $SRC_PG_HOME/bin/postgres，请检查 ① PG 安装目录"; exit 1; }
 [ -f "$SRC_PGDATA/postgresql.conf" ] || warn "$SRC_PGDATA 下未找到 postgresql.conf，将无法打出 pg17-conf.tar.gz（目标机用默认配置）"
 if ! mkdir -p "$OUT" 2>/dev/null || [ ! -w "$OUT" ]; then
   err "输出目录 $OUT 无法创建或不可写，请检查 ③ 输出目录"; exit 1
@@ -112,7 +126,7 @@ fi
 
 echo
 echo "---------- 打包参数 ----------"
-echo "① PG 安装目录 : $SRC_PGHOME  -> pg17-bin.tar.gz（程序+扩展）、pg17-deps/syslib.tar.gz（依赖库）"
+echo "① PG 安装目录 : $SRC_PG_HOME  -> pg17-bin.tar.gz（程序+扩展）、pg17-deps/syslib.tar.gz（依赖库）"
 echo "② data 目录   : $SRC_PGDATA  -> pg17-conf.tar.gz（仅取 postgresql.conf/pg_hba.conf）"
 echo "③ 输出目录    : $OUT  （6 个打包产物全部放这里）"
 echo "------------------------------"
@@ -121,7 +135,7 @@ read -r -p "确认开始打包？[Y/n]: " yn
 
 # ---------- 1. 打包 PG 程序目录 ----------
 info "1/6 打包 PG 程序目录 -> pg17-bin.tar.gz"
-tar -zcf "$OUT/pg17-bin.tar.gz" -C "$(dirname "$SRC_PGHOME")" "$(basename "$SRC_PGHOME")"
+tar -zcf "$OUT/pg17-bin.tar.gz" -C "$(dirname "$SRC_PG_HOME")" "$(basename "$SRC_PG_HOME")"
 # 注意：不能用 grep -q（提前退出会使 tar 收 SIGPIPE，pipefail 下误判）
 if tar -tzf "$OUT/pg17-bin.tar.gz" | grep -E 'postgis.*\.control' >/dev/null 2>&1; then
   info "    已确认包内含 postgis 扩展"
@@ -179,7 +193,7 @@ fi
 info "3/6 ldd 收集系统运行时库 -> pg17-syslib.tar.gz"
 list="$OUT/pg17-syslib.list"
 : > "$list"
-for bin in "$SRC_PGHOME/bin/postgres" "$SRC_PGHOME/bin/psql" "$SRC_PGHOME/lib/"*.so; do
+for bin in "$SRC_PG_HOME/bin/postgres" "$SRC_PG_HOME/bin/psql" "$SRC_PG_HOME/lib/"*.so; do
   ldd "$bin" 2>/dev/null
 done | \
   awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | \
@@ -240,7 +254,7 @@ rm -rf "$conf_tmp"
 info "5/6 写路径清单 -> pg17-migrate.env"
 cat > "$OUT/pg17-migrate.env" <<EOF
 # 由 migrate_pg17_pack.sh 自动生成，目标机 deploy 脚本读取后做路径替换
-SOURCE_PGHOME=$SRC_PGHOME
+SOURCE_PG_HOME=$SRC_PG_HOME
 SOURCE_PGDATA=$SRC_PGDATA
 EOF
 cat "$OUT/pg17-migrate.env"
@@ -249,13 +263,13 @@ cat "$OUT/pg17-migrate.env"
 info "6/6 生成依赖清单 -> pg17-ldd.txt"
 {
   echo "===== postgres 主程序 ====="
-  ldd "$SRC_PGHOME/bin/postgres"
+  ldd "$SRC_PG_HOME/bin/postgres"
   echo "===== PostGIS 扩展 ====="
-  ldd "$SRC_PGHOME/lib/postgis-3.so" 2>/dev/null || true
+  ldd "$SRC_PG_HOME/lib/postgis-3.so" 2>/dev/null || true
   echo "===== pgvector 扩展 ====="
-  ldd "$SRC_PGHOME/lib/vector.so" 2>/dev/null || true
+  ldd "$SRC_PG_HOME/lib/vector.so" 2>/dev/null || true
   echo "===== TimescaleDB 扩展 ====="
-  ldd "$SRC_PGHOME/lib/"timescaledb-*.so 2>/dev/null || true
+  ldd "$SRC_PG_HOME/lib/"timescaledb-*.so 2>/dev/null || true
 } > "$OUT/pg17-ldd.txt" 2>&1
 
 # ---------- 汇总 ----------

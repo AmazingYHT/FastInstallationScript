@@ -13,7 +13,8 @@
 #   5. initdb 全新 data 目录
 #   6. 覆盖源机带过来的 postgresql.conf / pg_hba.conf（自动替换路径）
 #   7. 安装 postgresql17.service 并启动
-#   8. CREATE EXTENSION postgis/vector/timescaledb 并验证
+#   8. 写 /etc/profile 环境变量（PG_HOME/PGDATA，与 install_postgresql.sh 一致）
+#   9. CREATE EXTENSION postgis/vector/timescaledb 并验证
 #
 # 用法：在【目标机】上以 root 执行
 #   bash migrate_pg17_deploy.sh                 # 自动扫描迁移包目录
@@ -59,30 +60,32 @@ PKG_DIR=${PKG_DIR%/}
 
 # 从 bin 包推导默认目标 PG 目录（以源机打包的程序目录名为准，如 postgresql-17.11）
 bin_top=$(tar -tzf "$PKG_DIR/pg17-bin.tar.gz" 2>/dev/null | awk -F/ 'NR==1{print $1}')
-default_pghome=/mnt/data/postgresql/${bin_top:-postgresql-17}
+default_pg_home=/mnt/data/postgresql/${bin_top:-postgresql-17}
 
-# ---------- 交互输入（只问目标机三件事） ----------
-read -r -p "目标机 PG 安装目录 [$default_pghome]: " PGHOME
-PGHOME=${PGHOME:-$default_pghome}
+# ---------- 交互输入（只问目标机两件事） ----------
+read -r -p "目标机 PG 安装目录 [$default_pg_home]: " PG_HOME
+PG_HOME=${PG_HOME:-$default_pg_home}
 
 read -r -p "目标机 data 数据目录（全新初始化） [/mnt/data/postgresql/data]: " PGDATA
 PGDATA=${PGDATA:-/mnt/data/postgresql/data}
 
-# 系统库固定解压到迁移包目录下的隐藏目录，无需关心
-SYSLIB="$PKG_DIR/.pg17-syslib"
+# 系统库解压到 PG 安装目录的同级目录 pg17-syslib，便于统一管理
+# （默认 PG_HOME=/mnt/data/postgresql/postgresql-17.11 时，即 /mnt/data/postgresql/pg17-syslib）
+SYSLIB="$(dirname "$PG_HOME")/pg17-syslib"
 
 # 源机路径只从打包时生成的 pg17-migrate.env 读取（用于替换配置里的旧路径），无需填写
-SRC_PGHOME=""
+SRC_PG_HOME=""
 SRC_PGDATA=""
 if [ -f "$PKG_DIR/pg17-migrate.env" ]; then
   # shellcheck disable=SC1090
   . "$PKG_DIR/pg17-migrate.env"
-  SRC_PGHOME=${SOURCE_PGHOME:-}
+  # 兼容旧包字段名 SOURCE_PGHOME
+  SRC_PG_HOME=${SOURCE_PG_HOME:-${SOURCE_PGHOME:-}}
   SRC_PGDATA=${SOURCE_PGDATA:-}
 fi
 # 预构造路径替换表达式（后面应用配置/服务文件时统一使用）
 SED_PATH_EXPR=()
-[ -n "$SRC_PGHOME" ] && SED_PATH_EXPR+=(-e "s|$SRC_PGHOME|$PGHOME|g")
+[ -n "$SRC_PG_HOME" ] && SED_PATH_EXPR+=(-e "s|$SRC_PG_HOME|$PG_HOME|g")
 [ -n "$SRC_PGDATA" ] && SED_PATH_EXPR+=(-e "s|$SRC_PGDATA|$PGDATA|g")
 
 # ---------- 前置检查：缺什么一次性列清楚 ----------
@@ -107,10 +110,11 @@ fi
 echo
 echo "---------- 部署参数 ----------"
 echo "迁移包目录 : $PKG_DIR"
-echo "PG 目录    : $PGHOME"
+echo "PG 目录    : $PG_HOME"
 echo "data 目录  : $PGDATA"
-if [ -n "$SRC_PGHOME" ] || [ -n "$SRC_PGDATA" ]; then
-  echo "源机路径   : $SRC_PGHOME  $SRC_PGDATA（来自 pg17-migrate.env，仅用于配置路径替换）"
+echo "系统库目录 : $SYSLIB"
+if [ -n "$SRC_PG_HOME" ] || [ -n "$SRC_PGDATA" ]; then
+  echo "源机路径   : $SRC_PG_HOME  $SRC_PGDATA（来自 pg17-migrate.env，仅用于配置路径替换）"
 else
   warn "未读取到源机路径（pg17-migrate.env 为空），配置文件中的旧路径不会自动替换"
 fi
@@ -119,32 +123,32 @@ read -r -p "确认开始部署？[Y/n]: " yn
 [[ "${yn:-Y}" =~ ^[Nn]$ ]] && { echo "已取消"; exit 0; }
 
 # ---------- 1. 创建 postgres 用户/组 ----------
-info "1/8 创建 postgres 用户/组"
+info "1/9 创建 postgres 用户/组"
 getent group postgres >/dev/null || groupadd -r postgres
 id postgres >/dev/null 2>&1 || useradd -r -g postgres -m -s /bin/bash postgres
 id postgres
 
 # ---------- 2. 解压三个包 ----------
-info "2/8 解压迁移包"
-mkdir -p "$(dirname "$PGHOME")" "$SYSLIB"
+info "2/9 解压迁移包"
+mkdir -p "$(dirname "$PG_HOME")" "$SYSLIB"
 # 系统库：包内是 usr/lib64/...，strip 两级平铺
 tar -zxf "$PKG_DIR/pg17-syslib.tar.gz" --strip-components=2 -C "$SYSLIB"
-# PG 程序：包内顶层目录名（前面推导默认 PG 目录时已读取为 bin_top）；若与目标 PGHOME 目录名不同则重命名
-tar -zxf "$PKG_DIR/pg17-bin.tar.gz" -C "$(dirname "$PGHOME")"
-if [ -n "$bin_top" ] && [ "$bin_top" != "$(basename "$PGHOME")" ]; then
-  [ -e "$PGHOME" ] && { err "$PGHOME 已存在，无法把 $bin_top 重命名为目标目录名"; exit 1; }
-  mv "$(dirname "$PGHOME")/$bin_top" "$PGHOME"
+# PG 程序：包内顶层目录名（前面推导默认 PG 目录时已读取为 bin_top）；若与目标 PG_HOME 目录名不同则重命名
+tar -zxf "$PKG_DIR/pg17-bin.tar.gz" -C "$(dirname "$PG_HOME")"
+if [ -n "$bin_top" ] && [ "$bin_top" != "$(basename "$PG_HOME")" ]; then
+  [ -e "$PG_HOME" ] && { err "$PG_HOME 已存在，无法把 $bin_top 重命名为目标目录名"; exit 1; }
+  mv "$(dirname "$PG_HOME")/$bin_top" "$PG_HOME"
 fi
-chown -R postgres:postgres "$PGHOME"
+chown -R postgres:postgres "$PG_HOME"
 # 自研依赖：包内自带 usr/local/...，必须 -C / 还原
 tar -zxf "$PKG_DIR/pg17-deps.tar.gz" -C /
-[ -x "$PGHOME/bin/postgres" ] || { err "解压后未找到 $PGHOME/bin/postgres，检查 PG 目录参数"; exit 1; }
+[ -x "$PG_HOME/bin/postgres" ] || { err "解压后未找到 $PG_HOME/bin/postgres，检查 PG 目录参数"; exit 1; }
 [ -f /usr/local/share/proj/proj.db ] || warn "未发现 /usr/local/share/proj/proj.db，PostGIS 投影功能可能异常"
 
 # ---------- 3. 配置动态库搜索路径 ----------
-info "3/8 写 /etc/ld.so.conf.d/pg17-syslib.conf 并刷新缓存"
+info "3/9 写 /etc/ld.so.conf.d/pg17-syslib.conf 并刷新缓存"
 cat > /etc/ld.so.conf.d/pg17-syslib.conf <<EOF
-$PGHOME/lib
+$PG_HOME/lib
 /usr/local/lib
 $SYSLIB
 EOF
@@ -152,9 +156,9 @@ cat /etc/ld.so.conf.d/pg17-syslib.conf
 ldconfig
 
 # ---------- 4. ldd 校验 ----------
-info "4/8 校验依赖库完整性"
+info "4/9 校验依赖库完整性"
 missing=0
-for f in "$PGHOME/bin/postgres" "$PGHOME/bin/psql" "$PGHOME/lib/"*.so; do
+for f in "$PG_HOME/bin/postgres" "$PG_HOME/bin/psql" "$PG_HOME/lib/"*.so; do
   out=$(ldd "$f" 2>/dev/null | grep 'not found' || true)
   if [ -n "$out" ]; then
     echo "$f:"; echo "$out"; missing=1
@@ -164,22 +168,22 @@ if [ "$missing" -ne 0 ]; then
   err "存在缺失库。请按《迁移操作.md》Q9/Q10 从源机补拷到 $SYSLIB 后 ldconfig，再重跑本脚本"
   exit 1
 fi
-"$PGHOME/bin/postgres" --version
+"$PG_HOME/bin/postgres" --version
 info "    依赖库全部就位"
 
 # ---------- 5. initdb ----------
-info "5/8 初始化 data 目录"
+info "5/9 初始化 data 目录"
 if [ -s "$PGDATA/PG_VERSION" ]; then
   warn "    $PGDATA 已初始化（发现 PG_VERSION），跳过 initdb"
 else
   mkdir -p "$PGDATA"
   chown -R postgres:postgres "$PGDATA"
   chmod 700 "$PGDATA"
-  su - postgres -c "$PGHOME/bin/initdb -D $PGDATA --encoding=UTF8 --locale=C -U postgres"
+  su - postgres -c "$PG_HOME/bin/initdb -D $PGDATA --encoding=UTF8 --locale=C -U postgres"
 fi
 
 # ---------- 6. 覆盖源机配置文件 ----------
-info "6/8 应用源机配置 postgresql.conf / pg_hba.conf"
+info "6/9 应用源机配置 postgresql.conf / pg_hba.conf"
 conf_tmp=$(mktemp -d)
 if [ -f "$PKG_DIR/pg17-conf.tar.gz" ]; then
   tar -zxf "$PKG_DIR/pg17-conf.tar.gz" -C "$conf_tmp"
@@ -217,7 +221,7 @@ PORT=${PORT:-5432}
 info "    数据库端口：$PORT"
 
 # ---------- 7. 安装并启动 systemd 服务 ----------
-info "7/8 配置 postgresql17.service 并启动"
+info "7/9 配置 postgresql17.service 并启动"
 if [ -f "$conf_tmp/postgresql17.service" ] && [ "${#SED_PATH_EXPR[@]}" -gt 0 ]; then
   sed "${SED_PATH_EXPR[@]}" \
     "$conf_tmp/postgresql17.service" > /etc/systemd/system/postgresql17.service
@@ -236,9 +240,9 @@ Type=forking
 User=postgres
 Group=postgres
 PIDFile=$PGDATA/postmaster.pid
-ExecStart=$PGHOME/bin/pg_ctl start -D $PGDATA -l $PGDATA/postgresql.log
-ExecStop=$PGHOME/bin/pg_ctl stop -D $PGDATA
-ExecReload=$PGHOME/bin/pg_ctl reload -D $PGDATA
+ExecStart=$PG_HOME/bin/pg_ctl start -D $PGDATA -l $PGDATA/postgresql.log
+ExecStop=$PG_HOME/bin/pg_ctl stop -D $PGDATA
+ExecReload=$PG_HOME/bin/pg_ctl reload -D $PGDATA
 Restart=on-failure
 RestartSec=5s
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -260,25 +264,41 @@ fi
 
 # 等待就绪（最多 30 秒；端口从配置里解析，兼容改过端口的情况）
 for i in $(seq 1 30); do
-  "$PGHOME/bin/pg_isready" -p "$PORT" -q && break
+  "$PG_HOME/bin/pg_isready" -p "$PORT" -q && break
   sleep 1
 done
-if ! "$PGHOME/bin/pg_isready" -p "$PORT" -q; then
+if ! "$PG_HOME/bin/pg_isready" -p "$PORT" -q; then
   err "服务未能就绪，请检查日志：tail -100 $PGDATA/postgresql.log"
   systemctl status postgresql17 --no-pager || true
   exit 1
 fi
 systemctl status postgresql17 --no-pager | head -5 || true
 
-# ---------- 8. 创建扩展并验证 ----------
-info "8/8 创建扩展并验证"
-su - postgres -c "$PGHOME/bin/psql -p $PORT -d postgres -c 'CREATE EXTENSION IF NOT EXISTS postgis;'"
-su - postgres -c "$PGHOME/bin/psql -p $PORT -d postgres -c 'CREATE EXTENSION IF NOT EXISTS vector;'"
-su - postgres -c "$PGHOME/bin/psql -p $PORT -d postgres -c 'CREATE EXTENSION IF NOT EXISTS timescaledb;'"
+# ---------- 8. 写环境变量到 /etc/profile（与 install_postgresql.sh 同一套变量名） ----------
+info "8/9 写入 PostgreSQL 环境变量到 /etc/profile"
+cp /etc/profile "/etc/profile.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+# 幂等：先剔除旧块再追加
+sed -i '/# PostgreSQL Environment/,/# End PostgreSQL Environment/d' /etc/profile
+cat >> /etc/profile <<EOF
+
+# PostgreSQL Environment
+export PG_HOME=$PG_HOME
+export PGDATA=$PGDATA
+export PATH=\$PG_HOME/bin:\$PATH
+export MANPATH=\$PG_HOME/share/man:\$MANPATH
+# End PostgreSQL Environment
+EOF
+info "    已写入 PG_HOME=$PG_HOME、PGDATA=$PGDATA（重新登录或 source /etc/profile 后生效）"
+
+# ---------- 9. 创建扩展并验证 ----------
+info "9/9 创建扩展并验证"
+su - postgres -c "$PG_HOME/bin/psql -p $PORT -d postgres -c 'CREATE EXTENSION IF NOT EXISTS postgis;'"
+su - postgres -c "$PG_HOME/bin/psql -p $PORT -d postgres -c 'CREATE EXTENSION IF NOT EXISTS vector;'"
+su - postgres -c "$PG_HOME/bin/psql -p $PORT -d postgres -c 'CREATE EXTENSION IF NOT EXISTS timescaledb;'"
 echo
-su - postgres -c "$PGHOME/bin/psql -p $PORT -d postgres -c '\dx'"
+su - postgres -c "$PG_HOME/bin/psql -p $PORT -d postgres -c '\dx'"
 echo
-su - postgres -c "$PGHOME/bin/psql -p $PORT -d postgres -t -c 'SELECT postgis_full_version();'"
+su - postgres -c "$PG_HOME/bin/psql -p $PORT -d postgres -t -c 'SELECT postgis_full_version();'"
 
 echo
 info "部署完成。远程连接请确认 pg_hba.conf 已放行网段、防火墙开放端口。"
