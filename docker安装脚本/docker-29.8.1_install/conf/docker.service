@@ -1,0 +1,31 @@
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+After=network-online.target firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/dockerd
+ExecReload=/bin/kill -s HUP $MAINPID
+
+TimeoutSec=0
+
+RestartSec=5
+
+Restart=always
+
+TimeoutStartSec=0
+
+LimitNOFILE=infinity
+LimitNPROC=infinity
+
+LimitCORE=infinity
+
+Delegate=yes
+KillMode=process
+StartLimitBurst=5
+StartLimitInterval=60s
+
+[Install]
+WantedBy=multi-user.target

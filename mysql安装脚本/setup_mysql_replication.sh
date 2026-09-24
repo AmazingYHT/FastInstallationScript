@@ -67,6 +67,35 @@ KEEP_LOCAL_TARBALL=1
 # 从库列表: host:port:user:password  (user/password 为 SSH 账号)
 SLAVE_HOSTS=()
 
+# ======================== 系统版本检测与包管理统一封装 ========================
+# EL8/9(Rocky/AlmaLinux/CentOS/RHEL) 用 dnf，EL7 用 yum，Debian 系用 apt-get
+SYS_PKG=""; SYS_FAMILY=""; OS_ID=""; OS_MAJOR=""
+
+detect_sys_pkg() {
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="${ID:-}"; OS_MAJOR="${VERSION_ID%%.*}"
+    fi
+    if command -v dnf &>/dev/null && [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && [ "$OS_MAJOR" -ge 8 ]; then
+        SYS_PKG=dnf; SYS_FAMILY=el
+    elif command -v yum &>/dev/null; then
+        SYS_PKG=yum; SYS_FAMILY=el
+    elif command -v apt-get &>/dev/null; then
+        SYS_PKG=apt-get; SYS_FAMILY=debian
+    fi
+}
+
+# 静默安装软件包。用法：sys_pkg_install "<el系包名>" "<debian系包名>"
+sys_pkg_install() {
+    local el_pkg="$1" deb_pkg="${2:-$1}"
+    case "$SYS_PKG" in
+        dnf) dnf install -y $el_pkg ;;
+        yum) yum install -y $el_pkg ;;
+        apt-get) apt-get install -y $deb_pkg ;;
+        *) return 1 ;;
+    esac
+}
+
 # ======================== 工具函数 ========================
 
 print_separator() {
@@ -136,13 +165,8 @@ ensure_ssh_tools() {
 
     if [ -n "$SSH_PASSWORD" ] && ! command -v sshpass >/dev/null 2>&1; then
         echo -e "${YELLOW}检测到使用 SSH 密码，但未安装 sshpass${NC}"
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get install -y sshpass 2>/dev/null || true
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y sshpass 2>/dev/null || true
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y sshpass 2>/dev/null || true
-        fi
+        detect_sys_pkg
+        sys_pkg_install "sshpass" "sshpass" 2>/dev/null || true
 
         if ! command -v sshpass >/dev/null 2>&1; then
             echo -e "${RED}sshpass 安装失败。请配置 SSH 免密，或手动安装 sshpass${NC}"
@@ -196,6 +220,53 @@ test_ssh_connection() {
         echo -e "${RED}✗ SSH 连接失败${NC}"
         return 1
     fi
+}
+
+# ======================== 远程节点 SELinux 处理 ========================
+# 本地只询问一次；确认后通过 SSH 在每个远程节点幂等关闭
+SELINUX_REMOTE_DISABLE_ASKED=0
+SELINUX_REMOTE_DISABLE=0
+
+disable_remote_selinux() {
+    local host="$1"
+
+    if [ "$SELINUX_REMOTE_DISABLE_ASKED" -eq 0 ]; then
+        SELINUX_REMOTE_DISABLE_ASKED=1
+        echo ""
+        echo -e "${YELLOW}远程节点若开启 SELinux（Enforcing），服务以 systemd 启动时可能被拦截。${NC}"
+        echo -e "${YELLOW}建议在所有远程节点关闭 SELinux（setenforce 0 立即生效 + 改 /etc/selinux/config 永久生效）。${NC}"
+        if [ -t 0 ] && [ -t 1 ]; then
+            local sel
+            read -rp "是否自动关闭所有远程节点的 SELinux? [Y/n]: " sel
+            [ -z "$sel" ] && sel="Y"
+            [[ "$sel" =~ ^[Yy]$ ]] && SELINUX_REMOTE_DISABLE=1
+        else
+            SELINUX_REMOTE_DISABLE=1
+            echo -e "${CYAN}非交互模式，默认在远程节点关闭 SELinux${NC}"
+        fi
+    fi
+
+    [ "$SELINUX_REMOTE_DISABLE" -ne 1 ] && return 0
+
+    local state
+    state=$(ssh_cmd "$host" 'if command -v getenforce >/dev/null 2>&1; then getenforce; else echo NONE; fi')
+    case "$state" in
+        Enforcing)
+            echo -e "${YELLOW}${host} SELinux=Enforcing，正在关闭...${NC}"
+            ssh_cmd "$host" 'setenforce 0 && sed -i "s/^SELINUX=enforcing/SELINUX=disabled/I" /etc/selinux/config && echo DONE' || {
+                echo -e "${RED}${host} 关闭 SELinux 失败，请手动处理${NC}"
+                return 1
+            }
+            echo -e "${GREEN}✓ ${host} SELinux 已关闭（运行时 Permissive，重启后 Disabled）${NC}"
+            ;;
+        Permissive|Disabled)
+            echo -e "${CYAN}${host} SELinux=${state}，无需处理${NC}"
+            ;;
+        *)
+            echo -e "${CYAN}${host} 无 SELinux 或状态未知，跳过${NC}"
+            ;;
+    esac
+    return 0
 }
 
 # ======================== 检测MySQL安装 ========================
@@ -564,6 +635,11 @@ remote_install_mysql() {
 
     if ! echo "$remote_info" | grep -q "HAS_SYSTEMD=1"; then
         echo -e "${RED}远程主机缺少 systemd，无法使用当前安装脚本${NC}"
+        SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+        return 1
+    fi
+
+    if ! disable_remote_selinux "$host"; then
         SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
         return 1
     fi

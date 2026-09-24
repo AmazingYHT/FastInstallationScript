@@ -23,6 +23,140 @@ mkdir -p package
 # 或安装目录打包: redis-x.x.x-linux-x86_64.tar.gz（内含 bin/redis-server）
 ```
 
+默认脚本期望路径：`package/redis-7.2.4.tar.gz`（与 `install_redis.sh` 中 `REDIS_VERSION` 一致）。
+
+### 源码/编译包下载地址
+
+> 源码包命名：`redis-<版本>.tar.gz`  
+> 放到 `redis安装脚本/package/` 后，脚本自动解压编译；也可自行编译后打包安装目录。
+
+**官方下载**
+
+| 类型 | 地址 |
+|------|------|
+| 官方发行包（推荐） | `https://download.redis.io/releases/` |
+| GitHub 标签源码 | `https://github.com/redis/redis/archive/refs/tags/<版本>.tar.gz` |
+| 版本列表 / Release | https://github.com/redis/redis/releases |
+
+**常用具体文件（已实测可下载）**
+
+| 安装包 | 下载地址 |
+|--------|----------|
+| redis-7.2.4.tar.gz（脚本默认） | https://download.redis.io/releases/redis-7.2.4.tar.gz |
+| redis-7.2.5.tar.gz | https://download.redis.io/releases/redis-7.2.5.tar.gz |
+| redis-7.4.2.tar.gz | https://download.redis.io/releases/redis-7.4.2.tar.gz |
+| redis-7.4.9.tar.gz（7.x 推荐） | https://download.redis.io/releases/redis-7.4.9.tar.gz |
+| redis-8.0.2.tar.gz | https://download.redis.io/releases/redis-8.0.2.tar.gz |
+| redis-8.8.3.tar.gz（8.x 推荐） | https://download.redis.io/releases/redis-8.8.3.tar.gz |
+| GitHub 7.2.4 源码 | https://github.com/redis/redis/archive/refs/tags/7.2.4.tar.gz |
+
+**国内加速镜像（已实测）**
+
+| 镜像 | 基址 | 说明 |
+|------|------|------|
+| **中科大 USTC（推荐）** | `https://mirrors.ustc.edu.cn/redis/` | 与官方文件名一致 |
+| 华为云 | `https://mirrors.huaweicloud.com/redis/` | 已实测可下 |
+| 清华 TUNA | — | 当前无独立 redis 源码镜像（404） |
+| 阿里云 / 腾讯云 | — | 当前无 redis 发行包镜像（404） |
+
+**USTC / 华为 具体文件**
+
+| 安装包 | 下载地址 |
+|--------|----------|
+| redis-7.2.4.tar.gz | https://mirrors.ustc.edu.cn/redis/redis-7.2.4.tar.gz |
+| redis-7.2.4.tar.gz | https://mirrors.huaweicloud.com/redis/redis-7.2.4.tar.gz |
+
+**路径规则**
+
+```text
+官方:   https://download.redis.io/releases/redis-{X.Y.Z}.tar.gz
+GitHub: https://github.com/redis/redis/archive/refs/tags/{X.Y.Z}.tar.gz
+USTC:   https://mirrors.ustc.edu.cn/redis/redis-{X.Y.Z}.tar.gz
+华为:   https://mirrors.huaweicloud.com/redis/redis-{X.Y.Z}.tar.gz
+
+本地:   package/redis-{X.Y.Z}.tar.gz
+```
+
+**下载示例**
+
+```bash
+cd redis安装脚本
+mkdir -p package
+
+# 推荐：USTC 加速
+curl -L -o package/redis-7.2.4.tar.gz \
+  https://mirrors.ustc.edu.cn/redis/redis-7.2.4.tar.gz
+
+# 或官方
+curl -L -o package/redis-7.2.4.tar.gz \
+  https://download.redis.io/releases/redis-7.2.4.tar.gz
+
+# 校验后安装
+bash install_redis.sh
+```
+
+> 若改用其他 Redis 版本：下载对应 `redis-X.Y.Z.tar.gz` 放到 `package/`，并同步修改 `install_redis.sh`（及哨兵/集群脚本）中的 `REDIS_VERSION`。
+
+### Redis 7 vs 8 版本对比与选型
+
+> 7.4.9 与 8.8.3 是**两条产品线**，不是同一版本号序列的高低。  
+> 要稳、只做缓存/哨兵/Cluster → **7.4.9**；要 JSON/搜索/时序/向量 → **8.8.3**。
+
+#### 版本定位
+
+| | **Redis 7.4.9** | **Redis 8.8.3** |
+|--|-----------------|-----------------|
+| 大版本 | 7.x 维护尾声补丁 | 8.x 当前功能线 |
+| 许可 | RSAL / SSPL | **AGPLv3**（更开源） |
+| 功能范围 | 核心 Redis（String/Hash/…、Pub/Sub、Lua/Function、Cluster、Sentinel） | **核心 + 原 Stack 模块**（JSON、Search、TimeSeries、Probabilistic/Bloom 等） |
+| 适合 | 传统缓存、队列、会话、主从/哨兵/Cluster | 要用模块能力或跟新版生态 |
+
+#### 主要功能差异（8 相对 7）
+
+| 能力 | 7.4.x | 8.x |
+|------|-------|-----|
+| String / Hash / List / Set / ZSet | ✅ | ✅ |
+| Redis Functions / Lua | ✅ | ✅ |
+| Cluster / Sentinel | ✅ | ✅（本脚本场景可继续用） |
+| Hash 字段过期 `HEXPIRE` | 7.4 起有 | ✅ |
+| **JSON**（`JSON.SET` 等） | 需 Redis Stack 插件 | ✅ **开源内置** |
+| **Search / 向量检索** | Stack 插件 | ✅ 内置 |
+| **TimeSeries / Bloom 等** | Stack 插件 | ✅ 内置 |
+| 吞吐/IO 优化 | 基线 | I/O 线程、客户端淘汰等持续优化 |
+| 许可与生态 | 老产品线 | 新主线 |
+
+#### 怎么选？
+
+| 场景 | 建议 |
+|------|------|
+| 纯缓存 / Session / 消息队列 | **7.4.9** |
+| 现网已是 7.2 / 7.4，哨兵或 Cluster 已跑稳 | 先升 **7.4.9**，不急上 8 |
+| 需要 JSON、全文/向量、时序，不想再装 Stack | **8.8.3** |
+| 新项目、可接受大版本差异 | **8.8.3** |
+| 对 AGPL 许可敏感 | 先评估 8.x AGPLv3；否则留 7.x |
+| 只要安全补丁、最低变更 | **7.4.9** |
+
+#### 对本仓库脚本的适配
+
+- `install_redis.sh` / Sentinel / Cluster：核心 `redis-server` / `redis-cli` / `redis-sentinel` / cluster **7 与 8 通用**
+- 8.x 模块已进主包，**不必**再 `loadmodule`
+- 换版本步骤：
+  1. 下载并放入 `package/redis-7.4.9.tar.gz` 或 `package/redis-8.8.3.tar.gz`
+  2. 修改脚本中 `REDIS_VERSION="7.4.9"` 或 `"8.8.3"`（含哨兵/集群脚本若写死了版本）
+- **不要** 7 主 8 从长期混跑；同集群用同大版本
+
+#### 7.4.9 / 8.8.3 下载（已实测）
+
+```text
+# 7.4.9
+https://download.redis.io/releases/redis-7.4.9.tar.gz
+https://mirrors.ustc.edu.cn/redis/redis-7.4.9.tar.gz
+
+# 8.8.3
+https://download.redis.io/releases/redis-8.8.3.tar.gz
+https://mirrors.ustc.edu.cn/redis/redis-8.8.3.tar.gz
+```
+
 ### 兼容性检查
 
 确保目标服务器 glibc 版本 >= 编译机器的 glibc 版本：
@@ -251,6 +385,14 @@ A: 目标服务器glibc版本低于编译机器，需要在更低版本系统上
 **Q: 复制预编译包需要注意什么？**
 
 A: 把整个redis源码编译后的目录打包，放入 `package/redis-x.x.x.tar.gz`，脚本会自动解压。确保 `bin/redis-server`、`bin/redis-cli`、`bin/redis-sentinel` 都在压缩包根目录。
+
+**Q: Redis 该用 7 还是 8？**
+
+A: 见上文「Redis 7 vs 8 版本对比与选型」。传统缓存/哨兵/Cluster 选 **7.4.9**；要 JSON/Search/向量或新项目选 **8.8.3**。
+
+**Q: 源码包从哪里下载？**
+
+A: 见上文「源码/编译包下载地址」。优先 USTC 镜像或 `https://download.redis.io/releases/`，放到 `package/redis-<版本>.tar.gz`。
 
 **Q: 哨兵模式客户端怎么连接？**
 

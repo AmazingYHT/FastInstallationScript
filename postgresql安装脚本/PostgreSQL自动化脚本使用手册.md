@@ -186,7 +186,7 @@ sudo ./install_postgresql.sh
 
 | 镜像源 | 地址 | 推荐场景 |
 |-------|------|---------|
-| 官网镜像 | https://ftp.postgresql.org | 国外服务器 |
+| 官网镜像 | https://ftp.postgresql.org/pub/source/ | 国外服务器 |
 | 腾讯云镜像 | https://mirrors.cloud.tencent.com | 国内服务器（推荐） |
 
 > 💡 **提示**：首次安装时会提示选择镜像源，也可在配置确认阶段更换镜像源。
@@ -206,6 +206,31 @@ sudo ./install_postgresql.sh
 ```
 
 > 💡 **路径默认值**：提示输入离线 tar 包路径时，**直接回车**即默认使用脚本当前所在目录，无需手动填写。
+
+> 🔧 **离线编译依赖准备**：PostgreSQL 是源码编译安装，离线模式（使用本地 tar.gz 源码包）下脚本会**强制检测**编译必需环境（`gcc`、`make`、`bison`、`flex`、`perl`）。注意「使用本地源码包」不等于「机器无网络」，依赖缺失时脚本按以下顺序处理：**① 先尝试在线安装**（`dnf groupinstall "Development Tools"` + `gcc make bison flex readline-devel zlib-devel libuuid-devel perl`，无网络会自动跳过，不会长时间卡住）；**② 在线不行再搜索本地 `rpm`/`deb` 包**（`脚本目录 → 脚本目录/package → 离线包目录 → 当前目录 → /tmp`）并自动安装；**③ 仍缺失才中止**，不会继续到编译阶段才报错。
+>
+> 纯离线环境（机器确实无网络）时，请在【联网且系统版本一致】的机器上准备依赖：
+> ```bash
+> # CentOS/Rocky/AlmaLinux 8/9 (dnf)
+> dnf groupinstall -y "Development Tools"
+> dnf install -y gcc make bison flex readline-devel zlib-devel
+> dnf install -y libuuid-devel   # 选择 --with-uuid=e2fs 时需要
+> dnf install -y perl            # PG18 编译运行 genbki.pl 等脚本需要
+>
+> # 一键下载全部离线包（拷贝到本机脚本同级目录或 /tmp，重跑脚本自动安装）
+> dnf download --resolve --downloaddir=./pg-deps gcc make bison flex readline-devel zlib-devel libuuid-devel perl
+> # 手动安装: dnf install -y --disablerepo='*' ./pg-deps/*.rpm
+>
+> # CentOS 7 (yum)
+> yum install -y yum-utils
+> yumdownloader --resolve --downloaddir=./pg-deps gcc make bison flex readline-devel zlib-devel libuuid-devel perl
+> # 手动安装: rpm -Uvh ./pg-deps/*.rpm
+>
+> # Ubuntu/Debian
+> apt-get install -y build-essential bison flex libreadline-dev zlib1g-dev uuid-dev perl
+> # 或下载离线包: apt-get download build-essential bison flex libreadline-dev zlib1g-dev uuid-dev perl
+> # 手动安装: dpkg -i ./*.deb
+> ```
 
 > 📦 **离线安装第三方扩展**：离线模式不会联网下载第三方扩展。请提前在联网机下载源码包，与 PostgreSQL tar 包放在同一目录（或放到 `/tmp`）。下载时把 URL 末尾版本号替换为目标版本即可：
 > ```bash

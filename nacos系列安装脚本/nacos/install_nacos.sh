@@ -484,6 +484,7 @@ main() {
     configure_application
     configure_cluster
     init_mysql_schema
+    check_selinux
     create_systemd_service
     start_and_verify
     print_summary

@@ -7,12 +7,14 @@
 ## 📋 目录
 
 1. [环境准备](#环境准备)
-2. [安装 Docker](#安装-docker)
-3. [配置说明](#配置说明)
-4. [Docker 代理配置（docker-proxy-manager.sh）](#-docker-代理配置docker-proxy-managersh)
-5. [卸载 Docker](#卸载-docker)
-6. [常用命令](#常用命令)
-7. [常见问题](#常见问题)
+2. [离线包下载](#离线包下载)
+3. [版本兼容对照](#版本兼容对照)
+4. [安装 Docker](#安装-docker)
+5. [配置说明](#配置说明)
+6. [Docker 代理配置（docker-proxy-manager.sh）](#-docker-代理配置docker-proxy-managersh)
+7. [卸载 Docker](#卸载-docker)
+8. [常用命令](#常用命令)
+9. [常见问题](#常见问题)
 
 ---
 
@@ -23,11 +25,27 @@
 ```
 要求项        最低配置        推荐配置
 ─────────────────────────────────────
-操作系统      CentOS 7+      CentOS 7/8/Ubuntu 20.04+
+内核          3.10+          5.14+（RHEL/Rocky 9.x）
 内存          2GB            4GB+
 磁盘空间      20GB           50GB+
 架构          x86_64         x86_64/ARM64
 ```
+
+**支持的操作系统**（静态二进制方案，不依赖发行版 RPM 源）：
+
+| 系统 | 版本 | 支持情况 | 说明 |
+|------|------|----------|------|
+| **Rocky Linux** | **9.8** | ✅ 已验证 | 内核 5.14+；注意 firewalld/nftables、SELinux |
+| Rocky Linux | 9.x | ✅ 支持 | 与 RHEL 9 对齐 |
+| Rocky Linux | 8.x | ✅ 支持 | |
+| AlmaLinux | 8.x / 9.x | ✅ 支持 | 与 Rocky 同源 |
+| CentOS | 7 / 8 / Stream | ✅ 支持 | CentOS 7 内核偏旧，建议仅用 Docker 20.x–25.x |
+| RHEL / Oracle Linux | 8.x / 9.x | ✅ 支持 | |
+| Ubuntu | 20.04 / 22.04 / 24.04 | ✅ 支持 | |
+| Debian | 11 / 12 | ✅ 支持 | |
+| WSL2 | Windows 10/11 | ✅ 支持 | 脚本自动适配；数据目录勿放 `/mnt/` |
+
+> **Rocky Linux 9.8 补充**：安装一般不会因系统版本失败；若容器端口映射不通，优先检查 firewalld（nftables 后端）与 SELinux。
 
 ### 目录结构准备
 
@@ -36,11 +54,177 @@
 ├── installDocker.sh              # Docker 安装脚本
 ├── uninstallDocker.sh            # Docker 卸载脚本
 ├── package/
-│   └── docker-*.tar.gz           # Docker 离线安装包
+│   └── docker-*.tgz              # Docker 离线安装包（静态二进制）
 └── conf/
     ├── docker.service            # Docker systemd 服务文件
-    └── docker-compose            # Docker Compose 二进制文件
+    └── docker-compose-linux-x86_64-*  # Docker Compose 二进制文件
 ```
+
+### 文件放置路径
+
+> 当前版本：**Docker Engine 29.8.1** + **Docker Compose 5.5.1**
+
+| 文件 | 本地路径 | 说明 |
+|------|----------|------|
+| Docker Engine | `package/docker-29.8.1.tgz` | 引擎 + CLI + containerd + runc |
+| Docker Compose | `conf/docker-compose-linux-x86_64-5.5.1` | Compose v5 独立二进制（当前） |
+| Docker Compose（旧） | `conf/docker-compose-linux-x86_64-2.40.3` | Compose v2 旧版，可选保留 |
+| systemd 服务 | `conf/docker.service` | 随仓库提供，无需下载 |
+
+> ⚠️ **安装脚本注意**：`installDocker.sh` 使用 `cp ./conf/docker-compose*` 复制 Compose。  
+> **conf 目录下请只保留一个** Compose 二进制（推荐 `docker-compose-linux-x86_64-5.5.1`），避免多个文件被一起拷贝导致覆盖异常。
+
+---
+
+## 📦 离线包下载
+
+> 适用于 `docker-29.9.1_install/`。Rocky Linux 9.x / CentOS 8+ / Ubuntu 均可使用静态二进制方案。  
+> 当前推荐组合：**Docker 29.8.1 + Compose 5.5.1**
+
+### 官方下载地址（可离线下载后拷贝到服务器）
+
+**x86_64**
+
+| 资源 | 下载地址 |
+|------|----------|
+| Docker Engine 29.8.1（当前） | https://download.docker.com/linux/static/stable/x86_64/docker-29.8.1.tgz |
+| Docker Engine 29.5.3（旧） | https://download.docker.com/linux/static/stable/x86_64/docker-29.5.3.tgz |
+| Docker Compose v5.5.1（当前） | https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64 |
+| Docker Compose v2.40.3（旧） | https://github.com/docker/compose/releases/download/v2.40.3/docker-compose-linux-x86_64 |
+| 全部静态包列表 | https://download.docker.com/linux/static/stable/x86_64/ |
+
+**aarch64 / ARM64**
+
+| 资源 | 下载地址 |
+|------|----------|
+| Docker Engine 29.8.1 | https://download.docker.com/linux/static/stable/aarch64/docker-29.8.1.tgz |
+| Docker Engine 29.5.3 | https://download.docker.com/linux/static/stable/aarch64/docker-29.5.3.tgz |
+| 全部静态包列表 | https://download.docker.com/linux/static/stable/aarch64/ |
+
+### 在线机下载示例
+
+```bash
+# 进入安装目录
+cd docker-29.9.1_install
+
+# 下载 Docker Engine 29.8.1（x86_64）
+curl -L -o package/docker-29.8.1.tgz \
+  https://download.docker.com/linux/static/stable/x86_64/docker-29.8.1.tgz
+
+# 下载 Docker Compose 5.5.1
+curl -L -o conf/docker-compose-linux-x86_64-5.5.1 \
+  https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64
+
+# 清理旧版 Compose（避免 installDocker.sh 同时匹配到多个文件）
+rm -f conf/docker-compose-linux-x86_64-2.40.3
+
+# （可选）校验文件完整性后，拷贝整个目录到离线服务器
+```
+
+### 可选：EL9 RPM 包（适合 dnf/rpm 离线安装）
+
+基址：https://download.docker.com/linux/centos/9/x86_64/stable/Packages/
+
+| 资源 | 文件名 |
+|------|--------|
+| containerd | `containerd.io-2.3.5-1.el9.x86_64.rpm` |
+| Docker CE | `docker-ce-29.8.1-1.el9.x86_64.rpm` |
+| Docker CE CLI | `docker-ce-cli-29.8.1-1.el9.x86_64.rpm` |
+| Buildx 插件 | `docker-buildx-plugin-0.37.1-1.el9.x86_64.rpm` |
+| Compose 插件 | `docker-compose-plugin-5.5.1-1.el9.x86_64.rpm` |
+
+```bash
+# 离线安装示例
+sudo dnf localinstall -y \
+  containerd.io-*.rpm \
+  docker-ce-cli-*.rpm \
+  docker-ce-*.rpm \
+  docker-buildx-plugin-*.rpm \
+  docker-compose-plugin-*.rpm
+```
+
+> **建议**：优先使用仓库自带的静态二进制脚本（`installDocker.sh`），避免与系统 podman 冲突。RPM 方式仅在需要 dnf 管理升级时使用。
+
+### Rocky Linux 9.8 注意事项
+
+- 内核 5.14+，兼容 Docker 29.x，**安装不会因系统版本失败**
+- firewalld 使用 nftables 后端，端口映射不通时检查防火墙/forwarding
+- SELinux enforcing 下挂载卷建议加 `:Z`，或临时 `setenforce 0` 验证
+- 安装后验证：`docker info` 与 `docker run --rm hello-world`
+
+---
+
+## 🧩 版本兼容对照
+
+> Compose **没有**官方「Compose 小版本 ↔ Engine 小版本」一一对应表。  
+> 兼容靠 **Docker API 版本协商**。以下对照用于选型与排障。
+
+### Engine ↔ API 兼容矩阵（官方）
+
+来源：https://docs.docker.com/engine/api/#api-version-matrix
+
+| Docker Engine | 最高 API | 最低 API | 说明 |
+|---------------|----------|----------|------|
+| **29.8** | 1.56 | **1.40** | 当前离线包 docker-29.8.1 |
+| **29.5** | 1.54 | **1.40** | 旧离线包 docker-29.5.3 |
+| 29.3–29.4 | 1.54 | 1.40 | |
+| 29.0–29.2 | 1.52–1.53 | 1.44 | 29 初代最低 API 更严 |
+| 28.x | 1.48–1.51 | 1.24 | |
+| 27.x | 1.46–1.47 | 1.24 | |
+| 25–26.x | 1.44–1.45 | 1.24 | |
+| 23–24.x | 1.42–1.43 | 1.12 | |
+| 20.10 | 1.41 | 1.12 | Compose v2 实用下限 |
+| 19.03 | 1.40 | 1.12 | 很旧 |
+| ≤18.09 | ≤1.39 | 1.12 | 已废弃，现代 Compose 不保证 |
+
+**读法**：客户端/Compose 与 Engine 协商到双方都支持的 API；兼容是 best-effort，极老 Engine 可能缺新特性。  
+现场自检：`docker version` 查看 Client/Server 的 API version。
+
+### Compose CLI ↔ Docker Engine（实用对照）
+
+| Compose CLI | 建议 Engine | 说明 |
+|-------------|-------------|------|
+| **v5.5.x（当前 5.5.1）** | **Docker 29.x**（推荐 29.3+） | 构建依赖 docker/cli 29.x；功能 ≈ v2，另含 Go SDK |
+| v2.40.x | Docker 20.10+（推荐 25+/28+/29） | 旧离线包 2.40.3 |
+| v2.x 通用 | Engine 20.10+ | 低于此不保证 |
+| v1.x（Python，已停） | 老 Engine 1.13–20.x | 不要用在新环境 |
+
+### 本仓库离线包组合建议
+
+| 组合 | 兼容性 |
+|------|--------|
+| Docker **29.8.1** + Compose **5.5.1** | ✅ **当前推荐** |
+| Docker 29.8.1 + Compose 2.40.3 | ✅ OK |
+| Docker 29.5.3 + Compose 5.5.1 | ✅ OK |
+| Docker 29.5.3 + Compose 2.40.3 | ✅ OK（旧组合） |
+| Docker 20.10 + Compose 5.5.1 | ⚠️ 能跑，新 API 特性受限 |
+| Docker 18.x + Compose 5.x | ❌ 不建议 |
+
+### 遗留：compose.yml `version:` 字段 ↔ Engine 最低版
+
+（旧文档已归档；Compose Spec / v2 / v5 会忽略顶层 `version`）
+
+| 文件格式 `version` | 建议最低 Docker Engine |
+|--------------------|------------------------|
+| 2.0 | 1.10.0+ |
+| 2.1 | 1.12.0+ |
+| 2.2 | 1.13.0+ |
+| 2.3–2.4 | 17.06.0+ |
+| 3.0–3.1 | 1.13.x |
+| 3.2 | 17.04.0+ |
+| 3.3 | 17.06.0+ |
+| 3.4 | 17.09.0+ |
+| 3.5–3.8 | 18.06.0+ |
+| Compose Spec（无 version） | 随 Compose v2/v5 + 现代 Engine |
+
+### 相关查表入口
+
+| 内容 | 地址 |
+|------|------|
+| Engine ↔ API 兼容矩阵 | https://docs.docker.com/engine/api/#api-version-matrix |
+| API 变更史 | https://docs.docker.com/reference/api/engine/version-history/ |
+| Compose 版本演进（v1/v2/v5） | https://docs.docker.com/compose/intro/history/ |
+| Compose 各版本 Release | https://github.com/docker/compose/releases |
 
 ---
 
@@ -212,7 +396,7 @@ sudo systemctl disable docker
 ### 脚本文件位置
 
 ```
-docker-29.5.3_install/
+docker-29.9.1_install/
 └── docker-proxy-manager.sh   # Docker 代理一键管理脚本
 ```
 
@@ -738,11 +922,21 @@ ls -la /bin/sh
 | 2376 | Docker API（加密 TLS）|
 | 2377 | Docker Swarm 管理 |
 
+### 版本对照（当前离线包）
+
+| 组件 | 版本 | 本地文件 |
+|------|------|----------|
+| Docker Engine | 29.8.1 | `package/docker-29.8.1.tgz` |
+| Docker Compose | 5.5.1 | `conf/docker-compose-linux-x86_64-5.5.1` |
+| Docker API | 1.56（min 1.40） | 由 Engine 29.8 提供 |
+
 ### 相关资源
 
 - Docker 官方文档：https://docs.docker.com/
 - Docker Hub：https://hub.docker.com/
 - Docker Compose 文档：https://docs.docker.com/compose/
+- Docker Engine API 兼容矩阵：https://docs.docker.com/engine/api/#api-version-matrix
+- Compose Release（含 5.5.1）：https://github.com/docker/compose/releases
 
 ---
 
@@ -755,6 +949,7 @@ ls -la /bin/sh
 
 ---
 
-> 📅 文档版本：v1.0
-> 🔄 更新日期：2025年
+> 📅 文档版本：v1.1
+> 🔄 更新日期：2026年
+> 📦 适用版本：Docker Engine 29.8.1 + Docker Compose 5.5.1
 > 📧 适用脚本：installDocker.sh / uninstallDocker.sh

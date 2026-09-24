@@ -8,9 +8,10 @@
 
 1. [脚本概览](#脚本概览)
 2. [快速开始](#快速开始)
-3. [安装脚本详解](#安装脚本详解)
-4. [卸载脚本](#卸载脚本)
-5. [常见问题](#常见问题)
+3. [离线包下载资源](#离线包下载资源)
+4. [安装脚本详解](#安装脚本详解)
+5. [卸载脚本](#卸载脚本)
+6. [常见问题](#常见问题)
 
 ---
 
@@ -20,7 +21,7 @@
 
 | 脚本名称 | 功能说明 | 权限要求 |
 |---------|---------|---------|
-| `install_mysql.sh` | MySQL 安装脚本（交互 + 无人值守） | root |
+| `install_mysql.sh` | MySQL 安装脚本（交互 + 无人值守；含离线包查找） | root |
 | `setup_mysql_replication.sh` | 主从复制：本机配置 / SSH远程安装 / 一键部署 | root |
 | `uninstall_mysql.sh` | MySQL 完全卸载脚本 | root |
 
@@ -115,6 +116,89 @@ sudo ./uninstall_mysql.sh
 
 ---
 
+## 📦 离线包下载资源
+
+> 二进制包命名：`mysql-<版本>-linux-glibc<包版本>-<架构>.tar.xz`  
+> 本地放置：任意路径均可，安装时指定；推荐 `/tmp/` 或 `/opt/packages/`  
+> 脚本在线下载会优先走**中科大加速镜像**，失败后回退官网 CDN / 归档。
+
+### 官方下载地址
+
+| 类型 | 地址 |
+|------|------|
+| 当前版本 CDN（推荐） | `https://cdn.mysql.com/Downloads/MySQL-<主次版本>/` |
+| 历史版本归档 | `https://cdn.mysql.com/archives/mysql-<主次版本>/` |
+| 下载页（浏览器选包） | https://dev.mysql.com/downloads/mysql/ |
+| 历史归档页 | https://downloads.mysql.com/archives/community/ |
+
+**常用具体文件（已实测可下载）**
+
+| 安装包 | 下载地址 |
+|--------|----------|
+| mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz（新系统推荐） | https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz |
+| mysql-8.4.9-linux-glibc2.28-aarch64.tar.xz | https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.9-linux-glibc2.28-aarch64.tar.xz |
+| mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz（CentOS 7） | https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz |
+| mysql-8.0.40-linux-glibc2.17-x86_64.tar.xz（旧系统 8.0） | https://cdn.mysql.com/archives/mysql-8.0/mysql-8.0.40-linux-glibc2.17-x86_64.tar.xz |
+
+### 国内加速镜像
+
+| 镜像 | 基址 | 说明 |
+|------|------|------|
+| **中科大 USTC（推荐）** | `https://mirrors.ustc.edu.cn/mysql/downloads/` | 与官方同结构，已实测可下 8.4/8.0 包 |
+| 清华 TUNA | 无独立 MySQL 二进制镜像 | 仅 yum/apt 仓库场景参考 |
+| 腾讯云 | `https://mirrors.cloud.tencent.com/mysql/` | 仅 apt/yum，**无** tar.xz 离线包 |
+| 华为云 | `https://mirrors.huaweicloud.com/mysql/` | 目录较旧，不保证含 8.4.9 |
+
+**USTC 加速具体文件（与官网文件名一致）**
+
+| 安装包 | 下载地址 |
+|--------|----------|
+| mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz | https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-8.4/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz |
+| mysql-8.4.9-linux-glibc2.28-aarch64.tar.xz | https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-8.4/mysql-8.4.9-linux-glibc2.28-aarch64.tar.xz |
+| mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz | https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-8.4/mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz |
+| mysql-8.0.40-linux-glibc2.17-x86_64.tar.xz | https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-8.0/mysql-8.0.40-linux-glibc2.17-x86_64.tar.xz |
+
+### 路径规则（自行拼 URL 时）
+
+```
+官网 CDN:   https://cdn.mysql.com/Downloads/MySQL-{X.Y}/{文件名}
+官网归档:   https://cdn.mysql.com/archives/mysql-{X.Y}/{文件名}
+USTC 镜像:  https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-{X.Y}/{文件名}
+
+文件名:     mysql-{X.Y.Z}-linux-glibc{2.17|2.28}-{x86_64|aarch64}.tar.xz
+```
+
+示例：
+
+```bash
+# 在线机下载（推荐 USTC 加速）
+mkdir -p /opt/packages && cd /opt/packages
+
+# 新系统（Rocky/Alma 8+、Ubuntu 22+）
+curl -L -o mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz \
+  https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-8.4/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz
+
+# CentOS 7
+curl -L -o mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz \
+  https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-8.4/mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz
+
+# 拷贝到离线服务器后安装
+sudo ./install_mysql.sh
+# 选择 2. 离线安装 → 输入 /opt/packages/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz
+```
+
+### 包选择速查
+
+| 系统 | 架构 | 推荐安装包 |
+|------|------|------------|
+| Rocky/Alma/CentOS Stream 8+、Ubuntu 22+、Debian 12 | x86_64 | `mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz` |
+| 同上 | aarch64 | `mysql-8.4.9-linux-glibc2.28-aarch64.tar.xz` |
+| CentOS 7 / glibc 2.17 | x86_64 | `mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz` |
+
+> 脚本在线下载顺序：**USTC 镜像 → 官网 CDN → 官网归档**；离线模式请手动下载后用 `--offline /path/to/xxx.tar.xz`。
+
+---
+
 ## 📥 安装脚本详解
 
 ### install_mysql.sh
@@ -162,11 +246,10 @@ sudo ./install_mysql.sh
 ##### 2️⃣ 离线安装模式
 
 ```bash
-# 准备离线包
-# 1. 从官网下载与系统 glibc/架构匹配的二进制包
-#    新系统示例：mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz
-#    CentOS 7 示例：mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz
-# 2. 上传到服务器
+# 准备离线包（推荐从 USTC 加速镜像下载，见「离线包下载资源」）
+# 新系统示例：mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz
+# CentOS 7 示例：mysql-8.4.4-linux-glibc2.17-x86_64.tar.xz
+# 上传到服务器任意路径（如 /opt/packages/）
 
 # 运行离线安装
 sudo ./install_mysql.sh
@@ -314,6 +397,104 @@ cp /etc/my.cnf ./my.cnf.bak
 ---
 
 ## 🔧 常见问题
+
+**Q: Rocky/Alma/RHEL 9 安装时报 `cp: 无法创建普通文件 '/etc/init.d/mysql'`，服务启动失败？**
+
+A: 新系统无 SysV `/etc/init.d`，旧逻辑会失败。脚本已改为**原生 systemd 直接启动 mysqld**（Type=notify，失败自动回退 mysqld_safe）。若手工修复：
+
+```bash
+cat > /etc/systemd/system/mysql.service << 'EOF'
+[Unit]
+Description=MySQL Server
+After=network-online.target
+
+[Service]
+Type=notify
+User=mysql
+Group=mysql
+PIDFile=/mnt/data/mysql/mysql-8.4.11/mysql.pid
+ExecStart=/mnt/data/mysql/mysql-8.4.11/bin/mysqld --defaults-file=/etc/my.cnf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl start mysql
+systemctl enable mysql
+
+# 用初始化临时密码改 root 密码（日志里的 temporary password）
+mysql -u root -p'临时密码' --connect-expired-password \
+  -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '你的密码'; FLUSH PRIVILEGES;"
+```
+
+**Q: Root 密码要多强？不够强怎么办？**
+
+A: 对齐 MySQL 8 默认 **MEDIUM** 策略：
+
+| 要求 | 说明 |
+|------|------|
+| 长度 | ≥ 8 |
+| 大写 | 至少 1 个 A-Z |
+| 小写 | 至少 1 个 a-z |
+| 数字 | 至少 1 个 0-9 |
+| 特殊字符 | 至少 1 个（如 `!@#%^&*`） |
+
+示例：`MyPass@2026`  
+不满足时脚本会**列出缺项**并提示重新输入（交互可反复改）。  
+`--batch --password xxx` 若太弱，`ALTER USER` 失败会打印 `validate_password` 相关原因。  
+确需弱密码（不推荐生产）：`ALLOW_WEAK_PASSWORD=1`。
+
+**Q: 如何查找/选择离线安装包？**
+
+A: 与 PostgreSQL 相同，逻辑在 `install_mysql.sh` 的 `find_offline_tarball`（离线安装流程内）：
+
+```bash
+sudo ./install_mysql.sh
+# 选择 2. 离线安装MySQL（使用本地tar.xz包）
+```
+
+交互提示：
+
+```text
+查找MySQL离线安装包...
+
+请输入MySQL tar.xz包的路径或目录:
+  - 完整路径: /path/to/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz
+  - 目录路径: /path/to/ (会自动查找目录中的tar.xz包)
+  - 直接回车: 默认使用脚本所在目录 ...
+b. 返回主菜单
+```
+
+无人值守：`--offline /path/to/mysql-xxx.tar.xz`。
+
+**Q: 我输入了 Root 密码（或 `--password`），为什么登录还是要临时密码？**
+
+A: 多半不是没读到输入，而是 **MySQL 8.x `validate_password` 策略拒绝了弱口令**（如 `root`、纯数字），`ALTER USER` 失败后仍停在临时密码。脚本已会自动：放宽 `validate_password.policy` → 失败则卸载 `component_validate_password` 再改密，并校验正式密码可登录。若仍失败：
+
+```bash
+mysql -u root -p'临时密码' --connect-expired-password
+SET GLOBAL validate_password.policy=LOW;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '你的正式密码';
+FLUSH PRIVILEGES;
+```
+
+生产环境建议使用符合策略的强密码，而不是卸掉校验组件。
+
+**Q: 脚本会按系统版本区分服务创建方式吗？**
+
+A: 会。`detect_sys_pkg` 识别 `OS_ID`/`OS_MAJOR`：
+- **EL7 及更老**（或无 systemd）：写 `/etc/init.d/mysql`（SysV），必要时 `mkdir -p /etc/init.d`
+- **EL8/EL9、Ubuntu 22+ 等**：原生 `mysql.service` 直接 `ExecStart=mysqld`，`Type=notify` 失败再回退 `mysqld_safe`
+
+**Q: 提示 `未找到匹配的参数: ncurses-compat-libs` 要紧吗？**
+
+A: 一般**不影响**。el9 可用 `ncurses-libs`；确需 compat 时启用 CRB：`dnf config-manager --set-enabled crb && dnf install -y ncurses-compat-libs`。
+
+**Q: error.log 里只有 initialization 日志，没有启动失败原因？**
+
+A: 初始化成功后启动失败要看 systemd：`journalctl -u mysql -n 50 --no-pager`。
 
 ### Q1: 安装时网络连接失败怎么办？
 
@@ -569,9 +750,9 @@ sudo rm -rf --no-preserve-root /path/to/dir
 /etc/
 ├── my.cnf                    # MySQL主配置文件
 ├── systemd/system/
-│   └── mysql.service         # systemd服务文件
+│   └── mysql.service         # systemd服务文件（原生 ExecStart=mysqld）
 └── init.d/
-    └── mysql                 # init.d服务脚本
+    └── mysql                 # SysV 兼容脚本（仅当系统存在 /etc/init.d 时写入）
 ```
 
 ### 服务管理
@@ -661,7 +842,7 @@ EXIT;
 #### 新增功能
 
 - **在线安装**
-  - 支持从 MySQL 官方 CDN 和归档地址下载二进制包
+  - 支持从 USTC 加速镜像、MySQL 官方 CDN 和归档地址下载二进制包
   - 根据系统 glibc 自动选择兼容二进制包
   - CentOS 7 / glibc 2.17 自动适配 MySQL 8.4.4 glibc2.17 x86_64 包
   - 下载失败自动重试，支持 IPv4、断点续传、低速超时

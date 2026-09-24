@@ -17,6 +17,46 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# ======================== 系统版本检测与包管理统一封装 ========================
+# EL8/9(Rocky/AlmaLinux/CentOS/RHEL) 用 dnf，EL7 用 yum，Debian 系用 apt-get
+SYS_PKG=""; SYS_FAMILY=""; OS_ID=""; OS_MAJOR=""
+
+detect_sys_pkg() {
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="${ID:-}"; OS_MAJOR="${VERSION_ID%%.*}"
+    fi
+    if command -v dnf &>/dev/null && [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && [ "$OS_MAJOR" -ge 8 ]; then
+        SYS_PKG=dnf; SYS_FAMILY=el
+    elif command -v yum &>/dev/null; then
+        SYS_PKG=yum; SYS_FAMILY=el
+    elif command -v apt-get &>/dev/null; then
+        SYS_PKG=apt-get; SYS_FAMILY=debian
+    fi
+}
+
+# 静默安装软件包。用法：sys_pkg_install "<el系包名>" "<debian系包名>"
+sys_pkg_install() {
+    local el_pkg="$1" deb_pkg="${2:-$1}"
+    case "$SYS_PKG" in
+        dnf) dnf install -y $el_pkg ;;
+        yum) yum install -y $el_pkg ;;
+        apt-get) apt-get update -qq && apt-get install -y $deb_pkg ;;
+        *) return 1 ;;
+    esac
+}
+
+# 静默安装软件包组。用法：sys_pkg_group_install "<el组名>" "<apt任务名>"
+sys_pkg_group_install() {
+    local el_group="$1" deb_task="${2:-}"
+    case "$SYS_PKG" in
+        dnf) dnf groupinstall -y "$el_group" ;;
+        yum) yum groupinstall -y "$el_group" ;;
+        apt-get) [ -n "$deb_task" ] && apt-get install -y "$deb_task" ;;
+        *) return 1 ;;
+    esac
+}
+
 # 默认配置变量
 DEFAULT_PG_VERSION="18.1"
 DEFAULT_PG_USER="postgres"
@@ -1385,58 +1425,58 @@ install_plugin_dependencies() {
     
     echo -e "${YELLOW}安装插件依赖...${NC}"
     
-    if command -v yum &> /dev/null; then
-        # CentOS/RHEL
+    if [ "$SYS_FAMILY" = "el" ]; then
+        # CentOS/RHEL/Rocky/AlmaLinux
         for plugin in $selected_plugins; do
             case $plugin in
                 "openssl")
-                    yum install -y openssl-devel
+                    sys_pkg_install "openssl-devel"
                     ;;
                 "perl")
-                    yum install -y perl-devel
+                    sys_pkg_install "perl-devel"
                     ;;
                 "python")
-                    yum install -y python3-devel
+                    sys_pkg_install "python3-devel"
                     ;;
                 "tcl")
-                    yum install -y tcl-devel
+                    sys_pkg_install "tcl-devel"
                     ;;
                 "uuid")
                     if [ "$UUID_LIBRARY" = "ossp" ]; then
-                        # OSSP UUID库依赖
-                        yum install -y libossp-uuid-devel
+                        # OSSP UUID库依赖（EL9 无 libossp-uuid-devel，失败时回退 e2fs uuid-devel）
+                        sys_pkg_install "libossp-uuid-devel"
                         # 如果ossp包不可用，尝试EPEL
                         if ! rpm -q libossp-uuid-devel &>/dev/null; then
-                            yum install -y epel-release
-                            yum install -y libossp-uuid-devel
-							yum install -y uuid-devel
+                            sys_pkg_install "epel-release"
+                            sys_pkg_install "libossp-uuid-devel" || true
+                            sys_pkg_install "uuid-devel"
                         fi
                     else
                         # e2fs UUID库依赖
-                        yum install -y util-linux-devel libuuid-devel
+                        sys_pkg_install "util-linux-devel libuuid-devel"
                     fi
                     ;;
                 "xml")
-                    yum install -y libxml2-devel libxslt-devel
+                    sys_pkg_install "libxml2-devel libxslt-devel"
                     ;;
                 "icu")
-                    yum install -y libicu-devel
+                    sys_pkg_install "libicu-devel"
                     ;;
                 "ldap")
-                    yum install -y openldap-devel
+                    sys_pkg_install "openldap-devel"
                     ;;
                 "pam")
-                    yum install -y pam-devel
+                    sys_pkg_install "pam-devel"
                     ;;
                 "bonjour")
-                    yum install -y avahi-devel
+                    sys_pkg_install "avahi-devel"
                     ;;
                 "systemd")
-                    yum install -y systemd-devel
+                    sys_pkg_install "systemd-devel"
                     ;;
             esac
         done
-    elif command -v apt-get &> /dev/null; then
+    elif [ "$SYS_FAMILY" = "debian" ]; then
         # Ubuntu/Debian
         for plugin in $selected_plugins; do
             case $plugin in
@@ -1527,11 +1567,9 @@ fix_icu_dependencies() {
         case "$fix_choice" in
             1)
                 echo -e "${YELLOW}正在安装 ICU 开发包...${NC}"
-                if command -v yum &>/dev/null; then
-                    yum install -y libicu-devel || { yum install -y epel-release && yum install -y libicu-devel; }
-                elif command -v dnf &>/dev/null; then
-                    dnf install -y libicu-devel
-                elif command -v apt-get &>/dev/null; then
+                if [ "$SYS_FAMILY" = "el" ]; then
+                    sys_pkg_install "libicu-devel" || { sys_pkg_install "epel-release" && sys_pkg_install "libicu-devel"; }
+                elif [ "$SYS_FAMILY" = "debian" ]; then
                     apt-get update && apt-get install -y libicu-dev
                 fi
                 if icu_link_test; then
@@ -1667,70 +1705,141 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# 检测编译工具链缺失项（输出空格分隔列表，空串表示齐全）
+missing_toolchain_deps() {
+    local miss=""
+    command -v gcc   &>/dev/null || miss="${miss}gcc "
+    command -v make  &>/dev/null || miss="${miss}make "
+    command -v bison &>/dev/null || miss="${miss}bison "
+    command -v flex  &>/dev/null || miss="${miss}flex "
+    # PG 构建会运行 genbki.pl 等 Perl 脚本，最小化系统仅有 perl-interpreter 会缺核心模块（如 FindBin）
+    if ! command -v perl &>/dev/null || ! perl -MFindBin -e1 &>/dev/null; then
+        miss="${miss}perl "
+    fi
+    echo "$miss"
+}
+
+# 离线模式：先尝试联网补齐编译依赖（用本地 tar 包安装 ≠ 机器一定无网络）
+# 在线安装失败不致命，调用方以 missing_toolchain_deps 复查结果为准
+try_online_compile_deps() {
+    echo -e "${CYAN}检测到编译依赖缺失，先尝试从软件仓库在线安装（若机器无网络会自动跳过）...${NC}"
+    local to=""
+    command -v timeout &>/dev/null && to="timeout 300"
+    case "$SYS_PKG" in
+        dnf)
+            $to dnf groupinstall -y "Development Tools"
+            $to dnf install -y gcc make bison flex readline-devel zlib-devel libuuid-devel perl
+            ;;
+        yum)
+            $to yum groupinstall -y "Development Tools"
+            $to yum install -y gcc make bison flex readline-devel zlib-devel libuuid-devel perl
+            ;;
+        apt-get)
+            $to apt-get update -qq
+            $to apt-get install -y build-essential bison flex libreadline-dev zlib1g-dev uuid-dev perl
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 离线模式：从本地目录查找 rpm/deb 依赖包并安装
+# 搜索顺序：脚本目录 → 脚本目录/package → 离线源码包所在目录 → 当前目录 → /tmp
+install_local_compile_deps() {
+    local roots=("$SCRIPT_DIR" "$SCRIPT_DIR/package" "$(dirname "$OFFLINE_TARBALL_PATH" 2>/dev/null)" "$PWD" "/tmp")
+    local pkgs=() root f
+
+    for root in "${roots[@]}"; do
+        [ -n "$root" ] && [ -d "$root" ] || continue
+        while IFS= read -r f; do
+            pkgs+=("$f")
+        done < <(find "$root" -maxdepth 3 -type f \( -name "*.rpm" -o -name "*.deb" \) 2>/dev/null)
+        [ ${#pkgs[@]} -gt 0 ] && break
+    done
+
+    if [ ${#pkgs[@]} -eq 0 ]; then
+        echo -e "${YELLOW}未在脚本目录/package、离线包目录、当前目录及 /tmp 下找到 rpm/deb 依赖包${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}发现本地依赖包 $(printf '%s\n' "${pkgs[@]}" | wc -l) 个，尝试离线安装...${NC}"
+    case "${pkgs[0]}" in
+        *.rpm)
+            if command -v dnf &>/dev/null; then
+                dnf install -y --disablerepo='*' "${pkgs[@]}"
+            elif command -v yum &>/dev/null; then
+                yum localinstall -y --disablerepo='*' "${pkgs[@]}"
+            else
+                rpm -Uvh "${pkgs[@]}"
+            fi
+            ;;
+        *.deb)
+            dpkg -i "${pkgs[@]}"
+            ;;
+    esac
+    return 0
+}
+
 # 安装依赖函数
 install_dependencies() {
     echo -e "${YELLOW}正在安装依赖包...${NC}"
     
-    # 离线模式下，只显示依赖列表，不尝试安装
+    # 离线模式（本地源码包）下的依赖处理：
+    # 检测缺失 → 先尝试在线补齐（有网时）→ 再尝试本地 rpm/deb 包 → 仍缺失则中止
     if [ "$OFFLINE_MODE" = "true" ]; then
-        echo -e "${YELLOW}离线安装模式: 跳过在线依赖安装${NC}"
-        echo -e "${CYAN}请确保已手动安装以下依赖包:${NC}"
-        
-        if command -v yum &> /dev/null; then
-            echo "  CentOS/RHEL:"
-            echo "    - yum groupinstall \"Development Tools\""
-            echo "    - yum install readline-devel zlib-devel gcc make bison flex"
-        elif command -v apt-get &> /dev/null; then
-            echo "  Ubuntu/Debian:"
-            echo "    - apt-get install build-essential libreadline-dev zlib1g-dev bison flex"
-        fi
-        
-        # 检查基础依赖是否存在
-        echo ""
-        echo -e "${CYAN}检查基础依赖...${NC}"
-        
-        local missing_deps=""
-        
-        if ! command -v gcc &> /dev/null; then
-            missing_deps="$missing_deps gcc"
-        fi
-        if ! command -v make &> /dev/null; then
-            missing_deps="$missing_deps make"
-        fi
-        # PostgreSQL 编译必需的语法分析工具（configure 缺失即报错中断）
-        if ! command -v bison &> /dev/null; then
-            missing_deps="$missing_deps bison"
-        fi
-        if ! command -v flex &> /dev/null; then
-            missing_deps="$missing_deps flex"
-        fi
-        
+        echo -e "${YELLOW}离线安装模式: 检查编译必需环境 (gcc/make/bison/flex/perl)...${NC}"
+
+        local missing_deps
+        missing_deps=$(missing_toolchain_deps)
+
         if [ -n "$missing_deps" ]; then
-            echo -e "${RED}缺少以下基础依赖: $missing_deps${NC}"
-            echo -e "${YELLOW}请先手动安装这些依赖（离线环境请用 rpm/dpkg 离线包），或选择退出安装${NC}"
-            if command -v yum &> /dev/null; then
-                echo -e "${CYAN}在线机下载离线包示例: yum install -y --downloadonly --downloaddir=./pg-deps bison flex${NC}"
-            elif command -v apt-get &> /dev/null; then
-                echo -e "${CYAN}在线机下载离线包示例: apt-get download bison flex${NC}"
+            echo -e "${RED}缺少编译必需工具: ${missing_deps% }${NC}"
+
+            # 1. 先尝试在线安装（使用本地 tar 包不代表机器无网络）
+            try_online_compile_deps || true
+            missing_deps=$(missing_toolchain_deps)
+
+            # 2. 在线未能补齐（无网络/仓库不可用）时，尝试本地目录的 rpm/deb 离线包
+            if [ -n "$missing_deps" ]; then
+                echo -e "${YELLOW}在线安装未补齐依赖，尝试本地 rpm/deb 离线包...${NC}"
+                install_local_compile_deps || true
+                missing_deps=$(missing_toolchain_deps)
             fi
-            read -p "是否继续? [y/N]: " continue_install
-            if [[ ! $continue_install =~ ^[Yy]$ ]]; then
-                exit 1
-            fi
-        else
-            echo -e "${GREEN}基础依赖检查通过${NC}"
         fi
-        
+
+        if [ -n "$missing_deps" ]; then
+            echo -e "${RED}仍缺少编译必需工具: ${missing_deps% }，无法编译，安装中止${NC}"
+            echo -e "${CYAN}本机无法联网时，请在【联网且系统版本一致】的机器上准备依赖后拷贝到本机:${NC}"
+            if [ "$SYS_FAMILY" = "el" ]; then
+                echo "  # 联网机直接安装验证依赖清单（CentOS/Rocky/AlmaLinux 8/9）:"
+                echo "  dnf groupinstall -y \"Development Tools\""
+                echo "  dnf install -y gcc make bison flex readline-devel zlib-devel"
+                echo "  dnf install -y libuuid-devel"
+                echo "  dnf install -y perl"
+                echo "  # 一键下载全部离线包（拷到本机脚本同级目录或 /tmp，重跑脚本自动安装）:"
+                echo "  dnf download --resolve --downloaddir=./pg-deps gcc make bison flex readline-devel zlib-devel libuuid-devel perl"
+                echo "  # EL7 改用: yum install -y yum-utils && yumdownloader --resolve --downloaddir=./pg-deps gcc make bison flex readline-devel zlib-devel libuuid-devel perl"
+                echo "  # 手动安装: dnf install -y --disablerepo='*' ./pg-deps/*.rpm  (或 rpm -Uvh ./pg-deps/*.rpm)"
+            elif [ "$SYS_FAMILY" = "debian" ]; then
+                echo "  # 联网机:"
+                echo "  apt-get install -y build-essential bison flex libreadline-dev zlib1g-dev uuid-dev perl"
+                echo "  # 或下载离线包: apt-get download build-essential bison flex libreadline-dev zlib1g-dev uuid-dev perl"
+                echo "  # 手动安装: dpkg -i ./*.deb"
+            fi
+            exit 1
+        fi
+
+        echo -e "${GREEN}编译必需环境检查通过${NC}"
         return 0
     fi
     
     # 在线安装模式
-    if command -v yum &> /dev/null; then
-        # CentOS/RHEL
-        yum update -y
-        yum groupinstall -y "Development Tools"
-        yum install -y readline-devel zlib-devel gcc make bison flex
-    elif command -v apt-get &> /dev/null; then
+    if [ "$SYS_FAMILY" = "el" ]; then
+        # CentOS/RHEL/Rocky/AlmaLinux
+        sys_pkg_group_install "Development Tools"
+        sys_pkg_install "readline-devel zlib-devel gcc make bison flex"
+    elif [ "$SYS_FAMILY" = "debian" ]; then
         # Ubuntu/Debian
         apt-get update
         apt-get install -y build-essential libreadline-dev zlib1g-dev bison flex
@@ -2229,11 +2338,9 @@ compile_install() {
                 case "$icu_fail_choice" in
                     1)
                         echo -e "${YELLOW}正在安装 ICU 开发包...${NC}"
-                        if command -v yum &>/dev/null; then
-                            yum install -y libicu-devel || { yum install -y epel-release && yum install -y libicu-devel; }
-                        elif command -v dnf &>/dev/null; then
-                            dnf install -y libicu-devel
-                        elif command -v apt-get &>/dev/null; then
+                        if [ "$SYS_FAMILY" = "el" ]; then
+                            sys_pkg_install "libicu-devel" || { sys_pkg_install "epel-release" && sys_pkg_install "libicu-devel"; }
+                        elif [ "$SYS_FAMILY" = "debian" ]; then
                             apt-get update && apt-get install -y libicu-dev
                         else
                             echo -e "${RED}不支持的包管理器（离线环境无法在线安装）。${NC}"
@@ -2514,7 +2621,7 @@ export PATH=\$PGHOME/bin:\$PATH
 export LANG=en_US.utf8
 export LD_LIBRARY_PATH=\$PGHOME/lib:\$LD_LIBRARY_PATH
 EOF
-    
+
     # 立即在当前会话中生效
     echo -e "${YELLOW}使环境变量在当前会话中生效...${NC}"
     export PGHOME="$PG_INSTALL_DIR"
@@ -2764,6 +2871,9 @@ configure_postgresql() {
     # 先删除已存在的相同配置，避免重复
     sed -i '/^host    all             all             0.0.0.0\/0               md5$/d' "$PG_DATA_DIR/pg_hba.conf" 2>/dev/null
 
+    # 确保文件以换行结尾，避免新规则与最后一行拼接导致 pg_hba.conf 解析失败
+    [ -n "$(tail -c1 "$PG_DATA_DIR/pg_hba.conf" 2>/dev/null)" ] && printf '\n' >> "$PG_DATA_DIR/pg_hba.conf"
+
     # 添加远程连接配置
     echo "host    all             all             0.0.0.0/0               md5" >> "$PG_DATA_DIR/pg_hba.conf"
     echo -e "${GREEN}✓ 已添加远程连接md5认证${NC}"
@@ -2773,8 +2883,45 @@ configure_postgresql() {
     grep -E "^(local|host).*all.*all" "$PG_DATA_DIR/pg_hba.conf" | head -10
 }
 
+check_selinux() {
+    # 未安装 SELinux（如 Debian 默认）直接跳过
+    if ! command -v getenforce &>/dev/null; then
+        return 0
+    fi
+    # 非交互（批量/无终端）环境不弹选项
+    if [ "${BATCH_MODE:-0}" = "1" ] || [ ! -t 0 ]; then
+        return 0
+    fi
+    local current_mode
+    current_mode="$(getenforce 2>/dev/null)"
+    if [ "$current_mode" != "Enforcing" ]; then
+        return 0
+    fi
+    echo ""
+    echo -e "\033[0;33m检测到 SELinux 当前为 Enforcing（强制启用）状态\033[0m"
+    echo -e "\033[0;36mSELinux 是内核级强制访问控制，可能限制 systemd 服务访问自定义安装/数据目录，\033[0m"
+    echo -e "\033[0;36m这是把服务安装到非标准目录后启动失败的常见原因。\033[0m"
+    echo ""
+    echo -e "\033[0;33m建议:\033[0m 内网/自建中间件环境通常可关闭 SELinux；若主机暴露公网或有等保合规要求，建议保持开启并自行配置策略。"
+    echo ""
+    echo "请选择:"
+    echo "  1. 关闭 SELinux（推荐）：立即设为 Permissive，并写入配置永久禁用（重启后完全生效）"
+    echo "  2. 保持开启：继续安装，但服务可能因 SELinux 拦截而启动失败"
+    read -p "请选择 [1/2，默认 1]: " selinux_choice
+    if [ "$selinux_choice" = "2" ]; then
+        echo -e "\033[0;33m已保留 SELinux Enforcing；若服务启动失败，可手动执行 setenforce 0 排查\033[0m"
+        return 0
+    fi
+    setenforce 0 2>/dev/null || true
+    if [ -f /etc/selinux/config ]; then
+        sed -i 's/^SELINUX=enforcing/SELINUX=disabled/I' /etc/selinux/config
+    fi
+    echo -e "\033[0;32mSELinux 已临时关闭（Permissive），并已配置重启后永久禁用\033[0m"
+}
+
 # 创建系统服务
 create_systemd_service() {
+    check_selinux
     echo -e "${YELLOW}创建系统服务...${NC}"
     
     cat > /etc/systemd/system/postgresql${PG_VERSION%.*}.service << EOF
@@ -2925,29 +3072,29 @@ set_password() {
                 # 使用postgres用户免密登录方式设置密码
                 echo -e "${YELLOW}步骤3: 设置密码...${NC}"
                 
-                # 创建临时脚本用于设置密码
+                # 创建临时脚本用于设置密码（psql 用绝对路径，避免 PATH 未生效）
                 temp_script="/tmp/set_postgres_password.sh"
                 cat > "$temp_script" << EOF
 #!/bin/bash
-# 切换到postgres用户并设置密码
 echo "正在设置postgres用户密码..."
-psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
-echo "密码设置完成，退出psql"
-exit
+$PG_INSTALL_DIR/bin/psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres WITH PASSWORD '${PG_PASSWORD//\'/\'\'}';"
 EOF
-                
-                # 执行脚本
+
+                # 执行脚本（保留错误输出，失败时可直接看到真实原因）
                 if [ "$EUID" -eq 0 ]; then
                     # 以root身份执行
                     chown postgres:postgres "$temp_script"
-                    chmod +x "$temp_script"
-                    su - postgres -c "bash $temp_script" 2>/dev/null
-                    
-                    if [ $? -eq 0 ]; then
+                    chmod 700 "$temp_script"
+                    su - postgres -c "bash $temp_script"
+
+                    # 用新密码通过 TCP 回连验证，确保密码确实写入且认证链路正常
+                    local verify_out
+                    verify_out=$(su - postgres -c "PGPASSWORD='$PG_PASSWORD' $PG_INSTALL_DIR/bin/psql -h 127.0.0.1 -p ${PG_PORT:-5432} -U postgres -d postgres -tAc 'select 1'" 2>/dev/null)
+                    if [ "$verify_out" = "1" ]; then
                         password_set=true
-                        echo -e "${GREEN}✓ postgres用户免密登录设置密码成功${NC}"
+                        echo -e "${GREEN}✓ postgres用户密码设置成功（已通过密码回连验证）${NC}"
                     else
-                        echo -e "${RED}✗ postgres用户免密登录设置密码失败${NC}"
+                        echo -e "${RED}✗ postgres用户密码设置失败或密码回连验证未通过${NC}"
                     fi
                 else
                     # 非root用户执行
@@ -2992,7 +3139,8 @@ EOF
             ;;
         "2")
             echo -e "${YELLOW}使用预设密码: $PG_PASSWORD${NC}"
-            password_set=true
+            # 注意：initdb 未设置密码，此处必须真正执行 ALTER USER，交由下方统一设置块处理
+            new_password="$PG_PASSWORD"
             ;;
         "3")
             # 隐藏密码输入
@@ -3038,7 +3186,7 @@ EOF
         # 方法1: 使用sudo -u
         if [ "$EUID" -eq 0 ] && command -v sudo &> /dev/null; then
             echo -e "${CYAN}方法1: 使用sudo -u切换用户${NC}"
-            sudo -u $PG_USER psql -c "ALTER USER $PG_USER WITH PASSWORD '$new_password';" 2>/dev/null
+            sudo -u $PG_USER "$PG_INSTALL_DIR/bin/psql" -c "ALTER USER $PG_USER WITH PASSWORD '$new_password';" 2>/dev/null
             if [ $? -eq 0 ]; then
                 password_set=true
                 echo -e "${GREEN}✓ sudo -u设置密码成功${NC}"
@@ -3050,7 +3198,7 @@ EOF
         # 方法2: 使用su -
         if [ "$password_set" = false ] && [ "$EUID" -eq 0 ]; then
             echo -e "${CYAN}方法2: 使用su -切换用户${NC}"
-            su - $PG_USER -c "psql -c \"ALTER USER $PG_USER WITH PASSWORD '$new_password';\"" 2>/dev/null
+            su - $PG_USER -c "$PG_INSTALL_DIR/bin/psql -c \"ALTER USER $PG_USER WITH PASSWORD '$new_password';\"" 2>/dev/null
             if [ $? -eq 0 ]; then
                 password_set=true
                 echo -e "${GREEN}✓ su -设置密码成功${NC}"
@@ -3062,7 +3210,7 @@ EOF
         # 方法3: 直接使用psql
         if [ "$password_set" = false ]; then
             echo -e "${CYAN}方法3: 直接使用psql连接${NC}"
-            PGPASSWORD="$new_password" psql -U $PG_USER -c "ALTER USER $PG_USER WITH PASSWORD '$new_password';" 2>/dev/null
+            PGPASSWORD="$new_password" "$PG_INSTALL_DIR/bin/psql" -U $PG_USER -c "ALTER USER $PG_USER WITH PASSWORD '$new_password';" 2>/dev/null
             if [ $? -eq 0 ]; then
                 password_set=true
                 echo -e "${GREEN}✓ 直接设置密码成功${NC}"
@@ -3100,7 +3248,7 @@ EOF
             read -p "设置密码完成后，按回车键继续... " -r
             # 验证是否设置了密码（通过尝试连接）
             echo -e "${YELLOW}验证密码设置...${NC}"
-            PGPASSWORD="$new_password" psql -U $PG_USER -c "SELECT 1;" &>/dev/null
+            PGPASSWORD="$new_password" "$PG_INSTALL_DIR/bin/psql" -h 127.0.0.1 -U $PG_USER -c "SELECT 1;" &>/dev/null
             if [ $? -eq 0 ]; then
                 password_set=true
                 echo -e "${GREEN}✓ 密码验证成功${NC}"
@@ -3114,6 +3262,15 @@ EOF
     
     # 显示密码设置结果
     if [ "$password_set" = true ]; then
+        # 统一恢复本机 local 连接的密码认证（配置阶段为免密改密临时改成了 trust）
+        # 用与写入时完全一致的固定行匹配，避免宽松正则误伤 host 行
+        local _hba="$PG_DATA_DIR/pg_hba.conf"
+        if [ -f "$_hba" ] && grep -q '^local   all             all                                     trust' "$_hba"; then
+            sed -i 's|^local   all             all                                     trust|local   all             all                                     md5|' "$_hba"
+            echo -e "${GREEN}✓ 已恢复 local 连接为密码认证（md5/scram 自动协商）${NC}"
+            [ -n "$service_name" ] && systemctl restart "$service_name" 2>/dev/null
+        fi
+
         echo ""
         echo -e "${GREEN}密码设置完成!${NC}"
         echo -e "${CYAN}PostgreSQL连接信息:${NC}"
@@ -3503,12 +3660,15 @@ configure_remote_access() {
     # 添加远程连接配置（IPv4）
     # 先删除已存在的相同配置，避免重复
     sed -i '/^host    all             all             0.0.0.0\/0               md5$/d' "$hba_file" 2>/dev/null
+    # 确保文件以换行结尾，避免追加时与上一行拼接
+    [ -n "$(tail -c1 "$hba_file" 2>/dev/null)" ] && printf '\n' >> "$hba_file"
     echo "host    all             all             0.0.0.0/0               md5" >> "$hba_file"
     echo -e "${GREEN}✓ 已添加IPv4远程访问配置${NC}"
 
     # 添加远程连接配置（IPv6）
     # 先删除已存在的相同配置，避免重复
     sed -i '/^host    all             all             ::\/0                    md5$/d' "$hba_file" 2>/dev/null
+    [ -n "$(tail -c1 "$hba_file" 2>/dev/null)" ] && printf '\n' >> "$hba_file"
     echo "host    all             all             ::/0                    md5" >> "$hba_file"
     echo -e "${GREEN}✓ 已添加IPv6远程访问配置${NC}"
     
@@ -3871,11 +4031,7 @@ install_uuid_library() {
 
         # 尝试安装 e2fsprogs UUID
         echo -e "${YELLOW}尝试安装 uuid-devel...${NC}"
-        if command -v dnf &>/dev/null; then
-            dnf install -y uuid-devel 2>/dev/null
-        elif command -v yum &>/dev/null; then
-            yum install -y uuid-devel 2>/dev/null
-        fi
+        sys_pkg_install "uuid-devel" 2>/dev/null
 
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}✓ uuid-devel 安装成功${NC}"
@@ -3885,11 +4041,7 @@ install_uuid_library() {
 
         # 尝试从 EPEL 或其他源安装
         echo -e "${YELLOW}尝试安装 util-linux-devel...${NC}"
-        if command -v dnf &>/dev/null; then
-            dnf install -y util-linux-devel 2>/dev/null
-        elif command -v yum &>/dev/null; then
-            yum install -y util-linux-devel 2>/dev/null
-        fi
+        sys_pkg_install "util-linux-devel" 2>/dev/null
 
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}✓ util-linux-devel 安装成功${NC}"
@@ -6788,7 +6940,7 @@ EOF
     # 替换为实际的路径
     sed -i "s|export PG_HOME=.*|export PG_HOME=$PG_INSTALL_DIR|g" /etc/profile
     sed -i "s|export PGDATA=.*|export PGDATA=$PG_DATA_DIR|g" /etc/profile
-    
+
     echo -e "${GREEN}✓ 已将PostgreSQL路径添加到/etc/profile${NC}"
     echo -e "${CYAN}添加的环境变量:${NC}"
     echo "  PG_HOME=$PG_INSTALL_DIR"
@@ -7307,6 +7459,8 @@ offline_install_flow() {
 
 # 主函数
 main() {
+    # 识别系统版本并绑定包管理器（EL8/9 dnf / EL7 yum / Debian apt）
+    detect_sys_pkg
     echo -e "${GREEN}PostgreSQL 自动化安装脚本${NC}"
     echo -e "${GREEN}支持 x86 和 ARM 架构${NC}"
     echo -e "${CYAN}构建版本: ${SCRIPT_BUILD_TAG}（含 PostGIS GEOS/PROJ 自动源码编译）${NC}"

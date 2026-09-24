@@ -72,6 +72,62 @@ detect_system() {
     GLIBC_PKG="2.17"
 }
 
+# ======================== 系统版本检测与包管理统一封装 ========================
+# 启动时识别发行版/主版本号，并绑定本机包管理器：
+# EL8/9(Rocky/AlmaLinux/CentOS/RHEL) 用 dnf，EL7 用 yum，Debian 系用 apt-get
+SYS_PKG=""        # 包管理器命令：dnf / yum / apt-get
+SYS_FAMILY=""     # 家族：el / debian
+OS_ID=""          # /etc/os-release 的 ID
+OS_MAJOR=""       # 主版本号
+
+detect_sys_pkg() {
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="${ID:-}"
+        OS_MAJOR="${VERSION_ID%%.*}"
+    fi
+    if command -v dnf &>/dev/null && [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && [ "$OS_MAJOR" -ge 8 ]; then
+        SYS_PKG=dnf; SYS_FAMILY=el
+    elif command -v yum &>/dev/null; then
+        SYS_PKG=yum; SYS_FAMILY=el
+    elif command -v apt-get &>/dev/null; then
+        SYS_PKG=apt-get; SYS_FAMILY=debian
+    fi
+}
+
+# 安装软件包（静默）。用法：sys_pkg_install "<el系包名>" "<debian系包名>"
+sys_pkg_install() {
+    local el_pkg="$1" deb_pkg="${2:-$1}"
+    case "$SYS_PKG" in
+        dnf) dnf install -y $el_pkg ;;
+        yum) yum install -y $el_pkg ;;
+        apt-get) apt-get install -y $deb_pkg ;;
+        *) return 1 ;;
+    esac
+}
+
+# 安装软件包组（静默）。用法：sys_pkg_group_install "<el组名>" "<apt任务名>"
+sys_pkg_group_install() {
+    local el_group="$1" deb_task="${2:-}"
+    case "$SYS_PKG" in
+        dnf) dnf groupinstall -y "$el_group" ;;
+        yum) yum groupinstall -y "$el_group" ;;
+        apt-get) [ -n "$deb_task" ] && apt-get install -y "$deb_task" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 卸载软件包（静默）。用法：sys_pkg_remove "<el系包名>" "<debian系包名>"
+sys_pkg_remove() {
+    local el_pkg="$1" deb_pkg="${2:-$1}"
+    case "$SYS_PKG" in
+        dnf) dnf remove -y $el_pkg ;;
+        yum) yum remove -y $el_pkg ;;
+        apt-get) apt-get remove -y $deb_pkg ;;
+        *) return 1 ;;
+    esac
+}
+
 # 根据MySQL版本和系统架构更新glibc包版本和tarball文件名
 update_tarball_name() {
     local major_minor="${MYSQL_VERSION%.*}"
@@ -87,6 +143,9 @@ update_tarball_name() {
     TARBALL_NAME="mysql-${MYSQL_VERSION}-linux-glibc${GLIBC_PKG}-${ARCH_TYPE}.tar.xz"
 }
 
+# 脚本所在目录（离线包默认查找目录，与 install_postgresql.sh 一致）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 检查是否为root用户
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}此脚本需要以root权限运行${NC}"
@@ -95,6 +154,7 @@ fi
 
 # 初始化系统检测
 detect_system
+detect_sys_pkg
 
 # ======================== 安装前环境检测 ========================
 
@@ -296,8 +356,8 @@ confirm_configuration() {
         echo -e "  下载源:        ${GREEN}MySQL官网归档${NC}"
         echo -e "  安装目录:      ${GREEN}$MYSQL_HOME/mysql-${MYSQL_VERSION}${NC}"
         echo -e "  数据目录:      ${GREEN}$MYSQL_HOME/data${NC}"
-        echo -e "  端口号:        ${GREEN}$DEFAULT_MYSQL_PORT${NC}"
-        echo -e "  Root密码:      ${GREEN}$DEFAULT_MYSQL_ROOT_PASSWORD${NC}"
+        echo -e "  端口号:        ${GREEN}${MYSQL_PORT:-$DEFAULT_MYSQL_PORT}${NC}"
+        echo -e "  Root密码:      ${GREEN}${MYSQL_ROOT_PASSWORD:-$DEFAULT_MYSQL_ROOT_PASSWORD}${NC}"
         echo ""
 
         echo "1. 使用默认配置"
@@ -335,6 +395,14 @@ confirm_configuration() {
                 read -s -p "请输入Root密码 [默认: root]: " input_root_password
                 echo ""
                 MYSQL_ROOT_PASSWORD=${input_root_password:-$DEFAULT_MYSQL_ROOT_PASSWORD}
+                # 立刻校验，不够强就让用户改，避免装完仍用临时密码
+                while ! check_password_strength "$MYSQL_ROOT_PASSWORD"; do
+                    read -s -p "请重新输入Root密码: " input_root_password
+                    echo ""
+                    if [ -n "$input_root_password" ]; then
+                        MYSQL_ROOT_PASSWORD="$input_root_password"
+                    fi
+                done
 
                 MYSQL_USER=$DEFAULT_MYSQL_USER
                 MYSQL_GROUP=$DEFAULT_MYSQL_GROUP
@@ -437,17 +505,19 @@ download_binary() {
 
     cd /tmp
 
-    # 优先使用当前版本下载地址，失败后回退到官网归档地址
+    # 下载源优先级：国内加速镜像 → 官网 CDN → 官网归档
     resolve_compatible_mysql_package
     local tarball="$TARBALL_NAME"
     local major_minor="${MYSQL_VERSION%.*}"
+    local mirror_url="https://mirrors.ustc.edu.cn/mysql/downloads/MySQL-${major_minor}/${tarball}"
     local current_url="https://cdn.mysql.com/Downloads/MySQL-${major_minor}/${tarball}"
-    local archive_url="https://downloads.mysql.com/archives/get/p/23/file/${tarball}"
+    local archive_url="https://cdn.mysql.com/archives/mysql-${major_minor}/${tarball}"
     local download_url=""
 
     echo -e "${CYAN}下载地址:${NC}"
-    echo "  1. $current_url"
-    echo "  2. $archive_url"
+    echo "  1. $mirror_url   # 中科大加速镜像"
+    echo "  2. $current_url  # 官网 CDN"
+    echo "  3. $archive_url  # 官网归档"
     echo ""
 
     # 检查是否已有安装包；未下载完成的文件保留用于断点续传
@@ -464,7 +534,7 @@ download_binary() {
 
     # 最大重试次数
     local max_retries=3
-    local urls=("$current_url" "$archive_url")
+    local urls=("$mirror_url" "$current_url" "$archive_url")
 
     for download_url in "${urls[@]}"; do
         echo -e "${CYAN}正在尝试: ${download_url}${NC}"
@@ -514,12 +584,14 @@ download_binary() {
     echo -e "${YELLOW}请手动下载以下文件并放到 /tmp/${TARBALL_NAME}${NC}"
     echo ""
     echo -e "${CYAN}手动下载地址:${NC}"
-    echo "  $current_url"
-    echo "  $archive_url"
+    echo "  加速镜像: $mirror_url"
+    echo "  官网 CDN: $current_url"
+    echo "  官网归档: $archive_url"
     echo ""
     echo -e "${CYAN}也可以在浏览器打开以下页面手动选择下载:${NC}"
     echo "  https://dev.mysql.com/downloads/mysql/"
     echo "  https://downloads.mysql.com/archives/community/"
+    echo "  https://mirrors.ustc.edu.cn/mysql/downloads/"
     echo ""
     return 1
 }
@@ -578,13 +650,10 @@ extract_and_install() {
 install_dependencies() {
     echo -e "${YELLOW}安装MySQL运行依赖...${NC}"
 
-    if command -v dnf &> /dev/null; then
-        dnf install -y libaio numactl-libs ncurses-compat-libs 2>/dev/null || \
-            dnf install -y libaio numactl-libs ncurses-libs 2>/dev/null
-    elif command -v yum &> /dev/null; then
-        yum install -y libaio numactl-libs ncurses-compat-libs 2>/dev/null || \
-            yum install -y libaio numactl-libs ncurses-libs 2>/dev/null
-    elif command -v apt-get &> /dev/null; then
+    if [ "$SYS_FAMILY" = "el" ]; then
+        sys_pkg_install "libaio numactl-libs ncurses-compat-libs" 2>/dev/null || \
+            sys_pkg_install "libaio numactl-libs ncurses-libs" 2>/dev/null
+    elif [ "$SYS_FAMILY" = "debian" ]; then
         apt-get update -qq
         apt-get install -y libaio1 libnuma1 libncurses5 2>/dev/null
 
@@ -770,11 +839,9 @@ init_database() {
     fi
 
     # 安装libaio（必需依赖）
-    if command -v dnf &> /dev/null; then
-        dnf install -y libaio 2>/dev/null
-    elif command -v yum &> /dev/null; then
-        yum install -y libaio 2>/dev/null
-    elif command -v apt-get &> /dev/null; then
+    if [ "$SYS_FAMILY" = "el" ]; then
+        sys_pkg_install "libaio" 2>/dev/null
+    elif [ "$SYS_FAMILY" = "debian" ]; then
         apt-get install -y libaio1 2>/dev/null
     fi
 
@@ -787,8 +854,16 @@ init_database() {
     if [ ${PIPESTATUS[0]} -eq 0 ]; then
         echo -e "${GREEN}数据库初始化成功!${NC}"
 
-        # 提取临时密码
-        local temp_password=$(grep "A temporary password is generated" /tmp/mysql_init.log | awk '{print $NF}')
+        # 提取临时密码：
+        # my.cnf 配置了 log-error 时，临时密码写入错误日志而非标准输出，
+        # 因此优先从错误日志提取，再回退到初始化标准输出日志。
+        local temp_password=""
+        if [ -f "$MYSQL_LOG_DIR/error.log" ]; then
+            temp_password=$(grep "A temporary password is generated" "$MYSQL_LOG_DIR/error.log" | tail -1 | awk '{print $NF}')
+        fi
+        if [ -z "$temp_password" ]; then
+            temp_password=$(grep "A temporary password is generated" /tmp/mysql_init.log | tail -1 | awk '{print $NF}')
+        fi
         if [ -n "$temp_password" ]; then
             MYSQL_TEMP_PASSWORD="$temp_password"
             echo -e "${CYAN}临时密码: $temp_password${NC}"
@@ -802,64 +877,195 @@ init_database() {
     fi
 }
 
+# ======================== SELinux 检测与处理 ========================
+
+check_selinux() {
+    # 未安装 SELinux（如 Debian 默认）直接跳过
+    if ! command -v getenforce &>/dev/null; then
+        return 0
+    fi
+
+    # 非交互（批量/无终端）环境不弹选项，交由命令行参数控制
+    if [[ "$BATCH_MODE" == "1" ]] || [ ! -t 0 ]; then
+        return 0
+    fi
+
+    local current_mode
+    current_mode="$(getenforce 2>/dev/null)"
+    # Disabled / Permissive 均不拦截，无需处理
+    if [ "$current_mode" != "Enforcing" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}检测到 SELinux 当前为 Enforcing（强制启用）状态${NC}"
+    echo -e "${CYAN}SELinux 是内核级强制访问控制，会限制 systemd 以 mysql 用户访问${NC}"
+    echo -e "${CYAN}自定义安装/数据目录（如 $MYSQL_INSTALL_DIR、$MYSQL_DATA_DIR），${NC}"
+    echo -e "${CYAN}这是 tar 包安装到非标准目录后 MySQL 服务启动失败的常见原因。${NC}"
+    echo ""
+    echo -e "${YELLOW}建议:${NC} 内网/自建中间件环境通常可关闭 SELinux，避免逐服务授权；"
+    echo -e "       若主机暴露公网或有等保合规要求，建议保持开启并自行配置策略。"
+    echo ""
+    echo "请选择:"
+    echo "  1. 关闭 SELinux（推荐）：立即设为 Permissive，并写入配置永久禁用（重启后完全生效）"
+    echo "  2. 保持开启：继续安装，但服务可能因 SELinux 拦截而启动失败"
+    read -p "请选择 [1/2，默认 1]: " selinux_choice
+
+    if [ "$selinux_choice" = "2" ]; then
+        echo -e "${YELLOW}已保留 SELinux Enforcing；若服务启动失败，可手动执行 setenforce 0 排查${NC}"
+        return 0
+    fi
+
+    # 立即切换为 Permissive（只记录不拦截，无需重启）
+    setenforce 0 2>/dev/null || true
+    # 永久禁用（重启后生效）
+    if [ -f /etc/selinux/config ]; then
+        sed -i 's/^SELINUX=enforcing/SELINUX=disabled/I' /etc/selinux/config
+    fi
+    echo -e "${GREEN}SELinux 已临时关闭（Permissive），并已配置重启后永久禁用${NC}"
+}
+
 # ======================== 创建系统服务 ========================
 
 create_systemd_service() {
     echo -e "${YELLOW}创建系统服务...${NC}"
 
-    # 方式1: 使用support-files中的服务脚本（参考博客推荐方式）
-    if [ -f "$MYSQL_INSTALL_DIR/support-files/mysql.server" ]; then
-        cp $MYSQL_INSTALL_DIR/support-files/mysql.server /etc/init.d/mysql
-        sed -i "s|^basedir=.*|basedir=$MYSQL_INSTALL_DIR|" /etc/init.d/mysql
-        sed -i "s|^datadir=.*|datadir=$MYSQL_DATA_DIR|" /etc/init.d/mysql
-        chmod +x /etc/init.d/mysql
+    # 启动服务前检测 SELinux，Enforcing 时给出关闭选项与建议
+    check_selinux
 
-        # 添加到系统服务
-        if command -v chkconfig &> /dev/null; then
-            chkconfig --add mysql
-            chkconfig mysql on
-        fi
-
-        echo -e "${GREEN}✓ 已添加到系统服务 (/etc/init.d/mysql)${NC}"
+    # 按发行版/主版本选择服务创建策略
+    detect_sys_pkg
+    local service_mode="systemd-native"
+    if [[ "$SYS_FAMILY" == "el" && "$OS_MAJOR" == "7" ]]; then
+        service_mode="sysv"
+    elif [[ "$SYS_FAMILY" == "el" && "$OS_MAJOR" =~ ^[0-9]+$ && "$OS_MAJOR" -le 6 ]]; then
+        service_mode="sysv"
+    elif [ ! -d /run/systemd/system ] && command -v chkconfig >/dev/null 2>&1; then
+        service_mode="sysv"
     fi
+    echo -e "${CYAN}系统: ${OS_ID:-unknown} ${OS_MAJOR:-?} | 服务方案: $service_mode${NC}"
 
-    # 方式2: 同时创建systemd服务文件
-    cat > /etc/systemd/system/mysql.service << EOF
-[Unit]
-Description=MySQL Server
-After=network.target
-
-[Service]
-Type=forking
-PIDFile=$MYSQL_INSTALL_DIR/mysql.pid
-ExecStart=/etc/init.d/mysql start
-ExecStop=/etc/init.d/mysql stop
-ExecReload=/etc/init.d/mysql restart
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 /etc/systemd/system/mysql.service
-    systemctl daemon-reload
-
-    # 确保运行时文件目录有写权限，并清理异常退出残留文件
-    chown -R $MYSQL_USER:$MYSQL_GROUP "$MYSQL_INSTALL_DIR"
+    # 运行时目录与残留清理（必须在启动前）
+    chown -R $MYSQL_USER:$MYSQL_GROUP "$MYSQL_INSTALL_DIR" "$MYSQL_DATA_DIR" "$MYSQL_LOG_DIR" 2>/dev/null || true
     chmod u+rwx "$MYSQL_INSTALL_DIR"
+    mkdir -p "$MYSQL_DATA_DIR" "$MYSQL_LOG_DIR"
+    chown -R $MYSQL_USER:$MYSQL_GROUP "$MYSQL_DATA_DIR" "$MYSQL_LOG_DIR" 2>/dev/null || true
     if [ -f "$MYSQL_INSTALL_DIR/mysql.pid" ] && ! pgrep -F "$MYSQL_INSTALL_DIR/mysql.pid" >/dev/null 2>&1; then
         rm -f "$MYSQL_INSTALL_DIR/mysql.pid"
     fi
     rm -f "$MYSQL_INSTALL_DIR/mysql.sock" "$MYSQL_INSTALL_DIR/mysql.sock.lock" \
         "$MYSQL_INSTALL_DIR/mysqlx.sock" "$MYSQL_INSTALL_DIR/mysqlx.sock.lock"
 
+    if [[ "$service_mode" == "sysv" ]]; then
+        # EL7 及更老 / 无 systemd：SysV init.d 优先
+        mkdir -p /etc/init.d
+        if [ -f "$MYSQL_INSTALL_DIR/support-files/mysql.server" ]; then
+            cp "$MYSQL_INSTALL_DIR/support-files/mysql.server" /etc/init.d/mysql
+            sed -i "s|^basedir=.*|basedir=$MYSQL_INSTALL_DIR|" /etc/init.d/mysql
+            sed -i "s|^datadir=.*|datadir=$MYSQL_DATA_DIR|" /etc/init.d/mysql
+            chmod +x /etc/init.d/mysql
+            if command -v chkconfig &> /dev/null; then
+                chkconfig --add mysql
+                chkconfig mysql on
+            fi
+            echo -e "${GREEN}✓ 已写入 SysV 服务 (/etc/init.d/mysql)${NC}"
+        else
+            echo -e "${YELLOW}未找到 support-files/mysql.server，改为 systemd 单元${NC}"
+            service_mode="systemd-native"
+        fi
+        if [[ "$service_mode" == "sysv" ]]; then
+            if service mysql start 2>/dev/null || /etc/init.d/mysql start; then
+                echo -e "${GREEN}MySQL服务已启动（SysV）${NC}"
+            else
+                echo -e "${RED}MySQL服务启动失败（SysV）${NC}"
+                echo -e "${YELLOW}请查看错误日志: cat $MYSQL_LOG_DIR/error.log${NC}"
+                return 1
+            fi
+            if [ ! -f "/usr/bin/mysql" ]; then
+                ln -s $MYSQL_INSTALL_DIR/bin/mysql /usr/bin/mysql
+            fi
+            return 0
+        fi
+    fi
+
+    # el8/el9/Ubuntu 22+ 等：原生 systemd 直接拉起 mysqld
+    cat > /etc/systemd/system/mysql.service << EOF
+[Unit]
+Description=MySQL Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=$MYSQL_USER
+Group=$MYSQL_GROUP
+PIDFile=$MYSQL_INSTALL_DIR/mysql.pid
+ExecStart=$MYSQL_INSTALL_DIR/bin/mysqld --defaults-file=/etc/my.cnf
+ExecStop=/bin/kill -s TERM \$MAINPID
+TimeoutStartSec=90
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 644 /etc/systemd/system/mysql.service
+
+    # 有 SysV 目录时额外写兼容脚本（不影响 systemd 启动）
+    if [ -d /etc/init.d ] && [ -f "$MYSQL_INSTALL_DIR/support-files/mysql.server" ]; then
+        cp "$MYSQL_INSTALL_DIR/support-files/mysql.server" /etc/init.d/mysql
+        sed -i "s|^basedir=.*|basedir=$MYSQL_INSTALL_DIR|" /etc/init.d/mysql
+        sed -i "s|^datadir=.*|datadir=$MYSQL_DATA_DIR|" /etc/init.d/mysql
+        chmod +x /etc/init.d/mysql
+        if command -v chkconfig &> /dev/null; then
+            chkconfig --add mysql
+            chkconfig mysql on
+        fi
+        echo -e "${GREEN}✓ 已写入 SysV 兼容脚本 (/etc/init.d/mysql)${NC}"
+    else
+        echo -e "${CYAN}跳过 /etc/init.d/mysql（$service_mode）${NC}"
+    fi
+
+    systemctl daemon-reload
+
     # 启动服务
     if ! systemctl start mysql; then
         echo -e "${RED}MySQL服务启动失败${NC}"
         echo -e "${YELLOW}请查看日志: journalctl -u mysql -n 50 --no-pager${NC}"
         echo -e "${YELLOW}或查看错误日志: cat $MYSQL_LOG_DIR/error.log${NC}"
-        return 1
+        echo -e "${YELLOW}尝试回退为 mysqld_safe 启动...${NC}"
+        cat > /etc/systemd/system/mysql.service << EOF
+[Unit]
+Description=MySQL Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=$MYSQL_USER
+Group=$MYSQL_GROUP
+PIDFile=$MYSQL_INSTALL_DIR/mysql.pid
+ExecStart=$MYSQL_INSTALL_DIR/bin/mysqld_safe --defaults-file=/etc/my.cnf
+ExecStop=$MYSQL_INSTALL_DIR/bin/mysqladmin --socket=$MYSQL_INSTALL_DIR/mysql.sock -u root shutdown
+TimeoutStartSec=90
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 /etc/systemd/system/mysql.service
+        systemctl daemon-reload
+        if ! systemctl start mysql; then
+            echo -e "${RED}MySQL服务启动失败（mysqld_safe 回退亦失败）${NC}"
+            echo -e "${YELLOW}请查看日志: journalctl -u mysql -n 50 --no-pager${NC}"
+            echo -e "${YELLOW}或查看错误日志: cat $MYSQL_LOG_DIR/error.log${NC}"
+            return 1
+        fi
     fi
 
     systemctl enable mysql
@@ -890,21 +1096,139 @@ wait_for_mysql() {
     local count=0
     echo -e "${YELLOW}等待MySQL服务就绪...${NC}"
     while [ $count -lt $max_wait ]; do
-        if $MYSQL_INSTALL_DIR/bin/mysqladmin --socket="$MYSQL_INSTALL_DIR/mysql.sock" ping -u root --silent 2>/dev/null; then
-            echo -e "${GREEN}MySQL已就绪${NC}"
-            return 0
-        fi
-        # 用临时密码检测
+        # 临时密码多数已过期，必须加 --connect-expired-password
         if [ -n "$MYSQL_TEMP_PASSWORD" ]; then
-            if $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_TEMP_PASSWORD" -e "SELECT 1;" > /dev/null 2>&1; then
-                echo -e "${GREEN}MySQL已就绪${NC}"
+            if $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_TEMP_PASSWORD" \
+                --connect-expired-password -e "SELECT 1;" > /dev/null 2>&1; then
+                echo -e "${GREEN}MySQL已就绪（临时密码）${NC}"
                 return 0
             fi
+        fi
+        # 目标密码可能已设置成功
+        if [ -n "$MYSQL_ROOT_PASSWORD" ]; then
+            if $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1;" > /dev/null 2>&1; then
+                echo -e "${GREEN}MySQL已就绪（正式密码）${NC}"
+                return 0
+            fi
+        fi
+        # socket 免密探测（初始化后未设密场景）
+        if $MYSQL_INSTALL_DIR/bin/mysqladmin --socket="$MYSQL_INSTALL_DIR/mysql.sock" -u root ping --silent 2>/dev/null; then
+            echo -e "${GREEN}MySQL已就绪${NC}"
+            return 0
         fi
         sleep 2
         ((count++))
     done
     echo -e "${YELLOW}等待超时，继续尝试...${NC}"
+    return 1
+}
+
+# ======================== 密码强度校验（对齐 MySQL 8 validate_password MEDIUM） ========================
+# 规则：长度≥8，且包含大写、小写、数字、特殊字符各至少 1 个
+# 校验失败会列出未满足项，便于用户立刻修正，避免装完仍停在临时密码
+
+check_password_strength() {
+    local pass="$1"
+    local missing=()
+    local len=${#pass}
+
+    if [ "$len" -lt 8 ]; then
+        missing+=("长度至少 8 位（当前 ${len} 位）")
+    fi
+    if ! [[ "$pass" =~ [A-Z] ]]; then
+        missing+=("至少 1 个大写字母 A-Z")
+    fi
+    if ! [[ "$pass" =~ [a-z] ]]; then
+        missing+=("至少 1 个小写字母 a-z")
+    fi
+    if ! [[ "$pass" =~ [0-9] ]]; then
+        missing+=("至少 1 个数字 0-9")
+    fi
+    if ! [[ "$pass" =~ [^A-Za-z0-9] ]]; then
+        missing+=("至少 1 个特殊字符（如 !@#%^&* 等）")
+    fi
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${RED}密码强度不足，MySQL 8 默认策略（MEDIUM）不接受该密码：${NC}"
+    local item
+    for item in "${missing[@]}"; do
+        echo -e "${RED}  ✗ $item${NC}"
+    done
+    echo -e "${YELLOW}请修正后重新输入。示例: MyPass@2026${NC}"
+    return 1
+}
+
+# 交互式输入并校验密码（可重复直到通过）
+prompt_root_password() {
+    local input=""
+    while true; do
+        read -s -p "请输入Root密码（需满足 MEDIUM 策略，空则用默认）: " input
+        echo ""
+        if [ -z "$input" ]; then
+            input="$DEFAULT_MYSQL_ROOT_PASSWORD"
+            echo -e "${YELLOW}使用默认密码（弱），可能被策略拒绝，建议自定义强密码${NC}"
+        fi
+        if check_password_strength "$input"; then
+            MYSQL_ROOT_PASSWORD="$input"
+            return 0
+        fi
+        read -p "是否仍使用该弱密码？策略可能拒绝，安装会提示失败原因 [y/N]: " force
+        if [[ "$force" =~ ^[Yy]$ ]]; then
+            MYSQL_ROOT_PASSWORD="$input"
+            return 0
+        fi
+        echo -e "${CYAN}请重新输入强密码...${NC}"
+    done
+}
+
+# 用临时密码执行 SQL（自动加 --connect-expired-password）
+mysql_with_temp_password() {
+    local sql="$1"
+    [ -n "$MYSQL_TEMP_PASSWORD" ] || return 1
+    $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_TEMP_PASSWORD" \
+        --connect-expired-password -e "$sql" 2>&1
+}
+
+# 尝试把 root 改成目标密码；优先提示策略问题，不静默卸组件
+try_set_root_password() {
+    local new_pass="$MYSQL_ROOT_PASSWORD"
+    local err_out
+
+    # 先本地校验并明确提示，方便用户立刻改密码
+    if ! check_password_strength "$new_pass"; then
+        echo -e "${YELLOW}  当前密码不符合 MySQL 8 MEDIUM 策略，ALTER USER 很可能被拒绝。${NC}"
+        if [[ "$BATCH_MODE" == "1" ]]; then
+            echo -e "${YELLOW}  请改用强密码后重跑，或查看下方失败原因。${NC}"
+        fi
+    fi
+
+    # 策略检查通过或用户坚持弱密码时：先不改全局策略，直接 ALTER
+    err_out=$(mysql_with_temp_password "ALTER USER 'root'@'localhost' IDENTIFIED BY '${new_pass}'; FLUSH PRIVILEGES;")
+    if [ $? -eq 0 ]; then
+        if $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$new_pass" -e "SELECT 1;" >/dev/null 2>&1; then
+            MYSQL_TEMP_PASSWORD=""
+            return 0
+        fi
+    fi
+    echo -e "${YELLOW}  ALTER USER 失败: ${err_out}${NC}"
+    echo -e "${YELLOW}  若错误含 validate_password / ER_NOT_VALID_PASSWORD，请改用更强密码后重试。${NC}"
+
+    # 仅当用户明确要求弱密码时，再放宽策略（不卸载组件）
+    if [[ "$ALLOW_WEAK_PASSWORD" == "1" ]]; then
+        echo -e "${YELLOW}  ALLOW_WEAK_PASSWORD=1，尝试放宽 validate_password.policy=LOW...${NC}"
+        mysql_with_temp_password "SET GLOBAL validate_password.policy=LOW; SET GLOBAL validate_password.length=4;" >/dev/null 2>&1 || true
+        err_out=$(mysql_with_temp_password "ALTER USER 'root'@'localhost' IDENTIFIED BY '${new_pass}'; FLUSH PRIVILEGES;")
+        if [ $? -eq 0 ] && $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$new_pass" -e "SELECT 1;" >/dev/null 2>&1; then
+            MYSQL_TEMP_PASSWORD=""
+            return 0
+        fi
+        echo -e "${YELLOW}  放宽策略后仍失败: ${err_out}${NC}"
+    else
+        echo -e "${YELLOW}  如确认要用弱密码，可设置 ALLOW_WEAK_PASSWORD=1 后重试（不推荐生产）。${NC}"
+    fi
     return 1
 }
 
@@ -924,18 +1248,14 @@ set_password() {
 
     local password_set=false
 
-    # 方式1: 使用临时密码（重试3次）
+    # 方式1: 临时密码 + 策略处理（重试3次）
     if [ -n "$MYSQL_TEMP_PASSWORD" ]; then
-        echo -e "${CYAN}使用临时密码登录并修改密码...${NC}"
-        echo -e "${CYAN}  临时密码: $MYSQL_TEMP_PASSWORD${NC}"
+        echo -e "${CYAN}使用临时密码登录并修改为正式密码...${NC}"
         local retry=0
         while [ $retry -lt 3 ]; do
-            $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$MYSQL_TEMP_PASSWORD" \
-                --connect-expired-password \
-                -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;" 2>&1
-            if [ $? -eq 0 ]; then
+            if try_set_root_password; then
                 password_set=true
-                echo -e "${GREEN}✓ 密码设置成功${NC}"
+                echo -e "${GREEN}✓ 密码设置成功，后续请使用正式密码${NC}"
                 break
             fi
             echo -e "${YELLOW}  重试中 ($((retry+1))/3)...${NC}"
@@ -948,27 +1268,30 @@ set_password() {
     if [ "$password_set" = false ]; then
         echo -e "${CYAN}重新从日志中提取临时密码...${NC}"
         local temp_pass=""
-        # 从数据目录的错误日志提取
-        local err_log=$(find "$MYSQL_DATA_DIR" -name "*.err" 2>/dev/null | head -1)
-        if [ -n "$err_log" ]; then
-            temp_pass=$(grep "A temporary password is generated" "$err_log" | awk '{print $NF}')
+        # 优先从日志目录的错误日志提取（my.cnf 的 log-error 指向此处）
+        if [ -f "$MYSQL_LOG_DIR/error.log" ]; then
+            temp_pass=$(grep "A temporary password is generated" "$MYSQL_LOG_DIR/error.log" | tail -1 | awk '{print $NF}')
         fi
-        # 从初始化日志提取
+        # 兼容数据目录下的 *.err（部分版本默认位置）
+        if [ -z "$temp_pass" ]; then
+            local err_log=$(find "$MYSQL_DATA_DIR" -maxdepth 1 -name "*.err" 2>/dev/null | head -1)
+            if [ -n "$err_log" ]; then
+                temp_pass=$(grep "A temporary password is generated" "$err_log" | tail -1 | awk '{print $NF}')
+            fi
+        fi
+        # 从初始化标准输出日志提取
         if [ -z "$temp_pass" ] && [ -f /tmp/mysql_init.log ]; then
-            temp_pass=$(grep "A temporary password is generated" /tmp/mysql_init.log | awk '{print $NF}')
+            temp_pass=$(grep "A temporary password is generated" /tmp/mysql_init.log | tail -1 | awk '{print $NF}')
         fi
 
         if [ -n "$temp_pass" ]; then
-            echo -e "${CYAN}  找到临时密码: $temp_pass${NC}"
+            echo -e "${CYAN}  找到临时密码，尝试改密...${NC}"
             MYSQL_TEMP_PASSWORD="$temp_pass"
             local retry=0
             while [ $retry -lt 3 ]; do
-                $MYSQL_INSTALL_DIR/bin/mysql -u root -p"$temp_pass" \
-                    --connect-expired-password \
-                    -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;" 2>/dev/null
-                if [ $? -eq 0 ]; then
+                if try_set_root_password; then
                     password_set=true
-                    echo -e "${GREEN}✓ 密码设置成功${NC}"
+                    echo -e "${GREEN}✓ 密码设置成功，后续请使用正式密码${NC}"
                     break
                 fi
                 sleep 3
@@ -999,15 +1322,29 @@ set_password() {
         done
 
         if [ $wait_count -lt 30 ]; then
-            # 修改密码
-            $MYSQL_INSTALL_DIR/bin/mysql --socket="$MYSQL_INSTALL_DIR/mysql.sock" -u root << EOSQL 2>/dev/null
-FLUSH PRIVILEGES;
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';
-FLUSH PRIVILEGES;
-EOSQL
+            local sk_sock="$MYSQL_INSTALL_DIR/mysql.sock"
+
+            # 1) 重新加载权限表，启用账户管理语句（skip-grant 下必需）
+            $MYSQL_INSTALL_DIR/bin/mysql --socket="$sk_sock" -u root \
+                -e "FLUSH PRIVILEGES;" 2>/dev/null
+
+            # 2) 放宽密码策略（容错）：8.4 tar 包默认未安装 validate_password，
+            #    此变量可能不存在；单独执行并忽略失败，绝不阻断后续改密。
+            $MYSQL_INSTALL_DIR/bin/mysql --socket="$sk_sock" -u root \
+                -e "SET GLOBAL validate_password.policy=LOW; SET GLOBAL validate_password.length=4;" 2>/dev/null || true
+
+            # 3) 核心：独立执行 ALTER USER，并单独判断结果
+            local alter_err
+            alter_err=$($MYSQL_INSTALL_DIR/bin/mysql --socket="$sk_sock" -u root \
+                -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';" 2>&1)
             if [ $? -eq 0 ]; then
+                $MYSQL_INSTALL_DIR/bin/mysql --socket="$sk_sock" -u root \
+                    -e "FLUSH PRIVILEGES;" 2>/dev/null
                 password_set=true
-                echo -e "${GREEN}✓ 密码设置成功${NC}"
+                MYSQL_TEMP_PASSWORD=""
+                echo -e "${GREEN}✓ 密码设置成功（skip-grant-tables），后续请使用正式密码${NC}"
+            else
+                echo -e "${YELLOW}skip-grant-tables 改密失败: ${alter_err}${NC}"
             fi
         else
             echo -e "${YELLOW}skip-grant-tables 模式启动超时，跳过自动修改密码${NC}"
@@ -1030,11 +1367,14 @@ EOSQL
         echo ""
         echo -e "${RED}自动设置密码失败！请手动执行以下命令:${NC}"
         echo ""
-        echo -e "${CYAN}--- 方法1: 使用临时密码 ---${NC}"
-        echo "  $MYSQL_INSTALL_DIR/bin/mysql -u root -p'$MYSQL_TEMP_PASSWORD' --connect-expired-password"
+        echo -e "${CYAN}--- 方法1: 使用临时密码 + 放宽策略 ---${NC}"
+        echo "  $MYSQL_INSTALL_DIR/bin/mysql -u root -p'\$临时密码' --connect-expired-password"
+        echo "  SET GLOBAL validate_password.policy=LOW;"
         echo "  ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';"
-        echo "  FLUSH PRIVILEGES;"
-        echo "  EXIT;"
+        echo "  FLUSH PRIVILEGES; EXIT;"
+        echo ""
+        echo -e "${YELLOW}提示: MySQL 8.x 默认 validate_password 会拒绝过简密码（如 root）。${NC}"
+        echo -e "${YELLOW}输入的正式密码若一直不生效，多半是策略拒绝，并非未读入 --password。${NC}"
         echo ""
         echo -e "${CYAN}--- 方法2: 安全模式 ---${NC}"
         echo "  systemctl stop mysql"
@@ -1245,20 +1585,31 @@ cleanup_temp_files() {
 # ======================== 离线安装 ========================
 
 find_offline_tarball() {
+    # 与 install_postgresql.sh 的 find_offline_tarbll 同一交互：路径/目录/回车=脚本目录
+    if [ -z "${SCRIPT_DIR:-}" ]; then
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
     echo -e "${YELLOW}查找MySQL离线安装包...${NC}"
+    echo -e "${CYAN}脚本所在目录: ${GREEN}${SCRIPT_DIR}${NC}"
     echo ""
 
     while true; do
         echo -e "${CYAN}请输入MySQL tar.xz包的路径或目录:${NC}"
         echo "  - 完整路径: /path/to/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz"
-        echo "  - 目录路径: /path/to/ (自动查找)"
+        echo "  - 目录路径: /path/to/ (会自动查找目录中的tar.xz包)"
+        echo -e "  - 直接回车: 默认使用脚本所在目录 ${GREEN}$SCRIPT_DIR${NC}"
         echo "b. 返回主菜单"
         echo ""
-        read -p "请输入路径: " input_path
+        read -p "请输入路径 [回车使用脚本所在目录 / 输入b返回]: " input_path
+
+        # 未输入时默认脚本所在目录（离线包通常与脚本同级）
+        if [ -z "$input_path" ]; then
+            input_path="$SCRIPT_DIR"
+            echo -e "${CYAN}未输入路径，使用脚本所在目录: $input_path${NC}"
+        fi
 
         case "$input_path" in
             "b"|"B") return 1 ;;
-            "") echo -e "${RED}路径不能为空${NC}"; continue ;;
         esac
 
         if [ ! -e "$input_path" ]; then
@@ -1295,7 +1646,8 @@ find_offline_tarball() {
             echo -e "${GREEN}找到 ${#tarballs[@]} 个安装包:${NC}"
             local counter=1
             for tarball in "${tarballs[@]}"; do
-                echo "  $counter. $(basename "$tarball")"
+                local ver=$(basename "$tarball" | sed 's/mysql-//' | sed 's/-linux.*//')
+                echo "  $counter. $ver  ($(basename "$tarball"))"
                 ((counter++))
             done
 
@@ -1376,6 +1728,13 @@ offline_install_flow() {
         read -s -p "Root密码 [默认: root]: " input_pass
         echo ""
         MYSQL_ROOT_PASSWORD=${input_pass:-$DEFAULT_MYSQL_ROOT_PASSWORD}
+        while ! check_password_strength "$MYSQL_ROOT_PASSWORD"; do
+            read -s -p "请重新输入Root密码: " input_pass
+            echo ""
+            if [ -n "$input_pass" ]; then
+                MYSQL_ROOT_PASSWORD="$input_pass"
+            fi
+        done
     else
         MYSQL_HOME=$DEFAULT_MYSQL_HOME
         MYSQL_PORT=$DEFAULT_MYSQL_PORT
@@ -1390,9 +1749,11 @@ offline_install_flow() {
 
     echo ""
     echo -e "${CYAN}最终配置:${NC}"
-    echo "  版本: $MYSQL_VERSION"
-    echo "  安装目录: $MYSQL_INSTALL_DIR"
-    echo "  端口: $MYSQL_PORT"
+    echo -e "  版本:       $MYSQL_VERSION"
+    echo -e "  安装目录:   $MYSQL_INSTALL_DIR"
+    echo -e "  数据目录:   $MYSQL_DATA_DIR"
+    echo -e "  端口:       $MYSQL_PORT"
+    echo -e "  Root密码:   ${GREEN}${MYSQL_ROOT_PASSWORD}${NC}"
     echo ""
 
     read -p "确认安装? [y/N]: " confirm
@@ -1476,6 +1837,11 @@ MySQL 安装脚本参数
   --keep-tarball       安装后保留 /tmp 下的安装包，便于 scp 到从库
   --force-init-data    数据目录非空时自动清空并重新初始化
   --user USER          MySQL系统用户，默认 mysql
+
+密码要求（MySQL 8 MEDIUM）:
+  长度≥8，含大写、小写、数字、特殊字符各至少1个；不满足会列出缺项并提示重输
+  确需弱密码: ALLOW_WEAK_PASSWORD=1 bash install_mysql.sh ...
+  离线包查找: 交互选「离线安装」，与 PostgreSQL 相同（回车=脚本所在目录）
 HELP
                 exit 0
                 ;;
