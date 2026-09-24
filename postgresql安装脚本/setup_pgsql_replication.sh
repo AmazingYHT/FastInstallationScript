@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# PostgreSQL 流复制配置脚本
-# 支持配置主库(Primary)和从库(Replica)，可自动调用安装脚本
+# PostgreSQL 流复制一键配置脚本
+# 支持：交互配置主/从库、SSH 远程安装配置从库、创建复制账号与业务账号
 # 兼容 Ubuntu 22/24、Debian 12、CentOS Stream/Rocky/AlmaLinux 8/9
 
 # 颜色定义
@@ -9,16 +9,14 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# 检查是否使用bash执行
 if [ -z "$BASH_VERSION" ]; then
-    echo "错误: 请使用bash执行此脚本，而不是sh"
-    echo "正确用法: bash setup_pgsql_replication.sh 或 ./setup_pgsql_replication.sh"
+    echo -e "${RED}错误: 请使用bash执行此脚本${NC}"
+    echo "正确用法: bash setup_pgsql_replication.sh"
     exit 1
 fi
 
-# 检查是否为root用户
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}此脚本需要以root权限运行${NC}"
    exit 1
@@ -26,50 +24,71 @@ fi
 
 # ======================== 全局变量 ========================
 
-# 脚本所在目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SCRIPT="$SCRIPT_DIR/install_postgresql.sh"
+CONFIG_FILE="/etc/pgsql_replication.conf"
+CLUSTER_STATE_FILE="/etc/pgsql_cluster_hosts.conf"
 
-# PostgreSQL配置
+# PostgreSQL
 PG_INSTALL_DIR=""
 PG_DATA_DIR=""
 PG_PORT="5432"
-PG_USER="postgres"
-PG_PASSWORD="postgres"
-PG_REPL_USER="repl"
-PG_REPL_PASSWORD="repl_password"
+PG_OS_USER="postgres"
+PG_SUPER_PASSWORD="postgres"
 PG_VERSION=""
 
-# 主从配置
-REPLICATION_ROLE=""  # primary 或 replica
+# 复制账号
+PG_REPL_USER="repl"
+PG_REPL_PASSWORD="Repl@$(date +%Y)Pass"
+
+# 业务账号（可选，如 scpdata）
+CREATE_APP_USER="no"
+APP_DB_NAME="scpdata"
+APP_DB_USER="scpdata"
+APP_DB_PASSWORD=""
+
+# 主从
+REPLICATION_ROLE=""   # primary | replica
 PRIMARY_HOST=""
 PRIMARY_PORT="5432"
+SYNCHRONOUS="off"     # on|off 同步复制
 
-# 配置文件路径
-CONFIG_FILE="/etc/pgsql_replication.conf"
+# SSH
+SSH_USER="root"
+SSH_PORT="22"
+SSH_PASSWORD=""
+SSH_KEY=""
+SSH_OPTS=""
 
-# ======================== 工具函数 ========================
+# 远程从库: host|ssh_port|ssh_user|ssh_pass|pg_port
+REPLICA_NODES=()
 
-# 打印分隔线
-print_separator() {
-    echo -e "${CYAN}========================================${NC}"
-}
+# ======================== 工具 ========================
 
-# 打印标题
 print_title() {
-    local title="$1"
     echo ""
-    print_separator
-    echo -e "${GREEN}$title${NC}"
-    print_separator
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${GREEN}$1${NC}"
+    echo -e "${CYAN}========================================${NC}"
     echo ""
 }
 
-# 确认操作
+info()    { echo -e "${CYAN}[INFO] $1${NC}"; }
+success() { echo -e "${GREEN}[SUCCESS] $1${NC}"; }
+warn()    { echo -e "${YELLOW}[WARN] $1${NC}"; }
+
 confirm_action() {
     local message="$1"
+    local default="${2:-N}"
+    local hint="是否继续? [y/N]: "
+    if [[ "$default" =~ ^[Yy]$ ]]; then
+        hint="是否继续? [Y/n]: "
+    fi
     echo -e "${YELLOW}$message${NC}"
-    read -p "是否继续? [y/N]: " confirm
+    read -p "$hint" confirm
+    if [[ -z "$confirm" ]]; then
+        confirm="$default"
+    fi
     if [[ ! $confirm =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}操作已取消${NC}"
         return 1
@@ -77,47 +96,129 @@ confirm_action() {
     return 0
 }
 
-# 检查服务状态
 check_service_status() {
     local service_name="$1"
     if systemctl is-active --quiet "$service_name" 2>/dev/null; then
         echo -e "${GREEN}✓ $service_name 服务正在运行${NC}"
         return 0
-    else
-        echo -e "${RED}✗ $service_name 服务未运行${NC}"
-        return 1
     fi
+    echo -e "${RED}✗ $service_name 服务未运行${NC}"
+    return 1
 }
 
-# 查找PostgreSQL服务名
+get_local_ip() {
+    local ip
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -z "$ip" ]; then
+        ip=$(ip -4 addr show 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
+    fi
+    echo "$ip"
+}
+
 find_pg_service_name() {
     local service_name=""
     local version_short="${PG_VERSION%.*}"
-    
-    # 尝试常见的服务名
     local possible_names=(
         "postgresql${version_short}"
         "postgresql-${version_short}"
         "postgresql@${version_short}-main"
         "postgresql"
     )
-    
+    # 从安装目录推断（编译安装常见）
+    if [ -n "$PG_INSTALL_DIR" ] && [ -f "/etc/systemd/system/postgresql.service" ]; then
+        if grep -q "$PG_INSTALL_DIR" /etc/systemd/system/postgresql.service 2>/dev/null; then
+            echo "postgresql"
+            return 0
+        fi
+    fi
     for name in "${possible_names[@]}"; do
-        if systemctl list-units --all --type=service --no-legend 2>/dev/null | grep -q "^${name}.service"; then
+        if systemctl list-units --all --type=service --no-legend 2>/dev/null | grep -q "^${name}\.service"; then
             service_name="$name"
             break
         fi
     done
-    
     echo "$service_name"
 }
 
-# ======================== 检测PostgreSQL安装 ========================
+# 以 postgres 用户执行 psql
+psql_exec() {
+    local sql="$1"
+    local db="${2:-postgres}"
+    if [ -n "$PG_INSTALL_DIR" ] && [ -x "$PG_INSTALL_DIR/bin/psql" ]; then
+        sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/psql" -p "$PG_PORT" -d "$db" -t -A -c "$sql" 2>/dev/null
+    else
+        sudo -u "$PG_OS_USER" psql -p "$PG_PORT" -d "$db" -t -A -c "$sql" 2>/dev/null
+    fi
+}
+
+# ======================== SSH ========================
+
+ensure_ssh_tools() {
+    if ! command -v ssh >/dev/null 2>&1 || ! command -v scp >/dev/null 2>&1; then
+        echo -e "${RED}未找到 ssh/scp${NC}"
+        return 1
+    fi
+    if [ -n "$SSH_PASSWORD" ] && ! command -v sshpass >/dev/null 2>&1; then
+        warn "尝试安装 sshpass..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y sshpass 2>/dev/null || true
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y sshpass 2>/dev/null || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y sshpass 2>/dev/null || true
+        fi
+        if ! command -v sshpass >/dev/null 2>&1; then
+            echo -e "${RED}sshpass 不可用，请配置 SSH 免密${NC}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+build_ssh_opts() {
+    SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p $SSH_PORT"
+    [ -n "$SSH_KEY" ] && SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
+}
+
+ssh_cmd() {
+    local host="$1"; shift
+    build_ssh_opts
+    if [ -n "$SSH_PASSWORD" ]; then
+        SSHPASS="$SSH_PASSWORD" sshpass -e ssh $SSH_OPTS "${SSH_USER}@${host}" "$*"
+    else
+        ssh $SSH_OPTS "${SSH_USER}@${host}" "$*"
+    fi
+}
+
+scp_to_remote() {
+    local src="$1" host="$2" dest="$3"
+    build_ssh_opts
+    if [ -n "$SSH_PASSWORD" ]; then
+        SSHPASS="$SSH_PASSWORD" sshpass -e scp $SSH_OPTS "$src" "${SSH_USER}@${host}:${dest}"
+    else
+        scp $SSH_OPTS "$src" "${SSH_USER}@${host}:${dest}"
+    fi
+}
+
+with_node_ssh() {
+    SSH_PORT="$2"; SSH_USER="$3"; SSH_PASSWORD="$4"
+}
+
+# ======================== 检测安装 ========================
 
 detect_postgresql_installation() {
     echo -e "${YELLOW}检测PostgreSQL安装...${NC}"
-    
-    # 常见的PostgreSQL安装路径
+
+    # 优先读复制状态文件
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        if [ -n "$PG_INSTALL_DIR" ] && [ -f "$PG_INSTALL_DIR/bin/psql" ]; then
+            echo -e "${GREEN}从配置加载: $PG_INSTALL_DIR${NC}"
+            return 0
+        fi
+    fi
+
     local pg_paths=(
         "/mnt/data/postgresql"
         "/usr/local/pgsql"
@@ -125,659 +226,765 @@ detect_postgresql_installation() {
         "/opt/pgsql"
         "/opt/postgresql"
         "/var/lib/pgsql"
+        "/usr/pgsql-18"
+        "/usr/pgsql-17"
+        "/usr/pgsql-16"
     )
-    
-    # 从环境变量中读取
-    if [ -n "$PGHOME" ]; then
-        pg_paths=("$PGHOME" "${pg_paths[@]}")
-    fi
-    
-    # 查找PostgreSQL安装
+    [ -n "$PGHOME" ] && pg_paths=("$PGHOME" "${pg_paths[@]}")
+
+    # 常见布局: PG_HOME/pg18 或 PG_HOME/postgresql-x.y
+    local base
+    for base in /mnt/data/postgresql /usr/local /opt; do
+        [ -d "$base" ] || continue
+        while IFS= read -r d; do
+            pg_paths+=("$d")
+        done < <(find "$base" -maxdepth 2 -type f -path '*/bin/psql' 2>/dev/null | sed 's|/bin/psql||')
+    done
+
     for path in "${pg_paths[@]}"; do
-        if [ -d "$path" ] && [ -f "$path/bin/psql" ]; then
+        if [ -f "$path/bin/psql" ]; then
             PG_INSTALL_DIR="$path"
-            echo -e "${GREEN}找到PostgreSQL安装: $PG_INSTALL_DIR${NC}"
-            
-            # 获取版本信息
-            PG_VERSION=$($PG_INSTALL_DIR/bin/psql --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+')
-            echo -e "${GREEN}PostgreSQL版本: $PG_VERSION${NC}"
-            
-            # 获取数据目录
-            if [ -n "$PGDATA" ]; then
-                PG_DATA_DIR="$PGDATA"
-            else
-                PG_DATA_DIR="$path/data"
+            PG_VERSION=$("$PG_INSTALL_DIR/bin/psql" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            if [ -z "$PG_DATA_DIR" ] || [ ! -d "$PG_DATA_DIR" ]; then
+                # 常见: $PG_INSTALL_DIR/data 或 $PG_INSTALL_DIR/../data
+                if [ -d "$PG_INSTALL_DIR/data" ]; then
+                    PG_DATA_DIR="$PG_INSTALL_DIR/data"
+                elif [ -d "$(dirname "$PG_INSTALL_DIR")/data" ]; then
+                    PG_DATA_DIR="$(dirname "$PG_INSTALL_DIR")/data"
+                elif [ -n "$PGDATA" ] && [ -d "$PGDATA" ]; then
+                    PG_DATA_DIR="$PGDATA"
+                fi
             fi
-            
-            PG_PORT=$(grep "^port" "$PG_DATA_DIR/postgresql.conf" 2>/dev/null | head -1 | awk -F'=' '{print $2}' | xargs)
-            PG_PORT=${PG_PORT:-5432}
-            
+            if [ -n "$PG_DATA_DIR" ] && [ -f "$PG_DATA_DIR/postgresql.conf" ]; then
+                local p
+                p=$(grep -E "^port\s*=" "$PG_DATA_DIR/postgresql.conf" 2>/dev/null | head -1 | awk -F'=' '{print $2}' | tr -d ' ')
+                PG_PORT=${p:-$PG_PORT}
+            fi
+            echo -e "${GREEN}找到PostgreSQL: $PG_INSTALL_DIR (v${PG_VERSION})${NC}"
+            [ -n "$PG_DATA_DIR" ] && echo -e "${GREEN}数据目录: $PG_DATA_DIR${NC}"
             return 0
         fi
     done
-    
-    # 尝试使用which命令
-    if command -v psql &>/dev/null; then
-        local psql_path=$(which psql)
-        PG_INSTALL_DIR=$(dirname $(dirname "$psql_path"))
-        PG_VERSION=$($PG_INSTALL_DIR/bin/psql --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+')
+
+    if command -v psql >/dev/null 2>&1; then
+        local psql_path
+        psql_path=$(command -v psql)
+        PG_INSTALL_DIR=$(dirname "$(dirname "$psql_path")")
+        PG_VERSION=$($PG_INSTALL_DIR/bin/psql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
         echo -e "${GREEN}找到PostgreSQL: $PG_INSTALL_DIR${NC}"
         return 0
     fi
-    
+
     echo -e "${RED}未找到PostgreSQL安装${NC}"
     return 1
 }
 
-# ======================== 调用安装脚本 ========================
-
 call_install_script() {
     print_title "安装PostgreSQL"
-    
     if [ ! -f "$INSTALL_SCRIPT" ]; then
         echo -e "${RED}未找到安装脚本: $INSTALL_SCRIPT${NC}"
         return 1
     fi
-    
-    echo -e "${YELLOW}即将调用PostgreSQL安装脚本...${NC}"
-    echo -e "${CYAN}安装脚本路径: $INSTALL_SCRIPT${NC}"
-    echo ""
-    
-    if ! confirm_action "是否继续安装PostgreSQL?"; then
-        return 1
-    fi
-    
-    # 执行安装脚本
+    confirm_action "即将调用交互式安装脚本，是否继续?" || return 1
     bash "$INSTALL_SCRIPT"
-    
-    # 检查安装结果
-    if detect_postgresql_installation; then
-        echo -e "${GREEN}✓ PostgreSQL安装成功${NC}"
-        return 0
+    detect_postgresql_installation || return 1
+    success "PostgreSQL 安装检测通过"
+    return 0
+}
+
+ensure_pg_running() {
+    local service_name
+    service_name=$(find_pg_service_name)
+    if [ -n "$service_name" ]; then
+        if ! check_service_status "$service_name"; then
+            info "尝试启动 $service_name ..."
+            systemctl start "$service_name"
+            sleep 3
+            check_service_status "$service_name" || return 1
+        fi
     else
-        echo -e "${RED}✗ PostgreSQL安装失败${NC}"
-        return 1
+        # pg_ctl 启动
+        if [ -n "$PG_DATA_DIR" ] && [ -x "$PG_INSTALL_DIR/bin/pg_ctl" ]; then
+            sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/pg_ctl" -D "$PG_DATA_DIR" status >/dev/null 2>&1 || \
+                sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/pg_ctl" -D "$PG_DATA_DIR" -l "$PG_DATA_DIR/logfile" start
+            sleep 2
+        fi
     fi
+    return 0
 }
 
 # ======================== 配置主库 ========================
 
 configure_primary() {
     print_title "配置PostgreSQL主库 (Primary)"
-    
-    # 检测PostgreSQL安装
+
     if ! detect_postgresql_installation; then
-        echo -e "${YELLOW}PostgreSQL未安装，是否先安装PostgreSQL?${NC}"
-        echo "1. 安装PostgreSQL"
+        echo "1. 先安装 PostgreSQL"
         echo "2. 退出"
         read -p "请选择 [1/2]: " choice
-        
-        case $choice in
-            "1")
-                call_install_script
-                if [ $? -ne 0 ]; then
-                    return 1
-                fi
-                ;;
-            *)
-                return 1
-                ;;
-        esac
+        [ "$choice" = "1" ] || return 1
+        call_install_script || return 1
     fi
-    
-    # 查找服务名
-    local service_name=$(find_pg_service_name)
-    
-    # 检查PostgreSQL服务状态
-    if [ -n "$service_name" ]; then
-        if ! check_service_status "$service_name"; then
-            echo -e "${YELLOW}尝试启动PostgreSQL服务...${NC}"
-            systemctl start "$service_name"
-            sleep 3
-            if ! check_service_status "$service_name"; then
-                echo -e "${RED}PostgreSQL服务启动失败${NC}"
-                return 1
-            fi
+
+    ensure_pg_running || return 1
+
+    local local_ip
+    local_ip=$(get_local_ip)
+
+    echo -e "${CYAN}===== 基础配置 =====${NC}"
+    read -p "PostgreSQL端口 [$PG_PORT]: " input; PG_PORT=${input:-$PG_PORT}
+    read -p "OS用户 [$PG_OS_USER]: " input; PG_OS_USER=${input:-$PG_OS_USER}
+    read -p "数据目录 [$PG_DATA_DIR]: " input; PG_DATA_DIR=${input:-$PG_DATA_DIR}
+    read -p "超级用户密码 [$PG_SUPER_PASSWORD]: " input; PG_SUPER_PASSWORD=${input:-$PG_SUPER_PASSWORD}
+
+    echo ""
+    echo -e "${CYAN}===== 复制账号 =====${NC}"
+    read -p "复制用户名 [$PG_REPL_USER]: " input; PG_REPL_USER=${input:-$PG_REPL_USER}
+    read -p "复制密码 [$PG_REPL_PASSWORD]: " input; PG_REPL_PASSWORD=${input:-$PG_REPL_PASSWORD}
+    read -p "是否启用同步复制 synchronous_commit? [y/N]: " input
+    if [[ "$input" =~ ^[Yy]$ ]]; then
+        SYNCHRONOUS="on"
+    else
+        SYNCHRONOUS="off"
+    fi
+
+    echo ""
+    echo -e "${CYAN}===== 业务账号（可选）=====${NC}"
+    read -p "是否创建业务库/账号? [y/N]: " input
+    if [[ "$input" =~ ^[Yy]$ ]]; then
+        CREATE_APP_USER="yes"
+        read -p "业务库名 [$APP_DB_NAME]: " input; APP_DB_NAME=${input:-$APP_DB_NAME}
+        read -p "业务用户名 [$APP_DB_USER]: " input; APP_DB_USER=${input:-$APP_DB_USER}
+        read -p "业务用户密码 [自动生成]: " input
+        if [ -n "$input" ]; then
+            APP_DB_PASSWORD="$input"
+        else
+            APP_DB_PASSWORD=$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)
+            echo -e "${GREEN}生成业务密码: $APP_DB_PASSWORD${NC}"
         fi
     fi
-    
-    # 获取配置信息
-    echo -e "${CYAN}请输入主库配置信息:${NC}"
-    echo ""
-    
-    read -p "PostgreSQL端口 [$PG_PORT]: " input_port
-    PG_PORT=${input_port:-$PG_PORT}
-    
-    read -p "PostgreSQL用户 [$PG_USER]: " input_user
-    PG_USER=${input_user:-$PG_USER}
-    
-    read -p "PostgreSQL密码 [$PG_PASSWORD]: " input_password
-    PG_PASSWORD=${input_password:-$PG_PASSWORD}
-    
-    # 复制用户配置
-    echo ""
-    echo -e "${CYAN}配置复制用户:${NC}"
-    read -p "复制用户名 [$PG_REPL_USER]: " input_repl_user
-    PG_REPL_USER=${input_repl_user:-$PG_REPL_USER}
-    
-    read -p "复制用户密码 [$PG_REPL_PASSWORD]: " input_repl_pass
-    PG_REPL_PASSWORD=${input_repl_pass:-$PG_REPL_PASSWORD}
-    
-    # 确认配置
-    echo ""
-    echo -e "${CYAN}主库配置信息:${NC}"
-    echo "  数据目录: $PG_DATA_DIR"
-    echo "  端口: $PG_PORT"
-    echo "  PostgreSQL用户: $PG_USER"
-    echo "  复制用户: $PG_REPL_USER"
-    echo ""
-    
-    if ! confirm_action "确认以上配置?"; then
-        return 1
-    fi
-    
-    # 备份配置文件
-    echo -e "${YELLOW}备份PostgreSQL配置文件...${NC}"
-    cp "$PG_DATA_DIR/postgresql.conf" "$PG_DATA_DIR/postgresql.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$PG_DATA_DIR/pg_hba.conf" "$PG_DATA_DIR/pg_hba.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    echo -e "${GREEN}✓ 配置文件已备份${NC}"
-    
-    # 配置postgresql.conf
-    echo -e "${YELLOW}配置postgresql.conf...${NC}"
-    
-    local conf_file="$PG_DATA_DIR/postgresql.conf"
-    
-    # 移除旧的复制相关配置
-    sed -i '/^# Replication Configuration/d' "$conf_file"
-    sed -i '/^wal_level/d' "$conf_file"
-    sed -i '/^max_wal_senders/d' "$conf_file"
-    sed -i '/^wal_keep_size/d' "$conf_file"
-    sed -i '/^hot_standby/d' "$conf_file"
-    sed -i '/^synchronous_commit/d' "$conf_file"
-    sed -i '/^archive_mode/d' "$conf_file"
-    sed -i '/^archive_command/d' "$conf_file"
-    
-    # 添加主库配置
-    cat >> "$conf_file" << EOF
 
-# Replication Configuration
+    read -p "从库连接主库使用的IP [$local_ip]: " input; PRIMARY_HOST=${input:-$local_ip}
+
+    echo ""
+    info "配置汇总:"
+    info "  主库IP: $PRIMARY_HOST:$PG_PORT"
+    info "  数据目录: $PG_DATA_DIR"
+    info "  复制账号: $PG_REPL_USER"
+    info "  同步复制: $SYNCHRONOUS"
+    if [ "$CREATE_APP_USER" = "yes" ]; then
+        info "  业务库: $APP_DB_NAME  用户: $APP_DB_USER"
+    fi
+    confirm_action "确认配置本机为主库?" || return 1
+
+    # 备份配置
+    [ -f "$PG_DATA_DIR/postgresql.conf" ] && cp "$PG_DATA_DIR/postgresql.conf" "$PG_DATA_DIR/postgresql.conf.backup.$(date +%Y%m%d_%H%M%S)"
+    [ -f "$PG_DATA_DIR/pg_hba.conf" ] && cp "$PG_DATA_DIR/pg_hba.conf" "$PG_DATA_DIR/pg_hba.conf.backup.$(date +%Y%m%d_%H%M%S)"
+
+    # postgresql.conf
+    info "写入 postgresql.conf 复制参数..."
+    local conf="$PG_DATA_DIR/postgresql.conf"
+    sed -i '/^# ===== Replication (setup_pgsql_replication)/d' "$conf"
+    sed -i '/^wal_level\s*=/d' "$conf"
+    sed -i '/^max_wal_senders\s*=/d' "$conf"
+    sed -i '/^wal_keep_size\s*=/d' "$conf"
+    sed -i '/^hot_standby\s*=/d' "$conf"
+    sed -i '/^synchronous_commit\s*=/d' "$conf"
+    sed -i '/^archive_mode\s*=/d' "$conf"
+    sed -i '/^archive_command\s*=/d' "$conf"
+    sed -i '/^listen_addresses\s*=/d' "$conf"
+    sed -i '/^#listen_addresses\s*=/d' "$conf"
+
+    # 确保 listen 可远程
+    if grep -q "^#listen_addresses = 'localhost'" "$conf"; then
+        sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" "$conf"
+    fi
+
+    cat >> "$conf" << EOF
+
+# ===== Replication (setup_pgsql_replication) =====
+listen_addresses = '*'
 wal_level = replica
 max_wal_senders = 10
 wal_keep_size = 1GB
 hot_standby = on
-synchronous_commit = on
+synchronous_commit = $SYNCHRONOUS
 archive_mode = on
 archive_command = 'cp %p $PG_DATA_DIR/archive/%f'
 EOF
-    
-    # 创建归档目录
+
     mkdir -p "$PG_DATA_DIR/archive"
-    chown -R $PG_USER:$(id -gn $PG_USER) "$PG_DATA_DIR/archive"
-    
-    echo -e "${GREEN}✓ postgresql.conf配置完成${NC}"
-    
-    # 配置pg_hba.conf
-    echo -e "${YELLOW}配置pg_hba.conf...${NC}"
-    
-    local hba_file="$PG_DATA_DIR/pg_hba.conf"
-    
-    # 移除旧的复制相关配置
-    sed -i '/^# Replication access/d' "$hba_file"
-    sed -i "/^host.*replication.*$PG_REPL_USER/d" "$hba_file"
-    
-    # 添加复制用户访问权限
-    echo "" >> "$hba_file"
-    echo "# Replication access" >> "$hba_file"
-    echo "host    replication     $PG_REPL_USER     0.0.0.0/0               md5" >> "$hba_file"
-    
-    echo -e "${GREEN}✓ pg_hba.conf配置完成${NC}"
-    
-    # 创建复制用户
-    echo -e "${YELLOW}创建复制用户...${NC}"
-    
-    sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -c "
-        CREATE USER $PG_REPL_USER WITH REPLICATION ENCRYPTED PASSWORD '$PG_REPL_PASSWORD';
-    " 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ 复制用户创建成功${NC}"
-    else
-        echo -e "${YELLOW}复制用户可能已存在，继续...${NC}"
+    chown -R "$PG_OS_USER:$(id -gn "$PG_OS_USER")" "$PG_DATA_DIR/archive"
+    success "postgresql.conf 完成"
+
+    # pg_hba.conf
+    info "配置 pg_hba.conf ..."
+    local hba="$PG_DATA_DIR/pg_hba.conf"
+    sed -i '/^# Replication access/d' "$hba"
+    sed -i "/host[[:space:]]\+replication[[:space:]]\+$PG_REPL_USER/d" "$hba"
+    # 业务/复制允许网段（默认 0.0.0.0/0，生产请收紧）
+    if ! grep -q "host.*replication.*$PG_REPL_USER" "$hba"; then
+        {
+            echo ""
+            echo "# Replication access"
+            echo "host    replication     $PG_REPL_USER     0.0.0.0/0               scram-sha-256"
+            echo "host    all             $PG_REPL_USER     0.0.0.0/0               scram-sha-256"
+        } >> "$hba"
     fi
-    
-    # 重启PostgreSQL服务
-    echo -e "${YELLOW}重启PostgreSQL服务...${NC}"
+    if [ "$CREATE_APP_USER" = "yes" ] && ! grep -q "host.*$APP_DB_NAME.*$APP_DB_USER" "$hba"; then
+        echo "host    $APP_DB_NAME    $APP_DB_USER     0.0.0.0/0               scram-sha-256" >> "$hba"
+    fi
+    success "pg_hba.conf 完成"
+
+    # 重启生效
+    info "重启 PostgreSQL..."
+    local service_name
+    service_name=$(find_pg_service_name)
     if [ -n "$service_name" ]; then
         systemctl restart "$service_name"
     else
-        sudo -u $PG_USER $PG_INSTALL_DIR/bin/pg_ctl restart -D "$PG_DATA_DIR"
+        sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/pg_ctl" -D "$PG_DATA_DIR" restart -m fast
     fi
     sleep 3
-    
-    # 检查服务状态
-    if [ -n "$service_name" ]; then
-        check_service_status "$service_name"
+    ensure_pg_running || return 1
+
+    # 创建复制用户
+    info "创建/更新复制账号 $PG_REPL_USER ..."
+    psql_exec "DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='$PG_REPL_USER') THEN
+    CREATE ROLE $PG_REPL_USER WITH LOGIN REPLICATION ENCRYPTED PASSWORD '$PG_REPL_PASSWORD';
+  ELSE
+    ALTER ROLE $PG_REPL_USER WITH LOGIN REPLICATION ENCRYPTED PASSWORD '$PG_REPL_PASSWORD';
+  END IF;
+END \$\$;" || warn "复制账号创建可能失败，请手动检查"
+
+    # 业务库与账号
+    if [ "$CREATE_APP_USER" = "yes" ]; then
+        info "创建业务库 $APP_DB_NAME 与账号 $APP_DB_USER ..."
+        psql_exec "SELECT 1 FROM pg_database WHERE datname='$APP_DB_NAME'" | grep -q 1 || \
+            psql_exec "CREATE DATABASE $APP_DB_NAME OWNER $PG_OS_USER;"
+        psql_exec "DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='$APP_DB_USER') THEN
+    CREATE ROLE $APP_DB_USER WITH LOGIN ENCRYPTED PASSWORD '$APP_DB_PASSWORD';
+  ELSE
+    ALTER ROLE $APP_DB_USER WITH LOGIN ENCRYPTED PASSWORD '$APP_DB_PASSWORD';
+  END IF;
+END \$\$;"
+        psql_exec "ALTER DATABASE $APP_DB_NAME OWNER TO $APP_DB_USER;"
+        psql_exec "GRANT ALL PRIVILEGES ON DATABASE $APP_DB_NAME TO $APP_DB_USER;"
+        # PG15+ 需要 schema 权限
+        psql_exec "GRANT ALL ON SCHEMA public TO $APP_DB_USER;" "$APP_DB_NAME" 2>/dev/null || true
+        success "业务账号配置完成"
     fi
-    
+
+    # 设置超级用户密码
+    psql_exec "ALTER USER $PG_OS_USER WITH ENCRYPTED PASSWORD '$PG_SUPER_PASSWORD';" || true
+
+    REPLICATION_ROLE="primary"
+    save_config "primary"
+
     echo ""
     echo -e "${GREEN}=====================================${NC}"
     echo -e "${GREEN}PostgreSQL 主库配置完成!${NC}"
     echo -e "${GREEN}=====================================${NC}"
+    echo -e "  主库IP:   ${GREEN}$PRIMARY_HOST${NC}"
+    echo -e "  端口:     ${GREEN}$PG_PORT${NC}"
+    echo -e "  复制账号: ${GREEN}$PG_REPL_USER / $PG_REPL_PASSWORD${NC}"
+    if [ "$CREATE_APP_USER" = "yes" ]; then
+        echo -e "  业务库:   ${GREEN}$APP_DB_NAME${NC}"
+        echo -e "  业务账号: ${GREEN}$APP_DB_USER / $APP_DB_PASSWORD${NC}"
+    fi
     echo ""
-    echo -e "${CYAN}主库信息 (请记录以下信息，配置从库时需要):${NC}"
-    echo "  主库IP: $(hostname -I | awk '{print $1}')"
-    echo "  端口: $PG_PORT"
-    echo "  复制用户: $PG_REPL_USER"
-    echo "  复制密码: $PG_REPL_PASSWORD"
-    echo "  数据目录: $PG_DATA_DIR"
+    echo -e "${CYAN}测试复制账号:${NC}"
+    echo "  PGPASSWORD='$PG_REPL_PASSWORD' psql -h $PRIMARY_HOST -p $PG_PORT -U $PG_REPL_USER -d postgres -c 'SELECT 1'"
     echo ""
-    echo -e "${CYAN}测试复制用户连接:${NC}"
-    echo "  PGPASSWORD='$PG_REPL_PASSWORD' psql -h <主库IP> -p $PG_PORT -U $PG_REPL_USER -d postgres -c 'SELECT 1'"
-    echo ""
-    
-    # 保存配置信息
-    save_config "primary"
-    
     return 0
 }
 
-# ======================== 配置从库 ========================
+# ======================== 配置本机从库 ========================
 
-configure_replica() {
-    print_title "配置PostgreSQL从库 (Replica)"
-    
-    # 检测PostgreSQL安装
+configure_replica_local() {
+    print_title "配置PostgreSQL从库（本机）"
+
     if ! detect_postgresql_installation; then
-        echo -e "${YELLOW}PostgreSQL未安装，是否先安装PostgreSQL?${NC}"
-        echo "1. 安装PostgreSQL"
+        echo "1. 先安装 PostgreSQL"
         echo "2. 退出"
         read -p "请选择 [1/2]: " choice
-        
-        case $choice in
-            "1")
-                call_install_script
-                if [ $? -ne 0 ]; then
-                    return 1
-                fi
-                ;;
-            *)
-                return 1
-                ;;
-        esac
+        [ "$choice" = "1" ] || return 1
+        call_install_script || return 1
     fi
-    
-    # 获取主库信息
-    echo -e "${CYAN}请输入主库信息:${NC}"
+
+    echo -e "${CYAN}主库信息:${NC}"
+    read -p "主库IP: " PRIMARY_HOST
+    [ -z "$PRIMARY_HOST" ] && { echo -e "${RED}主库IP不能为空${NC}"; return 1; }
+    read -p "主库端口 [$PRIMARY_PORT]: " input; PRIMARY_PORT=${input:-$PRIMARY_PORT}
+    read -p "复制用户名 [$PG_REPL_USER]: " input; PG_REPL_USER=${input:-$PG_REPL_USER}
+    read -p "复制密码 [$PG_REPL_PASSWORD]: " input; PG_REPL_PASSWORD=${input:-$PG_REPL_PASSWORD}
+
     echo ""
-    
-    read -p "主库IP地址: " PRIMARY_HOST
-    if [ -z "$PRIMARY_HOST" ]; then
-        echo -e "${RED}主库IP地址不能为空${NC}"
-        return 1
-    fi
-    
-    read -p "主库端口 [$PRIMARY_PORT]: " input_port
-    PRIMARY_PORT=${input_port:-$PRIMARY_PORT}
-    
-    read -p "复制用户名 [$PG_REPL_USER]: " input_user
-    PG_REPL_USER=${input_user:-$PG_REPL_USER}
-    
-    read -p "复制用户密码 [$PG_REPL_PASSWORD]: " input_pass
-    PG_REPL_PASSWORD=${input_pass:-$PG_REPL_PASSWORD}
-    
-    # 获取从库配置
+    read -p "本机端口 [$PG_PORT]: " input; PG_PORT=${input:-$PG_PORT}
+    read -p "OS用户 [$PG_OS_USER]: " input; PG_OS_USER=${input:-$PG_OS_USER}
+
     echo ""
-    echo -e "${CYAN}请输入从库配置:${NC}"
-    echo ""
-    
-    read -p "PostgreSQL端口 [$PG_PORT]: " input_local_port
-    PG_PORT=${input_local_port:-$PG_PORT}
-    
-    read -p "PostgreSQL用户 [$PG_USER]: " input_pg_user
-    PG_USER=${input_pg_user:-$PG_USER}
-    
-    # 数据目录配置
-    echo ""
-    echo -e "${CYAN}从库数据目录配置:${NC}"
-    echo "1. 使用pg_basebackup从主库复制 (推荐)"
-    echo "2. 手动指定已存在的数据目录"
-    echo ""
+    echo "数据初始化方式:"
+    echo "1. pg_basebackup 从主库复制（推荐）"
+    echo "2. 使用已有数据目录（仅配置 standby）"
     read -p "请选择 [1/2]: " data_mode
-    
-    local replica_data_dir=""
-    
-    case $data_mode in
-        "1")
-            read -p "从库数据目录 [$PG_DATA_DIR]: " input_data_dir
-            replica_data_dir=${input_data_dir:-$PG_DATA_DIR}
-            
-            if [ -d "$replica_data_dir" ] && [ "$(ls -A $replica_data_dir 2>/dev/null)" ]; then
-                echo -e "${YELLOW}数据目录已存在且非空${NC}"
-                echo "1. 清空后重新复制"
-                echo "2. 备份后重新复制"
-                echo "3. 取消"
-                read -p "请选择 [1/2/3]: " dir_choice
-                
-                case $dir_choice in
-                    "1")
-                        rm -rf "$replica_data_dir"/*
-                        ;;
-                    "2")
-                        mv "$replica_data_dir" "${replica_data_dir}_backup_$(date +%Y%m%d_%H%M%S)"
-                        mkdir -p "$replica_data_dir"
-                        ;;
-                    *)
-                        return 1
-                        ;;
-                esac
-            fi
-            
-            # 创建目录
-            mkdir -p "$replica_data_dir"
-            chown -R $PG_USER:$(id -gn $PG_USER) "$replica_data_dir"
-            
-            # 确认配置
-            echo ""
-            echo -e "${CYAN}从库配置信息:${NC}"
-            echo "  主库地址: $PRIMARY_HOST:$PRIMARY_PORT"
-            echo "  本地端口: $PG_PORT"
-            echo "  数据目录: $replica_data_dir"
-            echo "  复制用户: $PG_REPL_USER"
-            echo ""
-            
-            if ! confirm_action "确认以上配置?"; then
-                return 1
-            fi
-            
-            # 停止PostgreSQL服务
-            local service_name=$(find_pg_service_name)
-            if [ -n "$service_name" ]; then
-                systemctl stop "$service_name" 2>/dev/null
-            fi
-            
-            # 使用pg_basebackup复制数据
-            echo -e "${YELLOW}使用pg_basebackup从主库复制数据...${NC}"
-            echo -e "${CYAN}这可能需要一些时间，取决于数据量大小${NC}"
-            echo ""
-            
-            sudo -u $PG_USER $PG_INSTALL_DIR/bin/pg_basebackup \
-                -h $PRIMARY_HOST \
-                -p $PRIMARY_PORT \
-                -U $PG_REPL_USER \
-                -D $replica_data_dir \
-                -Fp -Xs -P -R
-            
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}pg_basebackup执行失败${NC}"
-                echo -e "${YELLOW}可能的原因:${NC}"
-                echo "  1. 主库地址或端口错误"
-                echo "  2. 复制用户名或密码错误"
-                echo "  3. 主库未配置允许复制连接"
-                echo "  4. 网络连接问题"
-                return 1
-            fi
-            
-            echo -e "${GREEN}✓ 数据复制完成${NC}"
-            PG_DATA_DIR="$replica_data_dir"
-            ;;
-        "2")
-            read -p "从库数据目录: " replica_data_dir
-            if [ ! -d "$replica_data_dir" ]; then
-                echo -e "${RED}数据目录不存在${NC}"
-                return 1
-            fi
-            PG_DATA_DIR="$replica_data_dir"
-            
-            # 确认配置
-            echo ""
-            echo -e "${CYAN}从库配置信息:${NC}"
-            echo "  主库地址: $PRIMARY_HOST:$PRIMARY_PORT"
-            echo "  本地端口: $PG_PORT"
-            echo "  数据目录: $PG_DATA_DIR"
-            echo "  复制用户: $PG_REPL_USER"
-            echo ""
-            
-            if ! confirm_action "确认以上配置?"; then
-                return 1
-            fi
-            ;;
-        *)
-            echo -e "${RED}无效选择${NC}"
+
+    local replica_data_dir="$PG_DATA_DIR"
+
+    if [ "$data_mode" = "1" ]; then
+        read -p "从库数据目录 [$PG_DATA_DIR]: " input; replica_data_dir=${input:-$PG_DATA_DIR}
+
+        if [ -d "$replica_data_dir" ] && [ "$(ls -A "$replica_data_dir" 2>/dev/null)" ]; then
+            warn "数据目录非空: $replica_data_dir"
+            echo "1. 备份后清空重建"
+            echo "2. 直接清空"
+            echo "3. 取消"
+            read -p "请选择 [1/2/3]: " dir_choice
+            case $dir_choice in
+                1) mv "$replica_data_dir" "${replica_data_dir}_backup_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$replica_data_dir" ;;
+                2) rm -rf "${replica_data_dir:?}/"* ;;
+                *) return 1 ;;
+            esac
+        fi
+
+        mkdir -p "$replica_data_dir"
+        chown -R "$PG_OS_USER:$(id -gn "$PG_OS_USER")" "$replica_data_dir"
+
+        confirm_action "开始 pg_basebackup（耗时取决于数据量）?" || return 1
+
+        local service_name
+        service_name=$(find_pg_service_name)
+        [ -n "$service_name" ] && systemctl stop "$service_name" 2>/dev/null
+
+        info "执行 pg_basebackup ..."
+        export PGPASSWORD="$PG_REPL_PASSWORD"
+        if ! sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/pg_basebackup" \
+            -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$PG_REPL_USER" \
+            -D "$replica_data_dir" -Fp -Xs -P -R; then
+            unset PGPASSWORD
+            echo -e "${RED}pg_basebackup 失败${NC}"
+            echo "排查: 主库地址/端口/复制账号/pg_hba/网络"
             return 1
-            ;;
-    esac
-    
-    # 配置从库参数
-    echo -e "${YELLOW}配置从库参数...${NC}"
-    
-    local conf_file="$PG_DATA_DIR/postgresql.conf"
-    
-    # 配置端口
-    if grep -q "^#port = 5432" "$conf_file"; then
-        sed -i "s/^#port = 5432/port = $PG_PORT/" "$conf_file"
-    elif grep -q "^port = " "$conf_file"; then
-        sed -i "s/^port = .*/port = $PG_PORT/" "$conf_file"
+        fi
+        unset PGPASSWORD
+        success "基础备份完成"
+        PG_DATA_DIR="$replica_data_dir"
     else
-        echo "port = $PG_PORT" >> "$conf_file"
+        read -p "已有数据目录: " replica_data_dir
+        [ -d "$replica_data_dir" ] || { echo -e "${RED}目录不存在${NC}"; return 1; }
+        PG_DATA_DIR="$replica_data_dir"
     fi
-    
-    # 确保standby.signal文件存在
-    touch "$PG_DATA_DIR/standby.signal"
-    
-    # 配置primary_conninfo
-    if grep -q "^primary_conninfo" "$conf_file"; then
-        sed -i "s|^primary_conninfo.*|primary_conninfo = 'host=$PRIMARY_HOST port=$PRIMARY_PORT user=$PG_REPL_USER password=$PG_REPL_PASSWORD'|" "$conf_file"
+
+    # 端口与 hot_standby
+    local conf="$PG_DATA_DIR/postgresql.conf"
+    if grep -qE "^#?port\s*=" "$conf"; then
+        sed -i "s/^#\?port\s*=.*/port = $PG_PORT/" "$conf"
     else
-        echo "primary_conninfo = 'host=$PRIMARY_HOST port=$PRIMARY_PORT user=$PG_REPL_USER password=$PG_REPL_PASSWORD'" >> "$conf_file"
+        echo "port = $PG_PORT" >> "$conf"
     fi
-    
-    # 确保hot_standby开启
-    if grep -q "^#hot_standby = on" "$conf_file"; then
-        sed -i "s/^#hot_standby = on/hot_standby = on/" "$conf_file"
-    elif ! grep -q "^hot_standby = on" "$conf_file"; then
-        echo "hot_standby = on" >> "$conf_file"
+    if grep -qE "^#?hot_standby\s*=" "$conf"; then
+        sed -i "s/^#\?hot_standby\s*=.*/hot_standby = on/" "$conf"
+    else
+        echo "hot_standby = on" >> "$conf"
     fi
-    
-    # 配置pg_hba.conf允许远程连接
-    local hba_file="$PG_DATA_DIR/pg_hba.conf"
-    if ! grep -q "host.*all.*all.*0.0.0.0/0.*md5" "$hba_file"; then
-        echo "host    all             all             0.0.0.0/0               md5" >> "$hba_file"
+    if grep -qE "^#?listen_addresses\s*=" "$conf"; then
+        sed -i "s/^#\?listen_addresses\s*=.*/listen_addresses = '*'/" "$conf"
+    else
+        echo "listen_addresses = '*'" >> "$conf"
     fi
-    
-    # 设置权限
-    chown -R $PG_USER:$(id -gn $PG_USER) "$PG_DATA_DIR"
-    
-    echo -e "${GREEN}✓ 从库配置完成${NC}"
-    
-    # 启动从库
-    echo -e "${YELLOW}启动从库服务...${NC}"
-    
-    local service_name=$(find_pg_service_name)
+
+    # primary_conninfo（-R 已写 standby.signal；无则补）
+    [ -f "$PG_DATA_DIR/standby.signal" ] || touch "$PG_DATA_DIR/standby.signal"
+    if grep -qE "^primary_conninfo\s*=" "$conf"; then
+        sed -i "s|^primary_conninfo\s*=.*|primary_conninfo = 'host=$PRIMARY_HOST port=$PRIMARY_PORT user=$PG_REPL_USER password=$PG_REPL_PASSWORD'|" "$conf"
+    else
+        echo "primary_conninfo = 'host=$PRIMARY_HOST port=$PRIMARY_PORT user=$PG_REPL_USER password=$PG_REPL_PASSWORD'" >> "$conf"
+    fi
+
+    local hba="$PG_DATA_DIR/pg_hba.conf"
+    grep -q "host.*all.*all.*0.0.0.0/0" "$hba" 2>/dev/null || \
+        echo "host    all             all             0.0.0.0/0               scram-sha-256" >> "$hba"
+
+    chown -R "$PG_OS_USER:$(id -gn "$PG_OS_USER")" "$PG_DATA_DIR"
+
+    info "启动从库..."
+    local service_name
+    service_name=$(find_pg_service_name)
     if [ -n "$service_name" ]; then
         systemctl start "$service_name"
-        sleep 3
-        check_service_status "$service_name"
     else
-        sudo -u $PG_USER $PG_INSTALL_DIR/bin/pg_ctl start -D "$PG_DATA_DIR"
-        sleep 3
+        sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/pg_ctl" -D "$PG_DATA_DIR" -l "$PG_DATA_DIR/logfile" start
     fi
-    
-    # 检查复制状态
-    check_replication_status
-    
-    # 保存配置信息
+    sleep 3
+
+    REPLICATION_ROLE="replica"
     save_config "replica"
-    
+    check_replication_status
     return 0
 }
 
-# ======================== 检查复制状态 ========================
+# ======================== SSH 一键部署 ========================
+
+collect_ssh_info() {
+    print_title "SSH 远程连接信息"
+    read -p "SSH 用户名 [root]: " input; SSH_USER=${input:-root}
+    read -p "SSH 端口 [22]: " input; SSH_PORT=${input:-22}
+    echo "认证方式: 1) SSH密码  2) SSH私钥"
+    read -p "请选择 [1/2]: " auth_choice
+    case "$auth_choice" in
+        2)
+            read -p "私钥路径 [~/.ssh/id_rsa]: " input
+            SSH_KEY=${input:-$HOME/.ssh/id_rsa}
+            SSH_KEY="${SSH_KEY/#\~/$HOME}"
+            SSH_PASSWORD=""
+            ;;
+        *)
+            read -s -p "SSH 密码: " SSH_PASSWORD; echo ""
+            SSH_KEY=""
+            ;;
+    esac
+    ensure_ssh_tools || return 1
+}
+
+collect_replica_list() {
+    print_title "添加远程从库（可多台，IP 留空结束）"
+    REPLICA_NODES=()
+    local idx=1
+    while true; do
+        read -p "从库 #${idx} IP/主机名 (空结束): " host
+        [ -z "$host" ] && break
+        local sport="$SSH_PORT" suser="$SSH_USER" spass="$SSH_PASSWORD" rport="$PG_PORT" custom
+        read -p "  SSH端口 [$SSH_PORT]: " custom; sport=${custom:-$sport}
+        read -p "  SSH用户 [$SSH_USER]: " custom; suser=${custom:-$suser}
+        if [ -n "$SSH_PASSWORD" ]; then
+            read -p "  使用全局SSH密码? [Y/n]: " ug
+            if [[ "$ug" =~ ^[Nn]$ ]]; then
+                read -s -p "  SSH密码: " spass; echo ""
+            fi
+        else
+            read -p "  使用全局SSH密钥? [Y/n]: " ug
+            if [[ "$ug" =~ ^[Nn]$ ]]; then
+                read -s -p "  SSH密码: " spass; echo ""
+            else
+                spass=""
+            fi
+        fi
+        read -p "  PostgreSQL端口 [$PG_PORT]: " custom; rport=${custom:-$rport}
+        REPLICA_NODES+=("${host}|${sport}|${suser}|${spass}|${rport}")
+        success "已添加: $host (ssh $suser@$host:$sport pg=$rport)"
+        idx=$((idx+1))
+    done
+    [ ${#REPLICA_NODES[@]} -eq 0 ] && { warn "未添加从库"; return 1; }
+    return 0
+}
+
+save_cluster_hosts() {
+    {
+        echo "# PG cluster hosts - $(date)"
+        echo "PRIMARY_HOST=$PRIMARY_HOST"
+        echo "PRIMARY_PORT=$PG_PORT"
+        echo "PG_REPL_USER=$PG_REPL_USER"
+        echo "PG_REPL_PASSWORD=$PG_REPL_PASSWORD"
+        echo "PG_SUPER_PASSWORD=$PG_SUPER_PASSWORD"
+        echo "PG_INSTALL_DIR=$PG_INSTALL_DIR"
+        echo "PG_DATA_DIR=$PG_DATA_DIR"
+        echo "PG_OS_USER=$PG_OS_USER"
+        echo "PG_VERSION=$PG_VERSION"
+        echo "CREATE_APP_USER=$CREATE_APP_USER"
+        echo "APP_DB_NAME=$APP_DB_NAME"
+        echo "APP_DB_USER=$APP_DB_USER"
+        echo "APP_DB_PASSWORD=$APP_DB_PASSWORD"
+        echo "REPLICA_NODES_STR=${REPLICA_NODES[*]}"
+        echo "SSH_USER=$SSH_USER"
+        echo "SSH_PORT=$SSH_PORT"
+        echo "SSH_KEY=$SSH_KEY"
+    } > "$CLUSTER_STATE_FILE"
+    chmod 600 "$CLUSTER_STATE_FILE"
+    success "集群节点信息: $CLUSTER_STATE_FILE"
+}
+
+remote_setup_replica() {
+    local host="$1" sport="$2" suser="$3" spass="$4" rport="$5"
+
+    print_title "远程配置从库 → ${host}:${rport}"
+
+    local old_port="$SSH_PORT" old_user="$SSH_USER" old_pass="$SSH_PASSWORD"
+    with_node_ssh "$host" "$sport" "$suser" "$spass"
+
+    ssh_cmd "$host" "echo SSH_OK && command -v systemctl >/dev/null && echo HAS_SYSTEMD=1" || {
+        SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"; return 1
+    }
+
+    # 探测远程 PG
+    local remote_pg remote_data remote_ver
+    remote_pg=$(ssh_cmd "$host" "ls -d /mnt/data/postgresql/*/bin/psql /usr/local/pgsql/bin/psql /usr/local/postgresql/bin/psql /usr/pgsql-*/bin/psql 2>/dev/null | head -1 | sed 's|/bin/psql||'")
+    if [ -z "$remote_pg" ]; then
+        remote_pg=$(ssh_cmd "$host" "command -v psql >/dev/null && dirname \$(dirname \$(command -v psql)) || true")
+    fi
+
+    if [ -z "$remote_pg" ] || ! ssh_cmd "$host" "test -x '$remote_pg/bin/psql'"; then
+        warn "远程未检测到 PostgreSQL"
+        echo "1. 上传并调用 install_postgresql.sh（交互，需你在远程完成）"
+        echo "2. 跳过该节点"
+        read -p "请选择 [1/2]: " ch
+        if [ "$ch" = "1" ]; then
+            ssh_cmd "$host" "mkdir -p /tmp/pg_repl_install" || true
+            scp_to_remote "$INSTALL_SCRIPT" "$host" "/tmp/pg_repl_install/install_postgresql.sh" || true
+            info "请在远程完成安装后重新执行本节点配置"
+            info "远程执行: bash /tmp/pg_repl_install/install_postgresql.sh"
+            SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+            return 1
+        fi
+        SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+        return 1
+    fi
+
+    remote_data=$(ssh_cmd "$host" "if [ -d '$remote_pg/data' ]; then echo '$remote_pg/data'; else ls -d $(dirname '$remote_pg')/data 2>/dev/null | head -1; fi")
+    remote_ver=$(ssh_cmd "$host" "'$remote_pg/bin/psql' --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+' | head -1")
+
+    info "远程 PG: $remote_pg v${remote_ver:-?} data=${remote_data:-?}"
+
+    # 停服务、pg_basebackup
+    info "停止远程 PG 并执行 pg_basebackup ..."
+    ssh_cmd "$host" "systemctl stop postgresql* 2>/dev/null; pkill -u postgres 2>/dev/null; true"
+
+    # 数据目录处理
+    local remote_home
+    remote_home=$(dirname "$remote_pg")
+    local target_data="${remote_data:-$remote_home/data}"
+
+    ssh_cmd "$host" "bash -s" << REMOTE
+set -e
+PGUSER=postgres
+if id "\$PGUSER" >/dev/null 2>&1; then :; else useradd -r -m -s /bin/bash \$PGUSER; fi
+if [ -d "$target_data" ] && [ "\$(ls -A $target_data 2>/dev/null)" ]; then
+  mv "$target_data" "${target_data}_backup_\$(date +%Y%m%d_%H%M%S)"
+fi
+mkdir -p "$target_data"
+chown -R \$PGUSER:\$PGUSER "$target_data"
+REMOTE
+
+    local remote_basebackup
+    remote_basebackup="PGPASSWORD='$PG_REPL_PASSWORD' sudo -u postgres '$remote_pg/bin/pg_basebackup' -h '$PRIMARY_HOST' -p '$PG_PORT' -U '$PG_REPL_USER' -D '$target_data' -Fp -Xs -P -R"
+    if ! ssh_cmd "$host" "$remote_basebackup"; then
+        warn "远程 pg_basebackup 失败"
+        SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+        return 1
+    fi
+    success "远程数据同步完成"
+
+    # 写从库配置
+    info "写入远程从库配置..."
+    ssh_cmd "$host" "bash -s" << REMOTE
+set -e
+CONF="$target_data/postgresql.conf"
+HBA="$target_data/pg_hba.conf"
+
+# port
+if grep -qE '^#?port\s*=' "\$CONF"; then
+  sed -i "s/^#\?port\s*=.*/port = $rport/" "\$CONF"
+else
+  echo "port = $rport" >> "\$CONF"
+fi
+# listen
+if grep -qE '^#?listen_addresses\s*=' "\$CONF"; then
+  sed -i "s/^#\?listen_addresses\s*=.*/listen_addresses = '*'/" "\$CONF"
+else
+  echo "listen_addresses = '*'" >> "\$CONF"
+fi
+# hot_standby
+if grep -qE '^#?hot_standby\s*=' "\$CONF"; then
+  sed -i "s/^#\?hot_standby\s*=.*/hot_standby = on/" "\$CONF"
+else
+  echo "hot_standby = on" >> "\$CONF"
+fi
+# primary_conninfo
+if grep -qE '^primary_conninfo\s*=' "\$CONF"; then
+  sed -i "s|^primary_conninfo\s*=.*|primary_conninfo = 'host=$PRIMARY_HOST port=$PG_PORT user=$PG_REPL_USER password=$PG_REPL_PASSWORD'|" "\$CONF"
+else
+  echo "primary_conninfo = 'host=$PRIMARY_HOST port=$PG_PORT user=$PG_REPL_USER password=$PG_REPL_PASSWORD'" >> "\$CONF"
+fi
+
+touch "$target_data/standby.signal"
+grep -q 'host.*all.*all.*0.0.0.0/0' "\$HBA" 2>/dev/null || echo "host    all             all             0.0.0.0/0               scram-sha-256" >> "\$HBA"
+chown -R postgres:postgres "$target_data"
+
+# systemd 或 pg_ctl 启动
+if systemctl list-units --all --type=service 2>/dev/null | grep -q postgresql; then
+  systemctl start postgresql 2>/dev/null || systemctl start postgresql* 2>/dev/null || true
+fi
+if ! sudo -u postgres '$remote_pg/bin/pg_ctl' -D '$target_data' status >/dev/null 2>&1; then
+  sudo -u postgres '$remote_pg/bin/pg_ctl' -D '$target_data' -l '$target_data/standby.log' start
+fi
+sleep 2
+sudo -u postgres '$remote_pg/bin/psql' -p $rport -t -A -c 'SELECT pg_is_in_recovery();'
+REMOTE
+
+    if [ $? -eq 0 ]; then
+        success "远程从库 ${host}:${rport} 配置完成"
+        SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+        return 0
+    fi
+    warn "远程从库启动/验证可能失败，请登录检查"
+    SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+    return 1
+}
+
+one_click_deploy() {
+    print_title "一键 PostgreSQL 主从部署（本机主库 + SSH远程从库）"
+
+    echo -e "${CYAN}流程:${NC}"
+    echo "  1. 本机配置 Primary（复制账号 + 可选业务库 scpdata）"
+    echo "  2. SSH 到从库执行 pg_basebackup"
+    echo "  3. 写入 standby 配置并启动"
+    echo "  4. 校验 pg_is_in_recovery / 延迟"
+    echo ""
+    confirm_action "开始一键部署?" || return 1
+
+    collect_ssh_info || return 1
+    collect_replica_list || return 1
+
+    # 本机主库
+    echo ""
+    info "===== 步骤 A: 本机主库 ====="
+    if detect_postgresql_installation; then
+        read -p "本机已有 PostgreSQL，是否直接配置为 Primary? [Y/n]: " c
+        if [[ ! "$c" =~ ^[Nn]$ ]]; then
+            configure_primary || return 1
+        fi
+    else
+        echo "1. 交互式安装后再配置主库"
+        read -p "请选择 [1]: " ch
+        call_install_script || return 1
+        configure_primary || return 1
+    fi
+
+    # 远程从库
+    local failed=0 idx=1
+    for item in "${REPLICA_NODES[@]}"; do
+        IFS='|' read -r h p u pw rp <<< "$item"
+        echo ""
+        info "===== 步骤 B.${idx}: 从库 ${h} ====="
+        remote_setup_replica "$h" "$p" "$u" "$pw" "$rp" || failed=$((failed+1))
+        idx=$((idx+1))
+    done
+
+    save_cluster_hosts
+
+    echo ""
+    print_title "一键部署结果"
+    info "主库: ${PRIMARY_HOST}:${PG_PORT}"
+    info "从库数: ${#REPLICA_NODES[@]}  失败: $failed"
+    info "复制账号: $PG_REPL_USER"
+    [ "$CREATE_APP_USER" = "yes" ] && info "业务库: $APP_DB_NAME / $APP_DB_USER"
+    echo ""
+    info "后续: bash $0 status"
+    echo ""
+    check_replication_status
+    return 0
+}
+
+# ======================== 状态 ========================
 
 check_replication_status() {
     print_title "检查PostgreSQL复制状态"
-    
-    # 检测PostgreSQL安装
-    if ! detect_postgresql_installation; then
-        echo -e "${RED}未找到PostgreSQL安装${NC}"
-        return 1
+
+    if [ -f "$CLUSTER_STATE_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CLUSTER_STATE_FILE"
     fi
-    
-    # 获取配置
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-    fi
-    
-    # 获取密码
-    if [ -z "$PG_PASSWORD" ]; then
-        read -s -p "请输入PostgreSQL密码: " PG_PASSWORD
-        echo ""
-    fi
-    
-    # 检查是否为从库
-    local is_recovery=$(sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
-    
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+    detect_postgresql_installation || return 1
+
+    local is_recovery
+    is_recovery=$(psql_exec "SELECT pg_is_in_recovery();")
     echo -e "${CYAN}当前角色:${NC}"
-    
     if [ "$is_recovery" = "t" ]; then
         echo -e "  ${GREEN}从库 (Replica)${NC}"
-        
-        echo ""
-        echo -e "${CYAN}复制状态:${NC}"
-        
-        # 获取复制延迟
-        local lag=$(sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -t -c "
-            SELECT CASE 
-                WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0
-                ELSE EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::int
-            END AS lag_seconds;
-        " 2>/dev/null | xargs)
-        
-        if [ -n "$lag" ] && [ "$lag" -eq "$lag" ] 2>/dev/null; then
-            if [ "$lag" -eq 0 ]; then
-                echo -e "  延迟: ${GREEN}无延迟${NC}"
-            else
-                echo -e "  延迟: ${YELLOW}${lag}秒${NC}"
-            fi
-        fi
-        
-        # 获取WAL位置
-        local received_lsn=$(sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -t -c "SELECT pg_last_wal_receive_lsn();" 2>/dev/null | xargs)
-        local replay_lsn=$(sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -t -c "SELECT pg_last_wal_replay_lsn();" 2>/dev/null | xargs)
-        
-        echo -e "  接收WAL位置: $received_lsn"
-        echo -e "  重放WAL位置: $replay_lsn"
-        
-        # 检查主库连接信息
-        local conninfo=$(sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -t -c "SHOW primary_conninfo;" 2>/dev/null | xargs)
-        if [ -n "$conninfo" ]; then
-            echo -e "  主库连接: $conninfo"
-        fi
-        
-        echo ""
-        echo -e "${GREEN}✓ 流复制运行正常${NC}"
+        local lag recv replay
+        lag=$(psql_exec "SELECT CASE WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0 ELSE COALESCE(EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::int,0) END;")
+        recv=$(psql_exec "SELECT pg_last_wal_receive_lsn();")
+        replay=$(psql_exec "SELECT pg_last_wal_replay_lsn();")
+        echo -e "  延迟: ${lag:-0} 秒"
+        echo -e "  接收LSN: $recv"
+        echo -e "  重放LSN: $replay"
+        psql_exec "SHOW primary_conninfo;" | sed 's/^/  conninfo: /'
     else
         echo -e "  ${CYAN}主库 (Primary)${NC}"
-        
         echo ""
-        echo -e "${CYAN}连接的从库:${NC}"
-        
-        # 显示连接的从库信息
-        local replicas=$(sudo -u $PG_USER $PG_INSTALL_DIR/bin/psql -p $PG_PORT -c "
-            SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn 
-            FROM pg_stat_replication;
-        " 2>/dev/null)
-        
+        echo -e "${CYAN}已连接从库:${NC}"
+        local replicas
+        replicas=$(sudo -u "$PG_OS_USER" "${PG_INSTALL_DIR:-/usr}/bin/psql" -p "$PG_PORT" -c "SELECT client_addr, state, sync_state, sent_lsn, replay_lsn FROM pg_stat_replication;" 2>/dev/null)
         if [ -n "$replicas" ] && ! echo "$replicas" | grep -q "(0 rows)"; then
             echo "$replicas"
         else
             echo -e "  ${YELLOW}暂无从库连接${NC}"
         fi
+        # 业务库
+        if [ "$CREATE_APP_USER" = "yes" ] || [ -n "$APP_DB_NAME" ]; then
+            echo ""
+            echo -e "${CYAN}业务库检查:${NC}"
+            local appdb
+            appdb=$(psql_exec "SELECT datname FROM pg_database WHERE datname='${APP_DB_NAME:-scpdata}';")
+            echo "  ${APP_DB_NAME:-scpdata}: ${appdb:-不存在}"
+        fi
     fi
-    
+
+    # 远程从库状态
+    if [ ${#REPLICA_NODES[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${CYAN}远程从库:${NC}"
+        for item in "${REPLICA_NODES[@]}"; do
+            IFS='|' read -r h p u pw rp <<< "$item"
+            local old_port="$SSH_PORT" old_user="$SSH_USER" old_pass="$SSH_PASSWORD"
+            with_node_ssh "$h" "$p" "$u" "$pw"
+            echo -n "  $h:$rp → "
+            local st
+            st=$(ssh_cmd "$h" "pgrep -u postgres >/dev/null && echo running || echo down")
+            echo "$st"
+            ssh_cmd "$h" "sudo -u postgres psql -p $rp -t -A -c \"SELECT pg_is_in_recovery();\" 2>/dev/null" | sed 's/^/    recovery=/'
+            SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
+        done
+    fi
     return 0
 }
 
-# ======================== 重置复制配置 ========================
+# ======================== 重置 ========================
 
 reset_replication() {
-    print_title "重置PostgreSQL复制配置"
-    
-    # 检测PostgreSQL安装
-    if ! detect_postgresql_installation; then
-        echo -e "${RED}未找到PostgreSQL安装${NC}"
-        return 1
+    print_title "重置本机复制配置"
+    detect_postgresql_installation || return 1
+    confirm_action "将停止服务、删除 standby.signal 并清理复制参数，确认?" || return 1
+
+    local service_name
+    service_name=$(find_pg_service_name)
+    [ -n "$service_name" ] && systemctl stop "$service_name"
+    [ -x "$PG_INSTALL_DIR/bin/pg_ctl" ] && sudo -u "$PG_OS_USER" "$PG_INSTALL_DIR/bin/pg_ctl" -D "$PG_DATA_DIR" stop 2>/dev/null
+
+    rm -f "$PG_DATA_DIR/standby.signal"
+    local conf="$PG_DATA_DIR/postgresql.conf"
+    if [ -f "$conf" ]; then
+        sed -i '/^# ===== Replication (setup_pgsql_replication)/d' "$conf"
+        sed -i '/^primary_conninfo/d' "$conf"
+        sed -i '/^wal_level\s*=/d' "$conf"
+        sed -i '/^max_wal_senders\s*=/d' "$conf"
+        sed -i '/^wal_keep_size\s*=/d' "$conf"
+        sed -i '/^archive_mode\s*=/d' "$conf"
+        sed -i '/^archive_command\s*=/d' "$conf"
     fi
-    
-    if ! confirm_action "确认要重置复制配置? 这将停止当前的复制进程。"; then
-        return 1
-    fi
-    
-    # 查找服务名
-    local service_name=$(find_pg_service_name)
-    
-    # 停止PostgreSQL服务
-    echo -e "${YELLOW}停止PostgreSQL服务...${NC}"
-    if [ -n "$service_name" ]; then
-        systemctl stop "$service_name"
-    else
-        sudo -u $PG_USER $PG_INSTALL_DIR/bin/pg_ctl stop -D "$PG_DATA_DIR"
-    fi
-    
-    # 删除standby.signal
-    if [ -f "$PG_DATA_DIR/standby.signal" ]; then
-        rm -f "$PG_DATA_DIR/standby.signal"
-        echo -e "${GREEN}✓ 已删除standby.signal${NC}"
-    fi
-    
-    # 移除复制相关配置
-    local conf_file="$PG_DATA_DIR/postgresql.conf"
-    if [ -f "$conf_file" ]; then
-        echo -e "${YELLOW}清理配置文件...${NC}"
-        sed -i '/^# Replication Configuration/d' "$conf_file"
-        sed -i '/^primary_conninfo/d' "$conf_file"
-        sed -i '/^wal_level/d' "$conf_file"
-        sed -i '/^max_wal_senders/d' "$conf_file"
-        sed -i '/^wal_keep_size/d' "$conf_file"
-        sed -i '/^archive_mode/d' "$conf_file"
-        sed -i '/^archive_command/d' "$conf_file"
-        echo -e "${GREEN}✓ 配置文件已清理${NC}"
-    fi
-    
-    # 清理pg_hba.conf中的复制配置
-    local hba_file="$PG_DATA_DIR/pg_hba.conf"
-    if [ -f "$hba_file" ]; then
-        sed -i '/^# Replication access/d' "$hba_file"
-        sed -i '/^host.*replication/d' "$hba_file"
-    fi
-    
-    # 删除配置文件
-    if [ -f "$CONFIG_FILE" ]; then
-        rm -f "$CONFIG_FILE"
-        echo -e "${GREEN}✓ 复制配置文件已删除${NC}"
-    fi
-    
-    # 删除归档目录
-    if [ -d "$PG_DATA_DIR/archive" ]; then
-        rm -rf "$PG_DATA_DIR/archive"
-        echo -e "${GREEN}✓ 归档目录已删除${NC}"
-    fi
-    
-    echo ""
-    echo -e "${GREEN}✓ 复制配置已重置${NC}"
-    echo -e "${YELLOW}注意: 请手动启动PostgreSQL服务${NC}"
-    
-    if [ -n "$service_name" ]; then
-        echo -e "${CYAN}启动命令: systemctl start $service_name${NC}"
-    else
-        echo -e "${CYAN}启动命令: sudo -u $PG_USER $PG_INSTALL_DIR/bin/pg_ctl start -D $PG_DATA_DIR${NC}"
-    fi
+    local hba="$PG_DATA_DIR/pg_hba.conf"
+    [ -f "$hba" ] && sed -i '/^# Replication access/d;/host.*replication/d' "$hba"
+    rm -f "$CONFIG_FILE" "$CLUSTER_STATE_FILE"
+    success "已重置（请手动启动服务）"
 }
 
-# ======================== 配置保存和加载 ========================
+# ======================== 配置保存 ========================
 
 save_config() {
     local role="$1"
-    
     cat > "$CONFIG_FILE" << EOF
 # PostgreSQL Replication Configuration
 # Generated: $(date)
@@ -786,138 +993,98 @@ REPLICATION_ROLE=$role
 PG_INSTALL_DIR=$PG_INSTALL_DIR
 PG_DATA_DIR=$PG_DATA_DIR
 PG_PORT=$PG_PORT
-PG_USER=$PG_USER
+PG_OS_USER=$PG_OS_USER
+PG_SUPER_PASSWORD=$PG_SUPER_PASSWORD
 PG_VERSION=$PG_VERSION
 PRIMARY_HOST=$PRIMARY_HOST
 PRIMARY_PORT=$PRIMARY_PORT
 PG_REPL_USER=$PG_REPL_USER
+PG_REPL_PASSWORD=$PG_REPL_PASSWORD
+CREATE_APP_USER=$CREATE_APP_USER
+APP_DB_NAME=$APP_DB_NAME
+APP_DB_USER=$APP_DB_USER
+APP_DB_PASSWORD=$APP_DB_PASSWORD
+SYNCHRONOUS=$SYNCHRONOUS
 EOF
-    
-    echo -e "${GREEN}✓ 配置已保存到 $CONFIG_FILE${NC}"
+    chmod 600 "$CONFIG_FILE"
+    success "配置已保存: $CONFIG_FILE"
 }
 
-# ======================== 显示帮助信息 ========================
+# ======================== 帮助/菜单 ========================
 
 show_help() {
-    print_title "PostgreSQL 流复制配置脚本帮助"
-    
-    echo -e "${CYAN}用法:${NC}"
-    echo "  bash setup_pgsql_replication.sh [选项]"
+    print_title "PostgreSQL 流复制配置脚本"
+    echo "用法: bash setup_pgsql_replication.sh [命令]"
     echo ""
-    echo -e "${CYAN}选项:${NC}"
-    echo "  primary   配置当前服务器为主库"
-    echo "  replica   配置当前服务器为从库"
+    echo "命令:"
+    echo "  one       一键部署：本机Primary + SSH远程Replica"
+    echo "  primary   仅配置本机为主库"
+    echo "  replica   仅配置本机为从库"
     echo "  status    检查复制状态"
     echo "  reset     重置复制配置"
-    echo "  help      显示帮助信息"
+    echo "  install   安装 PostgreSQL"
+    echo "  help      帮助"
     echo ""
-    echo -e "${CYAN}交互式菜单:${NC}"
-    echo "  直接运行脚本即可进入交互式菜单"
-    echo ""
-    echo -e "${CYAN}配置说明:${NC}"
-    echo "  主库配置:"
-    echo "    - 设置wal_level = replica"
-    echo "    - 配置max_wal_senders"
-    echo "    - 创建复制用户"
-    echo "    - 配置pg_hba.conf允许复制连接"
-    echo ""
-    echo "  从库配置:"
-    echo "    - 使用pg_basebackup创建基础备份"
-    echo "    - 创建standby.signal文件"
-    echo "    - 配置primary_conninfo"
-    echo "    - 启用hot_standby"
-    echo ""
-    echo -e "${CYAN}常用命令:${NC}"
-    echo "  SELECT pg_is_in_recovery();           -- 检查是否为从库"
-    echo "  SELECT * FROM pg_stat_replication;    -- 查看复制状态"
-    echo "  SELECT pg_last_wal_receive_lsn();     -- 查看接收的WAL位置"
-    echo "  SELECT pg_last_wal_replay_lsn();      -- 查看重放的WAL位置"
-    echo ""
-    echo -e "${CYAN}配置文件位置:${NC}"
-    echo "  本脚本配置: $CONFIG_FILE"
-    echo "  PostgreSQL配置: \$PG_DATA_DIR/postgresql.conf"
-    echo "  认证配置: \$PG_DATA_DIR/pg_hba.conf"
-    echo ""
+    echo "说明:"
+    echo "  - 主库会创建复制账号（默认 repl）"
+    echo "  - 可选创建业务库/账号（如 scpdata）"
+    echo "  - 从库使用 pg_basebackup 初始化并写 standby.signal"
+    echo "  - 一键模式需 SSH 可登从库 root（密钥或 sshpass）"
+    echo "  - 从库需已安装 PostgreSQL 二进制"
 }
-
-# ======================== 主菜单 ========================
 
 show_main_menu() {
     print_title "PostgreSQL 流复制配置工具"
-    
+    echo -e "${CYAN}本机IP: $(get_local_ip)${NC}"
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        echo -e "${CYAN}已有配置角色: ${REPLICATION_ROLE:-未知}${NC}"
+    fi
+    echo ""
     echo "请选择操作:"
     echo ""
-    echo "1. 配置主库 (Primary)"
-    echo "2. 配置从库 (Replica)"
-    echo "3. 检查复制状态"
-    echo "4. 重置复制配置"
-    echo "5. 安装PostgreSQL"
-    echo "6. 显示帮助信息"
-    echo "q. 退出"
+    echo -e "  ${GREEN}1. 一键主从部署${NC}（本机Primary + SSH远程从库）"
+    echo "  2. 配置本机为主库"
+    echo "  3. 配置本机为从库"
+    echo "  4. 检查复制状态"
+    echo "  5. 重置复制配置"
+    echo "  6. 安装 PostgreSQL"
+    echo "  7. 帮助"
+    echo "  q. 退出"
     echo ""
-    
-    read -p "请选择 [1-6/q]: " main_choice
-    
+    read -p "请选择 [1-7/q]: " main_choice
     case $main_choice in
-        "1")
-            configure_primary
-            ;;
-        "2")
-            configure_replica
-            ;;
-        "3")
-            check_replication_status
-            ;;
-        "4")
-            reset_replication
-            ;;
-        "5")
-            call_install_script
-            ;;
-        "6")
-            show_help
-            ;;
-        "q"|"Q")
-            echo -e "${GREEN}退出脚本${NC}"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选择${NC}"
-            ;;
+        1) one_click_deploy ;;
+        2) configure_primary ;;
+        3) configure_replica_local ;;
+        4) check_replication_status ;;
+        5) reset_replication ;;
+        6) call_install_script ;;
+        7) show_help ;;
+        q|Q) echo -e "${GREEN}退出${NC}"; exit 0 ;;
+        *) echo -e "${RED}无效选择${NC}" ;;
     esac
 }
 
-# ======================== 主程序入口 ========================
-
 main() {
-    # 检查是否有命令行参数
     if [ $# -gt 0 ]; then
         case "$1" in
-            "primary")
-                configure_primary
-                ;;
-            "replica")
-                configure_replica
-                ;;
-            "status")
-                check_replication_status
-                ;;
-            "reset")
-                reset_replication
-                ;;
-            "help"|"-h"|"--help")
-                show_help
-                ;;
+            one|deploy|cluster) one_click_deploy ;;
+            primary|master) configure_primary ;;
+            replica|slave) configure_replica_local ;;
+            status) check_replication_status ;;
+            reset) reset_replication ;;
+            install) call_install_script ;;
+            help|-h|--help) show_help ;;
             *)
                 echo -e "${RED}未知参数: $1${NC}"
-                echo "使用 '$0 help' 查看帮助信息"
+                echo "使用 '$0 help'"
                 exit 1
                 ;;
         esac
         return
     fi
-    
-    # 交互式菜单
     while true; do
         show_main_menu
         echo ""
@@ -925,5 +1092,4 @@ main() {
     done
 }
 
-# 执行主程序
 main "$@"

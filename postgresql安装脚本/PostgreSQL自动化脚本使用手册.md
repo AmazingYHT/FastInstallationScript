@@ -22,6 +22,7 @@
 | 脚本名称 | 功能说明 | 权限要求 |
 |---------|---------|---------|
 | `install_postgresql.sh` | PostgreSQL 安装脚本 | root |
+| `setup_pgsql_replication.sh` | **流复制主从**：交互配置 / SSH 一键远程从库 / 创建复制与业务账号 |
 | `postgresql_wal_archive_manager.sh` | WAL归档管理脚本 | root (setup/cron模式) |
 | `uninstall_postgresql.sh` | PostgreSQL 完全卸载脚本 | root |
 
@@ -56,6 +57,52 @@ chmod +x install_postgresql.sh
 # 运行安装脚本
 sudo ./install_postgresql.sh
 ```
+
+### 一键流复制主从部署
+
+```bash
+chmod +x setup_pgsql_replication.sh
+sudo ./setup_pgsql_replication.sh
+# 选择 1. 一键主从部署
+```
+
+交互会依次询问：
+
+1. 全局 SSH 信息（用户/端口/密码或私钥）
+2. **远程从库列表**：IP + SSH端口 + SSH用户/密码 + PG端口（可多台，回车结束）
+3. 本机主库：端口/数据目录/超级用户密码
+4. **复制账号**（默认 `repl`，密码可改）
+5. **是否创建业务库/账号**（如 `scpdata`）
+6. 从库连接主库使用的 IP
+
+确认后自动：
+
+1. 本机配置 Primary：`wal_level=replica`、`listen_addresses=*`、归档目录、`pg_hba` 放行
+2. 创建/更新复制账号 `REPLICATION`
+3. 可选创建业务库与账号并授权
+4. SSH 到从库执行 `pg_basebackup -R`
+5. 写入 `standby.signal` / `primary_conninfo` 并启动
+6. 校验 `pg_is_in_recovery` 与复制延迟
+
+命令行入口：
+
+```bash
+sudo ./setup_pgsql_replication.sh one      # 一键部署
+sudo ./setup_pgsql_replication.sh primary  # 仅本机主库
+sudo ./setup_pgsql_replication.sh replica  # 仅本机从库
+sudo ./setup_pgsql_replication.sh status   # 复制状态
+sudo ./setup_pgsql_replication.sh reset    # 重置复制
+sudo ./setup_pgsql_replication.sh help
+```
+
+依赖：
+- 本机 root
+- SSH 可登从库 root（密钥，或密码 + `sshpass`）
+- **从库需已安装 PostgreSQL 二进制**（脚本会探测路径；未装时会提示先远程执行 `install_postgresql.sh`）
+
+配置落盘：
+- `/etc/pgsql_replication.conf`：本机角色与账号
+- `/etc/pgsql_cluster_hosts.conf`：从库节点列表
 
 ### 配置 WAL 归档
 

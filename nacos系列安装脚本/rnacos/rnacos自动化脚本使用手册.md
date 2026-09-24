@@ -10,6 +10,7 @@
 |------|------|------|
 | `install_rnacos.sh` | Linux | 安装脚本，支持单机/集群 |
 | `install_rnacos.bat` | Windows | 安装脚本，功能与 Linux 对齐 |
+| `setup_rnacos_cluster.sh` | Linux | **一键 Raft 集群部署**：本机首节点 + SSH 远程 join |
 | `uninstall_rnacos.sh` | Linux | 卸载脚本 |
 | `uninstall_rnacos.bat` | Windows | 卸载脚本 |
 
@@ -56,6 +57,41 @@ bash install_rnacos.sh --cluster --node-id 1 --node-addr 192.168.1.10:9848 --aut
 bash install_rnacos.sh --cluster --node-id 2 --node-addr 192.168.1.11:9848 --join-addr 192.168.1.10:9848
 bash install_rnacos.sh --cluster --node-id 3 --node-addr 192.168.1.12:9848 --join-addr 192.168.1.10:9848
 ```
+
+### 一键 Raft 集群部署（推荐）
+
+在**当前机器**执行，交互输入其余节点的 **IP + SSH 端口 + SSH 密码**，自动完成首节点初始化与远程 join：
+
+```bash
+chmod +x setup_rnacos_cluster.sh
+sudo ./setup_rnacos_cluster.sh
+# 选择 1. 一键部署 rnacos 集群
+```
+
+流程：
+
+1. 收集全局 SSH 与集群参数（版本/端口/本机 IP）
+2. 本机作为 **Raft 首节点**（`--auto-init`，node-id=1）
+3. 打包 `rnacos-*.tar.gz` + 脚本 `scp` 到各节点
+4. 远程执行 `install_rnacos.sh --cluster --join-addr 首节点gRPC ...`
+5. 自动分配唯一 `node-id`
+6. 检查各节点 `rnacos` 服务状态
+
+命令行入口：
+
+```bash
+sudo ./setup_rnacos_cluster.sh one      # 一键部署
+sudo ./setup_rnacos_cluster.sh status   # 查看节点状态
+sudo ./setup_rnacos_cluster.sh help
+```
+
+依赖：
+- 本机 root
+- SSH 可登远程 root（密钥或密码+`sshpass`）
+- 远程 systemd
+- 节点间 **gRPC 端口互通**（默认 HTTP端口+1000）
+
+> 无需 Java、无需外部数据库；建议 3 节点（Raft 多数派）。
 
 ## 快速开始（Windows）
 

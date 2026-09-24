@@ -10,6 +10,7 @@
 |------|------|------|
 | `install_nacos.sh` | Linux | 安装脚本，支持单机/集群、Derby/MySQL |
 | `install_nacos.bat` | Windows | 安装脚本，功能与 Linux 对齐 |
+| `setup_nacos_cluster.sh` | Linux | **一键集群部署**：本机+SSH远程安装，统一鉴权 |
 | `uninstall_nacos.sh` | Linux | 卸载脚本（移除 systemd 服务和安装目录）|
 | `uninstall_nacos.bat` | Windows | 卸载脚本 |
 
@@ -50,6 +51,42 @@ bash install_nacos.sh --cluster --db mysql \
   --nodes 192.168.1.10:8848,192.168.1.11:8848,192.168.1.12:8848 \
   --mysql-host 192.168.1.20 --mysql-password 123456
 ```
+
+### 一键集群部署（推荐）
+
+在**当前机器**执行，交互输入其余节点的 **IP + SSH 端口 + SSH 密码**，自动完成：
+
+```bash
+chmod +x setup_nacos_cluster.sh
+sudo ./setup_nacos_cluster.sh
+# 选择 1. 一键部署 Nacos 集群
+```
+
+流程：
+
+1. 收集全局 SSH 与集群参数（版本/端口/MySQL）
+2. 生成**全集群统一**鉴权密钥
+3. 本机按集群模式安装（写入相同 `cluster.conf`）
+4. 打包 `nacos-server-*.tar.gz` + 脚本 `scp` 到各节点
+5. SSH 执行 `install_nacos.sh --cluster --db mysql --nodes ...`
+6. 同步鉴权配置并重启
+7. 检查各节点 `nacos` 服务状态
+
+命令行入口：
+
+```bash
+sudo ./setup_nacos_cluster.sh one      # 一键部署
+sudo ./setup_nacos_cluster.sh status   # 查看节点状态
+sudo ./setup_nacos_cluster.sh help
+```
+
+依赖：
+- 本机 root
+- SSH 可登远程 root（密钥或密码+`sshpass`）
+- 远程 JDK8+（脚本会尝试自动安装 OpenJDK）与 systemd
+- 所有节点能访问**同一 MySQL**（集群必须用 MySQL 存储）
+
+> 注意：鉴权密钥必须全集群一致，一键脚本会统一生成并写入各节点 `application.properties`。
 
 ## 快速开始（Windows）
 

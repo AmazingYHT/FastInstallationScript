@@ -11,7 +11,45 @@
 | 脚本 | 平台 | 说明 |
 |------|------|------|
 | `install_kafka.sh` | Linux | 安装脚本，支持 KRaft/Zookeeper × 单机/集群 |
+| `setup_kafka_cluster.sh` | Linux | **一键多机集群部署**：SSH 远程安装其余节点 |
 | `uninstall_kafka.sh` | Linux | 卸载脚本（同时清理 kafka 与 zookeeper 服务）|
+
+## 一键多机集群部署（推荐）
+
+在**本机**交互输入远程节点的 **IP + SSH 端口 + SSH 密码 + node-id/端口**，自动完成：
+
+```bash
+chmod +x setup_kafka_cluster.sh
+sudo ./setup_kafka_cluster.sh
+# 选择 1. 一键部署 Kafka 集群
+```
+
+流程：
+
+1. 选择协调模式（KRaft / Zookeeper）
+2. 全局 SSH 与端口
+3. 添加远程节点（可多台；分配唯一 `node-id`）
+4. 自动生成 KRaft `quorum` + **统一 cluster UUID**，或 ZK `zk-servers`/`zk-connect`
+5. 本机安装首节点 → 打包 `kafka_*.tgz` + 脚本 `scp` 到各节点
+6. SSH 执行 `install_kafka.sh --cluster --coord ... --node-id ... --quorum/... --cluster-uuid ...`
+7. 远程若无 JDK 会尝试安装 OpenJDK 17
+8. 校验各节点 `kafka` 服务状态
+
+命令行入口：
+
+```bash
+sudo ./setup_kafka_cluster.sh one      # 一键部署
+sudo ./setup_kafka_cluster.sh status   # 查看节点状态
+sudo ./setup_kafka_cluster.sh help
+```
+
+依赖：
+- 本机 root
+- SSH 可登远程 root（密钥或密码+`sshpass`）
+- 远程 JDK 11+（可自动装）、systemd
+- 节点间端口互通：
+  - KRaft：`9092`（broker）+ `9093`（controller）
+  - ZK：`2181` + `2888` + `3888` + `9092`
 
 ## 使用前提
 

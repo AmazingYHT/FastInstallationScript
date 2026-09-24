@@ -20,7 +20,8 @@
 
 | 脚本名称 | 功能说明 | 权限要求 |
 |---------|---------|---------|
-| `install_mysql.sh` | MySQL 安装脚本 | root |
+| `install_mysql.sh` | MySQL 安装脚本（交互 + 无人值守） | root |
+| `setup_mysql_replication.sh` | 主从复制：本机配置 / SSH远程安装 / 一键部署 | root |
 | `uninstall_mysql.sh` | MySQL 完全卸载脚本 | root |
 
 ### 支持的特性
@@ -30,6 +31,8 @@
 - **多版本支持**：MySQL 8.0.x ~ 8.4.x LTS
 - **多架构支持**：x86_64、ARM64
 - **双安装模式**：在线安装、离线安装
+- **无人值守安装**：`--batch` 参数，供主从脚本 SSH 远程调用
+- **主从复制编排**：一键本机主库 + SSH 远程安装/配置从库（GTID）
 - **二进制包安装**：无需编译，解压即用
 - **安装前环境检测**：自动检测 glibc、systemd、包管理器、SELinux 等
 - **智能包选择**：根据系统 glibc 自动选择可运行的 MySQL 二进制包
@@ -47,11 +50,61 @@
 
 ```bash
 # 赋予执行权限
-chmod +x install_mysql.sh
+chmod +x install_mysql.sh setup_mysql_replication.sh
 
 # 运行安装脚本
 sudo ./install_mysql.sh
 ```
+
+### 一键主从部署（本机主库 + SSH 远程从库）
+
+```bash
+sudo ./setup_mysql_replication.sh
+# 选择 1. 一键主从部署
+```
+
+流程：
+1. 本机无人值守安装 MySQL 并配置为主库（GTID）
+2. 自动保留 `tar.xz` 安装包
+3. `scp` 安装包 + `install_mysql.sh` 到各从库
+4. SSH 在从库执行 `install_mysql.sh --batch --offline ...`
+5. 自动写入主从参数并 `START REPLICA`
+6. 校验 IO/SQL 线程
+
+命令行入口：
+
+```bash
+sudo ./setup_mysql_replication.sh one      # 一键部署
+sudo ./setup_mysql_replication.sh master   # 仅本机主库
+sudo ./setup_mysql_replication.sh slave    # 仅本机从库
+sudo ./setup_mysql_replication.sh remote   # 仅远程安装/配置从库
+sudo ./setup_mysql_replication.sh status   # 查看复制状态（含远程）
+sudo ./setup_mysql_replication.sh reset    # 重置本机复制
+sudo ./setup_mysql_replication.sh help     # 帮助
+```
+
+依赖：
+- 本机 root
+- 可 SSH 登录从库 root（密钥，或密码 + `sshpass`）
+- 从库具备 systemd
+
+### 无人值守安装（供脚本/SSH 调用）
+
+```bash
+# 在线安装
+bash install_mysql.sh --batch --version 8.4.9 \
+  --home /mnt/data/mysql --port 3306 --password root --keep-tarball
+
+# 离线安装（从库常用）
+bash install_mysql.sh --batch --offline /tmp/mysql-8.4.9-linux-glibc2.28-x86_64.tar.xz \
+  --home /mnt/data/mysql --port 3306 --password root --force-init-data
+```
+
+参数说明：
+- `--batch`：跳过交互菜单
+- `--keep-tarball`：保留 `/tmp` 下安装包，便于 scp 到从库
+- `--force-init-data`：数据目录非空时清空并重新初始化（从库建议开启）
+- 安装状态写入 `/etc/mysql_install_state.conf`
 
 ### 完全卸载
 

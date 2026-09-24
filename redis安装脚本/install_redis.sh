@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Redis 自动化安装脚本
-# 支持编译好的 Redis 二进制包部署，支持单机模式和哨兵模式
+# 支持编译好的 Redis 二进制包部署，支持单机 / 哨兵 / Cluster 模式
 # 兼容 Ubuntu 22/24、Debian 12、CentOS Stream/Rocky/AlmaLinux 8/9
 
 # 颜色定义
@@ -43,8 +43,15 @@ REDIS_PORT="6379"
 REDIS_BIND="0.0.0.0"
 REDIS_PASSWORD=""
 
-# 部署模式：standalone 或 sentinel
+# 部署模式：standalone / sentinel / cluster
 DEPLOY_MODE="standalone"
+
+# Cluster 配置
+CLUSTER_ENABLED="no"
+CLUSTER_CONFIG_FILE=""
+CLUSTER_NODE_TIMEOUT="5000"
+CLUSTER_REQUIRE_FULL_COVERAGE="no"
+CLUSTER_MIGRATION_BARRIER="1"
 
 # 开启保护模式
 PROTECTED_MODE="yes"
@@ -54,6 +61,12 @@ LOG_LEVEL="notice"
 
 # 配置文件
 CONFIG_FILE="/etc/redis_install.conf"
+
+# 无人值守模式（供主从/哨兵脚本 SSH 远程调用）
+BATCH_MODE=0
+SKIP_START=0
+FORCE_REINSTALL=0
+KEEP_PACKAGE=1
 
 # ======================== 函数定义 ========================
 
@@ -83,7 +96,7 @@ detect_os() {
     else
         error "无法检测操作系统版本"
     fi
-    info "检测到操作系统: $OS $VERSIONION_ID"
+    info "检测到操作系统: $OS $VERSION_ID"
 }
 
 # 安装依赖
@@ -126,23 +139,69 @@ deploy_redis() {
 
     if [ -f "$REDIS_TGZ" ]; then
         info "使用本地压缩包: $REDIS_TGZ"
-        tar zxf "$REDIS_TGZ" -C "$REDIS_INSTALL_DIR" --strip-components=1
+        rm -rf "${REDIS_INSTALL_DIR}.tmp"
+        mkdir -p "${REDIS_INSTALL_DIR}.tmp"
+        tar zxf "$REDIS_TGZ" -C "${REDIS_INSTALL_DIR}.tmp" --strip-components=1
+
+        # 若是源码包且尚无二进制，则编译
+        if [ ! -f "${REDIS_INSTALL_DIR}.tmp/bin/redis-server" ]; then
+            info "检测到源码包，开始编译..."
+            install_dependencies
+            cd "${REDIS_INSTALL_DIR}.tmp" || error "无法进入编译目录"
+            make -j"$(nproc 2>/dev/null || echo 2)"
+            make PREFIX="$REDIS_INSTALL_DIR" install
+            rm -rf "${REDIS_INSTALL_DIR}.tmp"
+        else
+            # 已是编译产物目录结构
+            rm -rf "$REDIS_INSTALL_DIR"
+            mkdir -p "$REDIS_INSTALL_DIR"
+            cp -a "${REDIS_INSTALL_DIR}.tmp/." "$REDIS_INSTALL_DIR/"
+            rm -rf "${REDIS_INSTALL_DIR}.tmp"
+        fi
     else
         info "本地压缩包不存在，从官网下载..."
-        cd "$SCRIPT_DIR"
-        mkdir -p package
-        wget "http://download.redis.io/releases/redis-${REDIS_VERSION}.tar.gz" -O "$REDIS_TGZ"
-        tar zxf "$REDIS_TGZ" -C "$REDIS_INSTALL_DIR" --strip-components=1
-        cd "$REDIS_INSTALL_DIR"
-        make
+        mkdir -p "$(dirname "$REDIS_TGZ")"
+        wget "http://download.redis.io/releases/redis-${REDIS_VERSION}.tar.gz" -O "$REDIS_TGZ" || \
+            error "下载 Redis 失败"
+        rm -rf "${REDIS_INSTALL_DIR}.tmp"
+        mkdir -p "${REDIS_INSTALL_DIR}.tmp"
+        tar zxf "$REDIS_TGZ" -C "${REDIS_INSTALL_DIR}.tmp" --strip-components=1
+        cd "${REDIS_INSTALL_DIR}.tmp" || error "无法进入编译目录"
+        install_dependencies
+        make -j"$(nproc 2>/dev/null || echo 2)"
+        make PREFIX="$REDIS_INSTALL_DIR" install
+        rm -rf "${REDIS_INSTALL_DIR}.tmp"
     fi
 
     if [ ! -f "$REDIS_INSTALL_DIR/bin/redis-server" ]; then
-        error "Redis 二进制部署失败，请检查压缩包"
+        # 兼容 make install 到 PREFIX 的布局
+        if [ -f "$REDIS_INSTALL_DIR/bin/redis-server" ]; then
+            :
+        elif [ -f "$REDIS_INSTALL_DIR/redis-server" ]; then
+            mkdir -p "$REDIS_INSTALL_DIR/bin"
+            mv "$REDIS_INSTALL_DIR"/redis-* "$REDIS_INSTALL_DIR/bin/" 2>/dev/null || true
+        else
+            error "Redis 二进制部署失败，请检查压缩包"
+        fi
     fi
 
     chown -R redis:redis "$REDIS_INSTALL_DIR"
-    success "Redis 二进制部署完成"
+    success "Redis 二进制部署完成: $REDIS_INSTALL_DIR"
+}
+
+# 打包已编译安装目录，供 scp 到远程
+pack_installed_redis() {
+    local pack_dir="$SCRIPT_DIR/package"
+    local pack_name="redis-${REDIS_VERSION}-linux-$(uname -m).tar.gz"
+    mkdir -p "$pack_dir"
+    if [ ! -d "$REDIS_INSTALL_DIR" ] || [ ! -f "$REDIS_INSTALL_DIR/bin/redis-server" ]; then
+        warn "未找到已安装的 Redis，无法打包"
+        return 1
+    fi
+    tar zcf "${pack_dir}/${pack_name}" -C "$(dirname "$REDIS_INSTALL_DIR")" "$(basename "$REDIS_INSTALL_DIR")"
+    REDIS_TGZ="${pack_dir}/${pack_name}"
+    success "已打包安装目录: $REDIS_TGZ"
+    return 0
 }
 
 # 生成单机模式配置文件
@@ -169,6 +228,53 @@ EOF
 
     chown redis:redis "$conf_file"
     success "配置文件生成: $conf_file"
+}
+
+# 生成 Cluster 模式实例配置（cluster-enabled）
+generate_cluster_instance_config() {
+    info "生成 Cluster 模式实例配置..."
+
+    local conf_file="$REDIS_CONF_DIR/redis_${REDIS_PORT}.conf"
+    CLUSTER_CONFIG_FILE="$REDIS_DATA_DIR/redis_${REDIS_PORT}/nodes-${REDIS_PORT}.conf"
+
+    mkdir -p "$REDIS_DATA_DIR/redis_${REDIS_PORT}"
+
+    cat > "$conf_file" << EOF
+# Redis Cluster 实例配置 - 由 install_redis.sh 自动生成
+port $REDIS_PORT
+bind $REDIS_BIND
+protected-mode no
+daemonize yes
+pidfile $REDIS_RUN_DIR/redis_$REDIS_PORT.pid
+loglevel $LOG_LEVEL
+logfile $REDIS_LOG_DIR/redis_$REDIS_PORT.log
+dir $REDIS_DATA_DIR/redis_$REDIS_PORT
+
+# RDB
+save 900 1
+save 300 10
+save 60 10000
+rdbcompression yes
+dbfilename dump_$REDIS_PORT.rdb
+
+# Cluster
+cluster-enabled yes
+cluster-config-file nodes-${REDIS_PORT}.conf
+cluster-node-timeout $CLUSTER_NODE_TIMEOUT
+cluster-require-full-coverage $CLUSTER_REQUIRE_FULL_COVERAGE
+cluster-migration-barrier $CLUSTER_MIGRATION_BARRIER
+cluster-announce-ip $REDIS_BIND
+cluster-announce-port $REDIS_PORT
+cluster-announce-bus-port $((REDIS_PORT + 10000))
+EOF
+
+    if [ -n "$REDIS_PASSWORD" ]; then
+        echo "requirepass $REDIS_PASSWORD" >> "$conf_file"
+        echo "masterauth $REDIS_PASSWORD" >> "$conf_file"
+    fi
+
+    chown -R redis:redis "$conf_file" "$REDIS_DATA_DIR/redis_${REDIS_PORT}"
+    success "Cluster 实例配置: $conf_file"
 }
 
 # 生成systemd服务文件
@@ -223,6 +329,11 @@ EOF
 
 # 启动服务
 start_standalone_service() {
+    if [ "$SKIP_START" = "1" ]; then
+        info "跳过启动（将由主从/哨兵/Cluster脚本配置后启动）"
+        return 0
+    fi
+
     info "启动 Redis 服务..."
     if [ "$DEPLOY_MODE" = "standalone" ]; then
         systemctl enable --now redis
@@ -238,6 +349,14 @@ start_standalone_service() {
         else
             error "Redis 服务启动失败，请查看日志: journalctl -u redis"
         fi
+    elif [ "$DEPLOY_MODE" = "cluster" ]; then
+        systemctl enable --now "redis@${REDIS_PORT}"
+        sleep 2
+        if systemctl is-active --quiet "redis@${REDIS_PORT}"; then
+            success "Redis Cluster 实例启动成功: redis@${REDIS_PORT}"
+        else
+            error "Redis Cluster 实例启动失败: journalctl -u redis@${REDIS_PORT}"
+        fi
     fi
 }
 
@@ -247,10 +366,13 @@ interactive_config() {
     echo "=== Redis 安装配置 ==="
     echo
 
-    read -p "请输入部署模式 (1=单机模式, 2=哨兵模式多实例) [默认: 1-单机模式]: " mode_choice
+    read -p "请输入部署模式 (1=单机, 2=哨兵多实例, 3=Cluster) [默认: 1-单机]: " mode_choice
     case "$mode_choice" in
         2)
             DEPLOY_MODE="sentinel"
+            ;;
+        3)
+            DEPLOY_MODE="cluster"
             ;;
         *)
             DEPLOY_MODE="standalone"
@@ -288,6 +410,7 @@ interactive_config() {
 save_config() {
     cat > "$CONFIG_FILE" << EOF
 # Redis 安装配置 - 由 install_redis.sh 生成
+# Generated: $(date)
 REDIS_VERSION=$REDIS_VERSION
 REDIS_INSTALL_DIR=$REDIS_INSTALL_DIR
 REDIS_DATA_DIR=$REDIS_DATA_DIR
@@ -298,11 +421,169 @@ REDIS_PORT=$REDIS_PORT
 REDIS_BIND=$REDIS_BIND
 REDIS_PASSWORD=$REDIS_PASSWORD
 DEPLOY_MODE=$DEPLOY_MODE
+REDIS_TGZ=$REDIS_TGZ
+CLUSTER_ENABLED=$CLUSTER_ENABLED
+CLUSTER_NODE_TIMEOUT=$CLUSTER_NODE_TIMEOUT
+CLUSTER_REQUIRE_FULL_COVERAGE=$CLUSTER_REQUIRE_FULL_COVERAGE
 EOF
+    chmod 600 "$CONFIG_FILE"
+    success "安装状态已写入 $CONFIG_FILE"
+}
+
+# ======================== 无人值守安装 ========================
+
+parse_batch_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --batch|-b)
+                BATCH_MODE=1
+                shift
+                ;;
+            --standalone)
+                BATCH_MODE=1
+                DEPLOY_MODE="standalone"
+                shift
+                ;;
+            --sentinel)
+                BATCH_MODE=1
+                DEPLOY_MODE="sentinel"
+                shift
+                ;;
+            --cluster)
+                BATCH_MODE=1
+                DEPLOY_MODE="cluster"
+                CLUSTER_ENABLED="yes"
+                shift
+                ;;
+            --cluster-node-timeout)
+                CLUSTER_NODE_TIMEOUT="${2:-5000}"
+                shift 2
+                ;;
+            --version)
+                REDIS_VERSION="${2:-}"
+                # 若未显式指定 tgz，则按新版本重算默认包名
+                if [[ -z "$REDIS_TGZ_EXPLICIT" ]]; then
+                    REDIS_TGZ="$SCRIPT_DIR/package/redis-${REDIS_VERSION}.tar.gz"
+                fi
+                shift 2
+                ;;
+            --tgz)
+                REDIS_TGZ="${2:-}"
+                REDIS_TGZ_EXPLICIT=1
+                shift 2
+                ;;
+            --install-dir)
+                REDIS_INSTALL_DIR="${2:-}"
+                shift 2
+                ;;
+            --data-dir)
+                REDIS_DATA_DIR="${2:-}"
+                shift 2
+                ;;
+            --port)
+                REDIS_PORT="${2:-}"
+                shift 2
+                ;;
+            --password)
+                REDIS_PASSWORD="${2:-}"
+                shift 2
+                ;;
+            --bind)
+                REDIS_BIND="${2:-}"
+                shift 2
+                ;;
+            --skip-start)
+                SKIP_START=1
+                shift
+                ;;
+            --pack)
+                # 仅打包已安装目录
+                detect_os
+                create_user_and_dirs
+                pack_installed_redis
+                exit $?
+                ;;
+            --help|-h)
+                cat <<'HELP'
+Redis 安装脚本参数
+
+交互模式:
+  bash install_redis.sh
+
+无人值守（主从/哨兵/Cluster 脚本 SSH 远程调用）:
+  bash install_redis.sh --batch --tgz /tmp/redis-x.x.x.tar.gz \
+      --port 6379 --password 'xxx' --skip-start
+
+  bash install_redis.sh --batch --standalone --port 6379
+
+  bash install_redis.sh --batch --cluster --tgz /tmp/redis-x.x.x.tar.gz \
+      --port 6379 --password 'xxx' --skip-start
+
+可选:
+  --version VER              Redis 版本（默认 7.2.4）
+  --install-dir DIR          安装目录（默认 /usr/local/redis）
+  --data-dir DIR             数据目录（默认 /var/lib/redis）
+  --bind ADDR                绑定地址（默认 0.0.0.0）
+  --cluster                  Cluster 模式（cluster-enabled yes）
+  --cluster-node-timeout MS  集群节点超时毫秒（默认 5000）
+  --skip-start               只安装不启动
+  --pack                     将已安装目录打包到 package/ 便于 scp
+HELP
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+}
+
+batch_install_flow() {
+    BATCH_MODE=1
+    info "========== Redis 无人值守安装 =========="
+    info "模式: $DEPLOY_MODE"
+    info "版本: $REDIS_VERSION"
+    info "安装目录: $REDIS_INSTALL_DIR"
+    info "端口: $REDIS_PORT"
+    info "包: $REDIS_TGZ"
+    info "跳过启动: $SKIP_START"
+    echo
+
+    detect_os
+    install_dependencies
+    create_user_and_dirs
+
+    # 清理旧安装（可选）
+    if [ "$FORCE_REINSTALL" = "1" ] && [ -d "$REDIS_INSTALL_DIR" ]; then
+        warn "强制重装，清理 $REDIS_INSTALL_DIR"
+        rm -rf "$REDIS_INSTALL_DIR"
+    fi
+
+    deploy_redis
+
+    if [ "$DEPLOY_MODE" = "standalone" ]; then
+        generate_standalone_config
+    elif [ "$DEPLOY_MODE" = "cluster" ]; then
+        CLUSTER_ENABLED="yes"
+        generate_cluster_instance_config
+    fi
+    generate_systemd_service
+    start_standalone_service
+    save_config
+
+    success "无人值守安装完成"
+    return 0
 }
 
 # 主安装流程
 main() {
+    parse_batch_args "$@"
+
+    if [ "$BATCH_MODE" = "1" ]; then
+        batch_install_flow
+        exit $?
+    fi
+
     detect_os
     interactive_config
     install_dependencies
@@ -310,6 +591,9 @@ main() {
     deploy_redis
     if [ "$DEPLOY_MODE" = "standalone" ]; then
         generate_standalone_config
+    elif [ "$DEPLOY_MODE" = "cluster" ]; then
+        CLUSTER_ENABLED="yes"
+        generate_cluster_instance_config
     fi
     generate_systemd_service
     start_standalone_service
@@ -324,9 +608,13 @@ main() {
     if [ "$DEPLOY_MODE" = "standalone" ]; then
         success "服务名称: redis"
         success "管理命令: systemctl {start|stop|restart|status} redis"
+    elif [ "$DEPLOY_MODE" = "cluster" ]; then
+        success "实例服务: systemctl {start|stop|restart} redis@${REDIS_PORT}"
+        success "Cluster总线端口: $((REDIS_PORT + 10000))"
+        success "一键分片部署: bash $SCRIPT_DIR/setup_redis_cluster.sh"
     else
         success "多实例管理: systemctl {start|stop|restart} redis@端口"
-        success "哨兵配置请运行: bash $SCRIPT_DIR/setup_redis_sentinel.sh"
+        success "哨兵/主从一键部署: bash $SCRIPT_DIR/setup_redis_sentinel.sh"
     fi
     success "============================================"
     echo
@@ -334,21 +622,14 @@ main() {
 
 # 启动安装
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo "Redis 自动化安装脚本"
-    echo "用法: bash install_redis.sh [选项]"
-    echo
-    echo "选项:"
-    echo "  --help, -h    显示帮助信息"
-    echo "  --standalone  非交互式单机模式安装"
-    echo "  --sentinel    非交互式哨兵模式基础安装"
-    echo
-    exit 0
-elif [ "$1" = "--standalone" ]; then
-    DEPLOY_MODE="standalone"
-    main
-elif [ "$1" = "--sentinel" ]; then
-    DEPLOY_MODE="sentinel"
-    main
+    main --help
+elif [ "$1" = "--standalone" ] && [ -z "$2" ]; then
+    # 兼容旧用法：仅 --standalone 进入非交互
+    main --batch --standalone
+elif [ "$1" = "--sentinel" ] && [ -z "$2" ]; then
+    main --batch --sentinel
+elif [ "$1" = "--cluster" ] && [ -z "$2" ]; then
+    main --batch --cluster
 else
-    main
+    main "$@"
 fi
