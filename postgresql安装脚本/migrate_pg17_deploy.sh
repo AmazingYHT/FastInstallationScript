@@ -13,7 +13,7 @@
 #   5. initdb 全新 data 目录
 #   6. 覆盖源机带过来的 postgresql.conf / pg_hba.conf（自动替换路径）
 #   7. 安装 postgresql17.service 并启动
-#   8. 写 /etc/profile 环境变量（PG_HOME/PGDATA，与 install_postgresql.sh 一致）
+#   8. 写 /etc/profile.d/postgresql.sh 环境变量（PG_HOME/PGDATA，与 install_postgresql.sh 一致）
 #   9. CREATE EXTENSION postgis/vector/timescaledb 并验证
 #
 # 用法：在【目标机】上以 root 执行
@@ -274,21 +274,43 @@ if ! "$PG_HOME/bin/pg_isready" -p "$PORT" -q; then
 fi
 systemctl status postgresql17 --no-pager | head -5 || true
 
-# ---------- 8. 写环境变量到 /etc/profile（与 install_postgresql.sh 同一套变量名） ----------
-info "8/9 写入 PostgreSQL 环境变量到 /etc/profile"
-cp /etc/profile "/etc/profile.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-# 幂等：先剔除旧块再追加
-sed -i '/# PostgreSQL Environment/,/# End PostgreSQL Environment/d' /etc/profile
-cat >> /etc/profile <<EOF
+# ---------- 8. 写环境变量到 /etc/profile.d/postgresql.sh（与 install_postgresql.sh 同一套机制） ----------
+info "8/9 写入 PostgreSQL 环境变量（/etc/profile.d/postgresql.sh）"
 
-# PostgreSQL Environment
+# 8.1 一次性迁移清理老版本写入 /etc/profile 的历史段落（带备份；幂等）
+if [ -f /etc/profile ] && grep -qE "PostgreSQL Environment|PG_?HOME" /etc/profile 2>/dev/null; then
+  cp /etc/profile "/etc/profile.backup.$(date +%Y%m%d%H%M%S_%N)" 2>/dev/null || true
+  sed -i 's/\r$//' /etc/profile
+  sed -i -E \
+    -e '/# PostgreSQL Environment Variables[[:space:]]*$/,/^[[:space:]]*$/d' \
+    -e '/# PostgreSQL Environment[[:space:]]*$/,/# End PostgreSQL Environment[[:space:]]*$/d' \
+    /etc/profile
+  sed -i -E '\#(^|[^A-Za-z0-9_])PG_?HOME#d' /etc/profile
+  sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
+fi
+
+# 8.2 原子写入独立 profile.d 文件
+mkdir -p /etc/profile.d
+_pd_tmp=$(mktemp /etc/profile.d/.postgresql.XXXXXX 2>/dev/null || echo "/etc/profile.d/.postgresql.$$")
+cat > "$_pd_tmp" <<EOF
+# PostgreSQL Environment —— 由 migrate_pg17_deploy.sh 自动管理，卸载时自动删除，请勿手动编辑
 export PG_HOME=$PG_HOME
 export PGDATA=$PGDATA
-export PATH=\$PG_HOME/bin:\$PATH
-export MANPATH=\$PG_HOME/share/man:\$MANPATH
-# End PostgreSQL Environment
+# case 守卫：重复加载不重复叠加 PATH/MANPATH/LD_LIBRARY_PATH
+case ":\$PATH:" in *":\$PG_HOME/bin:"*) ;; *) export PATH="\$PG_HOME/bin:\$PATH" ;; esac
+case ":\$MANPATH:" in *":\$PG_HOME/share/man:"*) ;; *) export MANPATH="\$PG_HOME/share/man:\$MANPATH" ;; esac
+case ":\$LD_LIBRARY_PATH:" in *":\$PG_HOME/lib:"*) ;; *) export LD_LIBRARY_PATH="\$PG_HOME/lib:\$LD_LIBRARY_PATH" ;; esac
 EOF
-info "    已写入 PG_HOME=$PG_HOME、PGDATA=$PGDATA（重新登录或 source /etc/profile 后生效）"
+mv -f "$_pd_tmp" /etc/profile.d/postgresql.sh
+chmod 644 /etc/profile.d/postgresql.sh
+
+# 8.3 常用工具软链接到 /usr/local/bin（非登录 shell 也可用）
+mkdir -p /usr/local/bin
+for _c in psql pg_dump pg_dumpall pg_restore pg_ctl initdb pg_isready pg_config \
+          createdb createuser dropdb dropuser vacuumdb reindexdb clusterdb pg_basebackup; do
+  [ -x "$PG_HOME/bin/$_c" ] && ln -sf "$PG_HOME/bin/$_c" "/usr/local/bin/$_c"
+done
+info "    已写入 PG_HOME=$PG_HOME、PGDATA=$PGDATA（重新登录或 source /etc/profile.d/postgresql.sh 后生效）"
 
 # ---------- 9. 创建扩展并验证 ----------
 info "9/9 创建扩展并验证"

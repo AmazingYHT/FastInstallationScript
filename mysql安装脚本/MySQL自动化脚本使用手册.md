@@ -795,21 +795,50 @@ systemctl status mysql
 ### 数据库连接
 
 ```bash
-# 命令行连接
-/path/to/bin/mysql -u root -p
+# 命令行连接（安装时已写 /etc/profile.d/mysql.sh 并创建 /usr/local/bin/mysql 软链接，可直接使用）
+mysql -u root -p
 
 # 连接指定数据库
-/path/to/bin/mysql -u root -p -D mydb
+mysql -u root -p -D mydb
 
 # 执行SQL命令
-/path/to/bin/mysql -u root -p -e "SELECT version();"
+mysql -u root -p -e "SELECT version();"
 
 # 指定端口连接
-/path/to/bin/mysql -u root -p -P 3307
+mysql -u root -p -P 3307
 
 # 指定主机连接
-/path/to/bin/mysql -u root -p -h 192.168.1.100
+mysql -u root -p -h 192.168.1.100
 ```
+
+**环境变量存放位置**：脚本把环境变量写入独立文件 `/etc/profile.d/mysql.sh`（CentOS/RHEL/Rocky/Ubuntu/Debian 的标准 `/etc/profile` 会在登录时自动加载该目录），每个组件一个文件，安装写入、卸载直接删除，互不影响。
+
+写入的文件内容如下（`MYSQL_HOME` 会替换为实际安装目录）：
+
+```bash
+# MySQL Environment —— 由 install_mysql.sh 自动管理，卸载时自动删除，请勿手动编辑
+export MYSQL_HOME=/mnt/data/mysql/mysql-8.4.11
+# case 守卫：重复加载不重复叠加 PATH
+case ":$PATH:" in *":$MYSQL_HOME/bin:"*) ;; *) export PATH="$MYSQL_HOME/bin:$PATH" ;; esac
+```
+
+**验证环境变量是否生效**：
+
+```bash
+# 查看 MYSQL_HOME（应输出类似 /mnt/data/mysql/mysql-8.4.11）
+echo $MYSQL_HOME
+
+# 查看 mysql 实际路径（应输出 $MYSQL_HOME/bin/mysql）
+which mysql
+
+# 查看 PATH 中是否包含 MySQL bin 目录
+echo "$PATH" | tr ':' '\n' | grep mysql
+```
+
+> - `case` 是去重守卫：无论 `source` 多少次、登录多少次，bin 目录在 PATH 中只出现一次，不会越来越长。
+> - 安装时还会把 `mysql`、`mysqldump`、`mysqladmin`、`mysqlcheck`、`mysqlshow`、`mysqlimport`、`mysqlbinlog`、`mysqldumpslow`、`mysqlslap`、`mysql_config_editor`、`mysqlpump` 共 11 个命令软链接到 `/usr/local/bin`（该目录默认在 PATH 中、**当前终端立即生效**，无需重新登录）。
+> - 老版本脚本曾写入 `/etc/profile`，新版安装时会自动迁移清理（修改前备份为 `/etc/profile.backup.*`），清理完成后不再修改 `/etc/profile`。
+> - 卸载时直接 `rm /etc/profile.d/mysql.sh` 并删除 `/usr/local/bin` 下指向本次安装目录的软链接，不影响 Redis、PostgreSQL 等其他组件。
 
 ### SQL常用命令
 

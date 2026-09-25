@@ -1149,8 +1149,12 @@ systemctl status postgresql17
 ### 数据库连接
 
 ```bash
-# 命令行连接（依赖 /etc/profile 中的 PATH 环境变量，需重新登录或 source /etc/profile 后生效）
+# 命令行连接（环境变量在 /etc/profile.d/postgresql.sh，新登录终端自动生效；
+# 或安装时已在 /usr/local/bin 创建 psql 软链接，当前终端也可直接使用）
 psql -U postgres -W
+
+# 当前已打开的旧终端可手动加载：
+source /etc/profile.d/postgresql.sh
 
 # 若提示 psql 命令不存在，使用完整路径连接（-h 指定主机、-p 指定端口、-d 指定数据库）
 <安装目录>/bin/psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -W
@@ -1161,6 +1165,41 @@ psql -U postgres -d mydb -W
 # 执行SQL命令
 psql -U postgres -c "SELECT version();"
 ```
+
+**环境变量存放位置**：脚本把环境变量写入独立文件 `/etc/profile.d/postgresql.sh`（CentOS/RHEL/Rocky/Ubuntu/Debian 的标准 `/etc/profile` 会在登录时自动加载该目录），每个组件一个文件，安装写入、卸载直接删除，互不影响。
+
+写入的文件内容如下（`PG_HOME`、`PGDATA` 会替换为实际安装目录和数据目录）：
+
+```bash
+# PostgreSQL Environment —— 由 install_postgresql.sh 自动管理，卸载时自动删除，请勿手动编辑
+export PG_HOME=/mnt/data/postgresql/postgresql-18.6
+export PGDATA=/mnt/data/postgresql/data
+# case 守卫：重复加载不重复叠加 PATH/MANPATH/LD_LIBRARY_PATH
+case ":$PATH:" in *":$PG_HOME/bin:"*) ;; *) export PATH="$PG_HOME/bin:$PATH" ;; esac
+case ":$MANPATH:" in *":$PG_HOME/share/man:"*) ;; *) export MANPATH="$PG_HOME/share/man:$MANPATH" ;; esac
+case ":$LD_LIBRARY_PATH:" in *":$PG_HOME/lib:"*) ;; *) export LD_LIBRARY_PATH="$PG_HOME/lib:$LD_LIBRARY_PATH" ;; esac
+```
+
+**验证环境变量是否生效**：
+
+```bash
+# 查看 PG_HOME（应输出类似 /mnt/data/postgresql/postgresql-18.6）
+echo $PG_HOME
+
+# 查看 PGDATA（应输出数据目录，如 /mnt/data/postgresql/data）
+echo $PGDATA
+
+# 查看 psql 实际路径（应输出 $PG_HOME/bin/psql）
+which psql
+
+# 查看 PATH 中是否包含 PostgreSQL bin 目录
+echo "$PATH" | tr ':' '\n' | grep postgresql
+```
+
+> - `case` 是去重守卫：无论 `source` 多少次、登录多少次，bin/lib/man 目录在各自变量中只出现一次，不会越来越长。
+> - 安装时还会把 `psql`、`pg_dump`、`pg_dumpall`、`pg_restore`、`pg_ctl`、`initdb`、`pg_isready`、`pg_config`、`createdb`、`createuser`、`dropdb`、`dropuser`、`vacuumdb`、`reindexdb`、`clusterdb`、`pg_basebackup` 共 16 个命令软链接到 `/usr/local/bin`（该目录默认在 PATH 中、**当前终端立即生效**，无需重新登录）。
+> - 老版本脚本曾写入 `/etc/profile`，新版安装时会自动迁移清理（修改前备份为 `/etc/profile.backup.*`），清理完成后不再修改 `/etc/profile`。
+> - 卸载时直接 `rm /etc/profile.d/postgresql.sh` 并删除 `/usr/local/bin` 下指向本次安装目录的软链接，不影响 Redis、MySQL 等其他组件。
 
 ### SQL常用命令
 

@@ -190,9 +190,47 @@ bash install_redis.sh --batch --standalone --port 6379
 # 查看状态
 systemctl status redis
 
-# 连接（默认安装目录为 /mnt/data/redis/redis-<版本>）
-/mnt/data/redis/redis-7.2.4/bin/redis-cli -p 6379
+# 连接（安装时已配置好环境变量，新终端可直接使用 redis-cli）
+redis-cli -p 6379
+
+# 当前已打开的终端加载一次环境变量：
+source /etc/profile.d/redis.sh
+redis-cli -p 6379
 ```
+
+**环境变量存放位置**：脚本把环境变量写入独立文件 `/etc/profile.d/redis.sh`（CentOS/RHEL/Rocky/Ubuntu/Debian 的标准 `/etc/profile` 会在登录时自动加载该目录），每个组件一个文件，安装写入、卸载直接删除，互不影响。
+
+写入的文件内容如下（`REDIS_HOME` 会替换为实际安装目录）：
+
+```bash
+# Redis Environment —— 由 install_redis.sh 自动管理，卸载时自动删除，请勿手动编辑
+export REDIS_HOME=/mnt/data/redis/redis-8.8.3
+# case 守卫：重复加载不重复叠加 PATH
+case ":$PATH:" in *":$REDIS_HOME/bin:"*) ;; *) export PATH="$REDIS_HOME/bin:$PATH" ;; esac
+```
+
+**验证环境变量是否生效**：
+
+```bash
+# 查看 REDIS_HOME（应输出类似 /mnt/data/redis/redis-8.8.3）
+echo $REDIS_HOME
+
+# 查看 redis-cli 实际路径（应输出 $REDIS_HOME/bin/redis-cli）
+which redis-cli
+
+# 查看 PATH 中是否包含 Redis bin 目录
+echo "$PATH" | tr ':' '\n' | grep redis
+```
+
+> - `case` 是去重守卫：无论 `source` 多少次、登录多少次，bin 目录在 PATH 中只出现一次，不会越来越长。
+> - 安装时还会把 `redis-server`、`redis-cli`、`redis-benchmark`、`redis-check-aof`、`redis-check-rdb`、`redis-sentinel` 共 6 个命令软链接到 `/usr/local/bin`（该目录默认在 PATH 中、**当前终端立即生效**，无需重新登录）。
+> - 老版本脚本曾写入 `/etc/profile`，新版安装时会自动迁移清理（修改前备份为 `/etc/profile.backup.*`），清理完成后不再修改 `/etc/profile`。
+> - 卸载时直接 `rm /etc/profile.d/redis.sh` 并删除 `/usr/local/bin` 下指向本次安装目录的软链接，不影响 MySQL、PostgreSQL 等其他组件。
+> - 旧版本脚本安装的机器想立即修复命令，二选一：
+> ```bash
+> source /etc/profile.d/redis.sh 2>/dev/null || { export REDIS_HOME=/mnt/data/redis/redis-8.8.3; export PATH=$REDIS_HOME/bin:$PATH; }
+> # 或：ln -sf /mnt/data/redis/redis-8.8.3/bin/redis-* /usr/local/bin/
+> ```
 
 ### 2. 一键主从 + Sentinel（推荐）
 

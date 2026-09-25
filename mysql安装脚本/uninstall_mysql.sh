@@ -348,25 +348,29 @@ cleanup_environment() {
     echo ""
     echo -e "${CYAN}============ 清理环境变量 ============${NC}"
 
-    # 清理 /etc/profile
-    if grep -q "MySQL\|MYSQL" /etc/profile 2>/dev/null; then
-        cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S)
-        sed -i '/# MySQL Environment/,/# End MySQL Environment/d' /etc/profile
-        sed -i '/# MySQL Environment Variables/,/^$/d' /etc/profile
-        echo -e "${GREEN}  ✓ 已清理 /etc/profile 中的MySQL配置${NC}"
-        echo -e "${CYAN}  (已备份到 /etc/profile.backup.*)${NC}"
-    fi
-
-    # 清理 /etc/profile.d/
+    # 删除独立 profile.d 文件（新版脚本的环境变量存放位置）
     if [ -f "/etc/profile.d/mysql.sh" ]; then
         rm -f /etc/profile.d/mysql.sh
         echo -e "${GREEN}  ✓ 已删除 /etc/profile.d/mysql.sh${NC}"
     fi
 
-    # 立即生效（清除当前会话中的MySQL相关环境变量）
-    unset MYSQL_HOME 2>/dev/null
-    source /etc/profile > /dev/null 2>&1
-    echo -e "${GREEN}  ✓ 环境变量已立即生效${NC}"
+    # 清理老版本写入 /etc/profile 的历史 MySQL 段（带备份；兼容旧A段/新B段/孤儿行/畸形行）
+    if [ -f /etc/profile ] && grep -qE "MySQL Environment|MYSQL_HOME|^[[:space:]]*export[[:space:]]+[\$/]" /etc/profile 2>/dev/null; then
+        # 备份文件名含纳秒，避免同一秒内连续卸载/安装多个组件时备份互相覆盖
+        cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S_%N)
+        sed -i 's/\r$//' /etc/profile
+        sed -i -E \
+            -e '/# MySQL Environment Variables[[:space:]]*$/,/^[[:space:]]*$/d' \
+            -e '/# MySQL Environment[[:space:]]*$/,/# End MySQL Environment[[:space:]]*$/d' \
+            /etc/profile
+        sed -i -E '\#(^|[^A-Za-z0-9_])MYSQL_HOME#d' /etc/profile
+        sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
+        echo -e "${GREEN}  ✓ 已清理 /etc/profile 中的历史 MySQL 配置（已备份到 /etc/profile.backup.*）${NC}"
+    fi
+
+    # 只清除当前会话变量，不再 source 整个 /etc/profile（避免触发其他组件的历史坏段）
+    unset MYSQL_HOME 2>/dev/null || true
+    echo -e "${GREEN}  ✓ 环境变量已清理（新登录终端生效）${NC}"
 }
 
 # ======================== 删除软链接 ========================
@@ -387,6 +391,24 @@ remove_symlinks() {
         if [ -L "$link" ]; then
             rm -f "$link"
             echo -e "${GREEN}  ✓ 已删除: $link${NC}"
+        fi
+    done
+
+    # 清理新版安装脚本创建的 /usr/local/bin 软链接：只删指向版本化安装目录
+    # （.../mysql-<版本>/bin/...）的符号链接，不动发行版自带的实体文件
+    local target
+    for link in /usr/local/bin/mysql /usr/local/bin/mysqldump /usr/local/bin/mysqladmin \
+                /usr/local/bin/mysqlcheck /usr/local/bin/mysqlshow /usr/local/bin/mysqlimport \
+                /usr/local/bin/mysqlbinlog /usr/local/bin/mysqldumpslow /usr/local/bin/mysqlslap \
+                /usr/local/bin/mysql_config_editor /usr/local/bin/mysqlpump; do
+        if [ -L "$link" ]; then
+            target=$(readlink -f "$link" 2>/dev/null)
+            case "$target" in
+                */mysql-*/bin/*)
+                    rm -f "$link"
+                    echo -e "${GREEN}  ✓ 已删除: $link -> $target${NC}"
+                    ;;
+            esac
         fi
     done
 

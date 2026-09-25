@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 DEFAULT_PG_VERSION="18.1"
 DEFAULT_PG_USER="postgres"
 DEFAULT_PG_GROUP="postgres"
-DEFAULT_PG_HOME="/data/di/postgresql"  # 修改为与原脚本一致
+DEFAULT_PG_HOME="/mnt/data/postgresql"  # 与install_postgresql.sh默认安装根目录一致
 DEFAULT_DAYS_TO_KEEP=7
 DEFAULT_ARCHIVE_DIR=""
 
@@ -65,20 +65,32 @@ show_version() {
 }
 
 # 定义profile文件列表（全局变量）
-PROFILE_FILES=("/etc/profile" "/etc/bashrc" "/home/$DEFAULT_PG_USER/.bash_profile" "/home/$DEFAULT_PG_USER/.bashrc" "/etc/profile.d/postgres.sh" "/etc/profile.d/pgsql.sh")
+PROFILE_FILES=("/etc/profile.d/postgresql.sh" "/etc/profile" "/etc/bashrc" "/home/$DEFAULT_PG_USER/.bash_profile" "/home/$DEFAULT_PG_USER/.bashrc" "/etc/profile.d/postgres.sh" "/etc/profile.d/pgsql.sh")
 
 # 定义常见安装路径列表（全局变量）
 COMMON_PATHS=("/usr/local/pgsql" "/usr/local/postgresql" "/opt/pgsql" "/opt/postgresql" "/var/lib/pgsql")
 
+# 从环境变量文件中提取指定变量的值
+# 支持格式：export VAR=value / export VAR="value" / export VAR='value'  # comment
+_extract_pg_var() {
+    local file="$1" var="$2"
+    grep -E "^[[:space:]]*export[[:space:]]+${var}[[:space:]]*=" "$file" 2>/dev/null \
+        | head -1 \
+        | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^["'\'']//; s/["'\'']$//'
+}
+
 # 从profile文件中读取PostgreSQL信息
+# 优先级：当前环境变量 > /etc/profile.d/postgresql.sh（install脚本写入）> 其他profile文件 > 常见安装路径
 read_pg_profile() {
     # 临时设置区域设置以避免警告
     export LC_ALL=C
     
-    # 首先尝试从当前环境中读取
+    local primary_profile="/etc/profile.d/postgresql.sh"
+    
+    # 1. 首先尝试从当前环境变量中读取（最高优先级）
     if [[ -n "$PG_HOME" ]]; then
         DEFAULT_PG_HOME="$PG_HOME"
-        # 如果PG_HOME包含bin/postgres，则它也是安装目录
+        # install_postgresql.sh 中 PG_HOME 即为安装目录（含 bin/postgres）
         if [[ -f "$PG_HOME/bin/postgres" ]]; then
             DEFAULT_PG_INSTALL_DIR="$PG_HOME"
         fi
@@ -90,45 +102,70 @@ read_pg_profile() {
         [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}从环境变量中读取到 PGDATA: $PGDATA${NC}"
     fi
     
-    # 从profile文件中查找
-    for profile_file in "${PROFILE_FILES[@]}"; do
-        if [[ -f "$profile_file" ]]; then
-            # 查找PostgreSQL相关的环境变量
-            if grep -q "PG_HOME\|POSTGRES_HOME\|PGDATA" "$profile_file" 2>/dev/null; then
-                [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}从 $profile_file 中读取PostgreSQL配置信息...${NC}"
-                
-                # 提取PG_HOME - 改进正则表达式
-                local pghome=$(grep -E "export[[:space:]]+PGHOME[[:space:]]*=|export[[:space:]]+PG_HOME[[:space:]]*=|export[[:space:]]+POSTGRES_HOME[[:space:]]*=" "$profile_file" 2>/dev/null | head -1 | sed -E 's/.*=[[:space:]]*([^[:space:]]*).*/\1/' | sed 's/"//g' | sed "s/'//g")
+    # 2. 优先从 /etc/profile.d/postgresql.sh 读取（install_postgresql.sh 写入的标准位置）
+    #    该文件中：PG_HOME = 编译/安装目录（含 bin/postgres），PGDATA = 数据目录
+    if [[ -f "$primary_profile" ]]; then
+        [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}从 $primary_profile 读取PostgreSQL配置...${NC}"
+        
+        local pghome="$(_extract_pg_var "$primary_profile" PG_HOME)"
+        [[ -z "$pghome" ]] && pghome="$(_extract_pg_var "$primary_profile" PGHOME)"
+        [[ -z "$pghome" ]] && pghome="$(_extract_pg_var "$primary_profile" POSTGRES_HOME)"
+        
+        local pgdata="$(_extract_pg_var "$primary_profile" PGDATA)"
+        
+        if [[ -n "$pghome" && -d "$pghome" ]]; then
+            DEFAULT_PG_HOME="$pghome"
+            if [[ -f "$pghome/bin/postgres" ]]; then
+                DEFAULT_PG_INSTALL_DIR="$pghome"
+            fi
+            [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}找到有效的 PG_HOME（编译目录）: $pghome${NC}"
+        fi
+        
+        if [[ -n "$pgdata" && -d "$pgdata" ]]; then
+            DEFAULT_PG_DATA_DIR="$pgdata"
+            [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}找到有效的 PGDATA（数据目录）: $pgdata${NC}"
+        fi
+    fi
+    
+    # 3. 仅当主配置文件未能提供完整路径时，回退到其他 profile 文件
+    if [[ -z "$DEFAULT_PG_INSTALL_DIR" || -z "$DEFAULT_PG_DATA_DIR" ]]; then
+        for profile_file in "${PROFILE_FILES[@]}"; do
+            # 跳过已处理的主配置文件
+            [[ "$profile_file" == "$primary_profile" ]] && continue
+            [[ -f "$profile_file" ]] || continue
+            
+            if ! grep -qE "PG_HOME|POSTGRES_HOME|PGHOME|PGDATA" "$profile_file" 2>/dev/null; then
+                continue
+            fi
+            
+            [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}回退从 $profile_file 读取PostgreSQL配置...${NC}"
+            
+            # 仅在尚未获取到时才提取，避免覆盖已得到的正确值
+            if [[ -z "$DEFAULT_PG_HOME" ]]; then
+                local pghome="$(_extract_pg_var "$profile_file" PG_HOME)"
+                [[ -z "$pghome" ]] && pghome="$(_extract_pg_var "$profile_file" PGHOME)"
+                [[ -z "$pghome" ]] && pghome="$(_extract_pg_var "$profile_file" POSTGRES_HOME)"
                 if [[ -n "$pghome" && -d "$pghome" ]]; then
                     DEFAULT_PG_HOME="$pghome"
-                    # 如果PGHOME包含bin/postgres，则它也是安装目录
-                    if [[ -f "$pghome/bin/postgres" ]]; then
-                        DEFAULT_PG_INSTALL_DIR="$pghome"
-                    fi
+                    [[ -f "$pghome/bin/postgres" ]] && DEFAULT_PG_INSTALL_DIR="$pghome"
                     [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}找到有效的 PG_HOME: $pghome${NC}"
                 fi
-                
-                # 提取PGDATA - 改进正则表达式
-                local pgdata=$(grep -E "export[[:space:]]+PGDATA[[:space:]]*=" "$profile_file" 2>/dev/null | head -1 | sed -E 's/.*=[[:space:]]*([^[:space:]]*).*/\1/' | sed 's/"//g' | sed "s/'//g")
+            fi
+            
+            if [[ -z "$DEFAULT_PG_DATA_DIR" ]]; then
+                local pgdata="$(_extract_pg_var "$profile_file" PGDATA)"
                 if [[ -n "$pgdata" && -d "$pgdata" ]]; then
                     DEFAULT_PG_DATA_DIR="$pgdata"
                     [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}找到有效的 PGDATA: $pgdata${NC}"
                 fi
-                
-                # 提取PATH中的PostgreSQL路径 - 改进逻辑
-                local pg_path=$(grep -E "PATH.*postgres|PATH.*pgsql" "$profile_file" 2>/dev/null | head -1)
-                if [[ -n "$pg_path" ]]; then
-                    local install_dir=$(echo "$pg_path" | grep -oE '/[a-zA-Z0-9/_-]+postgresql[0-9.]*' | head -1)
-                    if [[ -n "$install_dir" && -d "$install_dir" ]]; then
-                        DEFAULT_PG_INSTALL_DIR="$install_dir"
-                        [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}找到有效的安装目录: $install_dir${NC}"
-                    fi
-                fi
             fi
-        fi
-    done
+            
+            # 两个路径都已获取则提前结束
+            [[ -n "$DEFAULT_PG_INSTALL_DIR" && -n "$DEFAULT_PG_DATA_DIR" ]] && break
+        done
+    fi
     
-    # 尝试从常见安装位置查找
+    # 4. 尝试从常见安装位置查找（仅当未找到安装目录时）
     if [[ -z "$DEFAULT_PG_INSTALL_DIR" ]]; then
         for path in "${COMMON_PATHS[@]}"; do
             if [[ -d "$path" && -f "$path/bin/postgres" ]]; then
@@ -140,7 +177,7 @@ read_pg_profile() {
         done
     fi
     
-    # 如果没有找到数据目录，设置默认值
+    # 5. 数据目录兜底
     if [[ -z "$DEFAULT_PG_DATA_DIR" ]]; then
         if [[ -n "$DEFAULT_PG_HOME" ]]; then
             DEFAULT_PG_DATA_DIR="${DEFAULT_PG_HOME}/data"
@@ -150,10 +187,9 @@ read_pg_profile() {
         [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}使用默认数据目录: $DEFAULT_PG_DATA_DIR${NC}"
     fi
     
-    # 如果没有找到安装目录，设置默认值
+    # 6. 安装目录兜底
     if [[ -z "$DEFAULT_PG_INSTALL_DIR" ]]; then
         if [[ -n "$DEFAULT_PG_HOME" ]]; then
-            # 检查PG_HOME是否已经是完整的安装目录（包含bin/postgres）
             if [[ -f "$DEFAULT_PG_HOME/bin/postgres" ]]; then
                 DEFAULT_PG_INSTALL_DIR="$DEFAULT_PG_HOME"
                 [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}使用PG_HOME作为安装目录: $DEFAULT_PG_INSTALL_DIR${NC}"
@@ -167,10 +203,10 @@ read_pg_profile() {
         fi
     fi
     
-    # 如果没有找到PG_HOME，设置默认值
+    # 7. PG_HOME 兜底（未显式设置时取安装目录，与 install_postgresql.sh 约定一致）
     if [[ -z "$DEFAULT_PG_HOME" ]]; then
-        DEFAULT_PG_HOME="/usr/local/pgsql"
-        [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}使用默认PG_HOME: $DEFAULT_PG_HOME${NC}"
+        DEFAULT_PG_HOME="$DEFAULT_PG_INSTALL_DIR"
+        [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}使用安装目录作为PG_HOME: $DEFAULT_PG_HOME${NC}"
     fi
     
     # 恢复区域设置
@@ -189,23 +225,23 @@ confirm_configuration() {
     COMMIT_SIBLINGS="5"
     
     echo -e "${YELLOW}请确认PostgreSQL WAL归档配置:${NC}"
-    echo -e "PostgreSQL版本: ${GREEN}$DEFAULT_PG_VERSION${NC}"
-    echo -e "用户名: ${GREEN}$DEFAULT_PG_USER${NC}"
-    echo -e "用户组: ${GREEN}$DEFAULT_PG_GROUP${NC}"
-    echo -e "编译目录: ${GREEN}$DEFAULT_PG_INSTALL_DIR${NC}"
-    echo -e "数据目录: ${GREEN}$DEFAULT_PG_DATA_DIR${NC}"
-    echo -e "归档保留天数: ${GREEN}$DEFAULT_DAYS_TO_KEEP${NC}"
+    echo -e "PostgreSQL版本: ${GREEN}${PG_VERSION:-$DEFAULT_PG_VERSION}${NC}"
+    echo -e "用户名: ${GREEN}${PG_USER:-$DEFAULT_PG_USER}${NC}"
+    echo -e "用户组: ${GREEN}${PG_GROUP:-$DEFAULT_PG_GROUP}${NC}"
+    echo -e "编译目录: ${GREEN}${PG_INSTALL_DIR:-$DEFAULT_PG_INSTALL_DIR}${NC}"
+    echo -e "数据目录: ${GREEN}${PG_DATA_DIR:-$DEFAULT_PG_DATA_DIR}${NC}"
+    echo -e "归档保留天数: ${GREEN}${DAYS_TO_KEEP:-$DEFAULT_DAYS_TO_KEEP}${NC}"
     echo ""
     
     read -p "是否使用自动检测的配置? [y/N]: " use_auto
     
     if [[ $use_auto =~ ^[Yy]$ ]]; then
-        PG_VERSION=$DEFAULT_PG_VERSION
-        PG_USER=$DEFAULT_PG_USER
-        PG_GROUP=$DEFAULT_PG_GROUP
-        PG_INSTALL_DIR=$DEFAULT_PG_INSTALL_DIR
-        PG_DATA_DIR=$DEFAULT_PG_DATA_DIR
-        DAYS_TO_KEEP=$DEFAULT_DAYS_TO_KEEP
+        PG_VERSION=${PG_VERSION:-$DEFAULT_PG_VERSION}
+        PG_USER=${PG_USER:-$DEFAULT_PG_USER}
+        PG_GROUP=${PG_GROUP:-$DEFAULT_PG_GROUP}
+        PG_INSTALL_DIR=${PG_INSTALL_DIR:-$DEFAULT_PG_INSTALL_DIR}
+        PG_DATA_DIR=${PG_DATA_DIR:-$DEFAULT_PG_DATA_DIR}
+        DAYS_TO_KEEP=${DAYS_TO_KEEP:-$DEFAULT_DAYS_TO_KEEP}
         
         echo -e "${YELLOW}配置WAL参数（按Enter使用默认值，输入新值后按Enter确认）:${NC}"
         echo ""
@@ -252,23 +288,23 @@ confirm_configuration() {
         echo -e "设置: ${GREEN}$COMMIT_SIBLINGS${NC}"
         echo ""
     else
-        read -p "请输入PostgreSQL版本 [$DEFAULT_PG_VERSION]: " input_version
-        PG_VERSION=${input_version:-$DEFAULT_PG_VERSION}
+        read -p "请输入PostgreSQL版本 [$PG_VERSION]: " input_version
+        PG_VERSION=${input_version:-$PG_VERSION}
         
-        read -p "请输入用户名 [$DEFAULT_PG_USER]: " input_user
-        PG_USER=${input_user:-$DEFAULT_PG_USER}
+        read -p "请输入用户名 [$PG_USER]: " input_user
+        PG_USER=${input_user:-$PG_USER}
         
-        read -p "请输入用户组 [$DEFAULT_PG_GROUP]: " input_group
-        PG_GROUP=${input_group:-$DEFAULT_PG_GROUP}
+        read -p "请输入用户组 [$PG_GROUP]: " input_group
+        PG_GROUP=${input_group:-$PG_GROUP}
         
-        read -p "请输入编译目录 [$DEFAULT_PG_INSTALL_DIR]: " input_install_dir
-        PG_INSTALL_DIR=${input_install_dir:-$DEFAULT_PG_INSTALL_DIR}
+        read -p "请输入编译目录 [$PG_INSTALL_DIR]: " input_install_dir
+        PG_INSTALL_DIR=${input_install_dir:-$PG_INSTALL_DIR}
         
-        read -p "请输入数据目录 [$DEFAULT_PG_DATA_DIR]: " input_data_dir
-        PG_DATA_DIR=${input_data_dir:-$DEFAULT_PG_DATA_DIR}
+        read -p "请输入数据目录 [$PG_DATA_DIR]: " input_data_dir
+        PG_DATA_DIR=${input_data_dir:-$PG_DATA_DIR}
         
-        read -p "请输入归档保留天数 [$DEFAULT_DAYS_TO_KEEP]: " input_days
-        DAYS_TO_KEEP=${input_days:-$DEFAULT_DAYS_TO_KEEP}
+        read -p "请输入归档保留天数 [$DAYS_TO_KEEP]: " input_days
+        DAYS_TO_KEEP=${input_days:-$DAYS_TO_KEEP}
         
         echo ""
         echo -e "${YELLOW}WAL参数配置（按Enter使用默认值，输入新值后按Enter确认）:${NC}"
@@ -427,59 +463,53 @@ configure_wal_archive() {
     fi
     
     # 修改postgresql.conf文件
-    sed -i.bak "s/#wal_level = minimal/wal_level = replica/" "$PG_DATA_DIR/postgresql.conf"
-    sed -i.bak "s/#archive_mode = off/archive_mode = on/" "$PG_DATA_DIR/postgresql.conf"
-    sed -i.bak "s|#archive_command = ''|archive_command = 'cp %p $PG_ARCHIVE_DIR/%f'|" "$PG_DATA_DIR/postgresql.conf"
+    # 注意：PG14+ 默认配置为 "#wal_level = replica"（非 minimal），必须用正则匹配注释/未注释行
+    sed -i.bak -E "s/^[#[:space:]]*wal_level[[:space:]]*=.*/wal_level = replica/" "$PG_DATA_DIR/postgresql.conf"
+    sed -i.bak -E "s/^[#[:space:]]*archive_mode[[:space:]]*=.*/archive_mode = on/" "$PG_DATA_DIR/postgresql.conf"
+    sed -i.bak -E "s|^[#[:space:]]*archive_command[[:space:]]*=.*|archive_command = 'cp %p $PG_ARCHIVE_DIR/%f'|" "$PG_DATA_DIR/postgresql.conf"
+    # sed 无匹配时也返回 0，参数完全不存在时需用 grep 检测后追加兜底
+    grep -qE "^wal_level[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "wal_level = replica" >> "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^archive_mode[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "archive_mode = on" >> "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^archive_command[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "archive_command = 'cp %p $PG_ARCHIVE_DIR/%f'" >> "$PG_DATA_DIR/postgresql.conf"
     
     # 如果pg_archivecleanup存在，添加清理命令
     if [[ -n "$PG_ARCHIVECLEANUP_CMD" ]]; then
-        sed -i.bak "s|#archive_cleanup_command = ''|$PG_ARCHIVECLEANUP_CMD|" "$PG_DATA_DIR/postgresql.conf"
+        sed -i.bak -E "s|^[#[:space:]]*archive_cleanup_command[[:space:]]*=.*|$PG_ARCHIVECLEANUP_CMD|" "$PG_DATA_DIR/postgresql.conf"
+        grep -qE "^archive_cleanup_command[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "$PG_ARCHIVECLEANUP_CMD" >> "$PG_DATA_DIR/postgresql.conf"
     fi
     
     echo -e "${YELLOW}正在配置WAL参数...${NC}"
     
     # 替换WAL配置参数
+    # 注意：PG默认配置中参数多为注释状态（如 "#max_wal_size = 1GB"），需正则匹配注释行
+    # sed 无匹配时返回 0，故用 grep 检测不存在后追加兜底
     echo -e "${YELLOW}设置 max_wal_size = $MAX_WAL_SIZE${NC}"
-    sed -i.bak "s/^max_wal_size\s*=.*/max_wal_size = $MAX_WAL_SIZE/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 max_wal_size${NC}"
-        echo "max_wal_size = $MAX_WAL_SIZE" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*max_wal_size[[:space:]]*=.*/max_wal_size = $MAX_WAL_SIZE/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^max_wal_size[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "max_wal_size = $MAX_WAL_SIZE" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}设置 min_wal_size = $MIN_WAL_SIZE${NC}"
-    sed -i.bak "s/^min_wal_size\s*=.*/min_wal_size = $MIN_WAL_SIZE/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 min_wal_size${NC}"
-        echo "min_wal_size = $MIN_WAL_SIZE" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*min_wal_size[[:space:]]*=.*/min_wal_size = $MIN_WAL_SIZE/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^min_wal_size[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "min_wal_size = $MIN_WAL_SIZE" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}设置 checkpoint_completion_target = $CHECKPOINT_COMPLETION_TARGET${NC}"
-    sed -i.bak "s/^checkpoint_completion_target\s*=.*/checkpoint_completion_target = $CHECKPOINT_COMPLETION_TARGET/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 checkpoint_completion_target${NC}"
-        echo "checkpoint_completion_target = $CHECKPOINT_COMPLETION_TARGET" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*checkpoint_completion_target[[:space:]]*=.*/checkpoint_completion_target = $CHECKPOINT_COMPLETION_TARGET/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^checkpoint_completion_target[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "checkpoint_completion_target = $CHECKPOINT_COMPLETION_TARGET" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}设置 wal_buffers = $WAL_BUFFERS${NC}"
-    sed -i.bak "s/^wal_buffers\s*=.*/wal_buffers = $WAL_BUFFERS/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 wal_buffers${NC}"
-        echo "wal_buffers = $WAL_BUFFERS" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*wal_buffers[[:space:]]*=.*/wal_buffers = $WAL_BUFFERS/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^wal_buffers[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "wal_buffers = $WAL_BUFFERS" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}设置 wal_writer_delay = $WAL_WRITER_DELAY${NC}"
-    sed -i.bak "s/^wal_writer_delay\s*=.*/wal_writer_delay = $WAL_WRITER_DELAY/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 wal_writer_delay${NC}"
-        echo "wal_writer_delay = $WAL_WRITER_DELAY" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*wal_writer_delay[[:space:]]*=.*/wal_writer_delay = $WAL_WRITER_DELAY/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^wal_writer_delay[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "wal_writer_delay = $WAL_WRITER_DELAY" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}设置 commit_delay = $COMMIT_DELAY${NC}"
-    sed -i.bak "s/^commit_delay\s*=.*/commit_delay = $COMMIT_DELAY/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 commit_delay${NC}"
-        echo "commit_delay = $COMMIT_DELAY" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*commit_delay[[:space:]]*=.*/commit_delay = $COMMIT_DELAY/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^commit_delay[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "commit_delay = $COMMIT_DELAY" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}设置 commit_siblings = $COMMIT_SIBLINGS${NC}"
-    sed -i.bak "s/^commit_siblings\s*=.*/commit_siblings = $COMMIT_SIBLINGS/" "$PG_DATA_DIR/postgresql.conf" || {
-        echo -e "${RED}错误: 无法设置 commit_siblings${NC}"
-        echo "commit_siblings = $COMMIT_SIBLINGS" >> "$PG_DATA_DIR/postgresql.conf"
-    }
+    sed -i.bak -E "s/^[#[:space:]]*commit_siblings[[:space:]]*=.*/commit_siblings = $COMMIT_SIBLINGS/" "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^commit_siblings[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "commit_siblings = $COMMIT_SIBLINGS" >> "$PG_DATA_DIR/postgresql.conf"
     
     echo -e "${YELLOW}验证配置参数...${NC}"
     
@@ -535,24 +565,11 @@ configure_wal_archive() {
         verification_errors=$((verification_errors + 1))
     fi
     
-    # 添加WAL配置
-    cat >> "$PG_DATA_DIR/postgresql.conf" << EOF
-
-# WAL Archive Settings
-max_wal_size = 1GB
-min_wal_size = 80MB
-checkpoint_completion_target = 0.9
-wal_buffers = 16MB
-wal_writer_delay = 200ms
-commit_delay = 0
-commit_siblings = 5
-EOF
-    
     # 验证配置文件语法
     echo -e "${YELLOW}验证配置文件语法...${NC}"
     if [[ -f "$PG_INSTALL_DIR/bin/postgres" ]]; then
-        # 使用postgres命令验证配置文件语法
-        local syntax_output=$(su - $PG_USER -c "$PG_INSTALL_DIR/bin/postgres -t -c config_file=$PG_DATA_DIR/postgresql.conf" 2>&1)
+        # 使用 postgres -C 离线解析配置文件验证语法（-t 不是 postgres 的有效选项）
+        local syntax_output=$(su - $PG_USER -c "$PG_INSTALL_DIR/bin/postgres -D $PG_DATA_DIR -C archive_mode" 2>&1)
         if [[ $? -eq 0 ]]; then
             echo -e "${GREEN}✓ 配置文件语法验证通过${NC}"
         else
@@ -646,7 +663,10 @@ verify_wal_archive() {
 create_cleanup_script() {
     echo -e "${YELLOW}创建WAL清理脚本...${NC}"
     
-    cat > $PG_HOME/cleanup_wal.sh << EOF
+    # 脚本放在PG安装目录的父目录下（与版本目录隔离，升级换版本不影响清理脚本）
+    local cleanup_script="$(dirname "$PG_INSTALL_DIR")/cleanup_wal.sh"
+    
+    cat > "$cleanup_script" << EOF
 #!/bin/bash
 
 # WAL归档清理脚本
@@ -659,17 +679,18 @@ export LANG=C
 PG_ARCHIVE_DIR="$PG_ARCHIVE_DIR"
 DAYS_TO_KEEP=$DAYS_TO_KEEP
 
-# 删除超过指定天数的WAL文件
-find \$PG_ARCHIVE_DIR -name "*.gz" -type f -mtime +\$DAYS_TO_KEEP -delete
-find \$PG_ARCHIVE_DIR -name "*.backup" -type f -mtime +\$DAYS_TO_KEEP -delete
+# 删除超过指定天数的WAL归档文件
+# 注意：WAL段文件名形如 000000010000000000000001（无扩展名），
+# 括号分组确保 -o 条件整体受 -mtime 约束，避免误删保留期内的文件
+find "\$PG_ARCHIVE_DIR" -type f \( -name "000*" -o -name "*.backup" -o -name "*.history" -o -name "*.gz" \) -mtime +\$DAYS_TO_KEEP -delete
 
 echo "WAL清理完成，保留最近 \$DAYS_TO_KEEP 天的文件"
 EOF
     
-    chmod +x $PG_HOME/cleanup_wal.sh
-    chown $PG_USER:$PG_GROUP $PG_HOME/cleanup_wal.sh
+    chmod +x "$cleanup_script"
+    chown $PG_USER:$PG_GROUP "$cleanup_script"
     
-    echo -e "${GREEN}WAL清理脚本创建完成: $PG_HOME/cleanup_wal.sh${NC}"
+    echo -e "${GREEN}WAL清理脚本创建完成: $cleanup_script${NC}"
 }
 
 # 设置定时清理任务
@@ -688,7 +709,7 @@ setup_cron_job() {
     # 检查是否已存在清理任务
     if ! grep -q "cleanup_wal.sh" /tmp/postgres_cron.txt 2>/dev/null; then
         # 添加每天凌晨2点执行清理任务，包含区域设置
-        echo "0 2 * * * LC_ALL=C LANG=C $PG_HOME/cleanup_wal.sh >> $PG_HOME/cleanup_wal.log 2>&1" >> /tmp/postgres_cron.txt
+        echo "0 2 * * * LC_ALL=C LANG=C $(dirname "$PG_INSTALL_DIR")/cleanup_wal.sh >> $(dirname "$PG_INSTALL_DIR")/cleanup_wal.log 2>&1" >> /tmp/postgres_cron.txt
         
         # 安装新的crontab
         if [[ $EUID -eq 0 ]]; then
@@ -711,11 +732,11 @@ show_archive_info() {
     echo -e "${GREEN}WAL归档配置完成!${NC}"
     echo -e "${GREEN}=====================================${NC}"
     echo -e "归档目录: $PG_ARCHIVE_DIR"
-    echo -e "清理脚本: $PG_HOME/cleanup_wal.sh"
-    echo -e "清理日志: $PG_HOME/cleanup_wal.log"
+    echo -e "清理脚本: $(dirname "$PG_INSTALL_DIR")/cleanup_wal.sh"
+    echo -e "清理日志: $(dirname "$PG_INSTALL_DIR")/cleanup_wal.log"
     echo -e ""
     echo -e "手动清理命令:"
-    echo -e "sudo -u $PG_USER $PG_HOME/cleanup_wal.sh"
+    echo -e "sudo -u $PG_USER $(dirname "$PG_INSTALL_DIR")/cleanup_wal.sh"
     echo -e ""
     echo -e "查看cron任务:"
     echo -e "sudo -u $PG_USER crontab -l"
@@ -769,17 +790,17 @@ manual_cleanup() {
         # 按时间清理
         [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}按时间清理${DAYS_TO_KEEP}天前的WAL文件...${NC}"
         
-        old_files=$(find "$PG_ARCHIVE_DIR" -type f -name "*.gz" -o -name "*.backup" -o -name "000*" -mtime +$DAYS_TO_KEEP 2>/dev/null)
+        old_files=$(find "$PG_ARCHIVE_DIR" -type f \( -name "000*" -o -name "*.backup" -o -name "*.history" -o -name "*.gz" \) -mtime +$DAYS_TO_KEEP 2>/dev/null)
         
         if [[ -n "$old_files" ]]; then
             if [[ "$FORCE_MODE" == "true" ]]; then
-                find "$PG_ARCHIVE_DIR" -type f -name "*.gz" -o -name "*.backup" -o -name "000*" -mtime +$DAYS_TO_KEEP -delete 2>/dev/null
+                find "$PG_ARCHIVE_DIR" -type f \( -name "000*" -o -name "*.backup" -o -name "*.history" -o -name "*.gz" \) -mtime +$DAYS_TO_KEEP -delete 2>/dev/null
             else
                 echo -e "${YELLOW}将要删除以下文件:${NC}"
                 echo "$old_files"
                 read -p "确认删除? [y/N]: " confirm
                 if [[ $confirm =~ ^[Yy]$ ]]; then
-                    find "$PG_ARCHIVE_DIR" -type f -name "*.gz" -o -name "*.backup" -o -name "000*" -mtime +$DAYS_TO_KEEP -delete 2>/dev/null
+                    find "$PG_ARCHIVE_DIR" -type f \( -name "000*" -o -name "*.backup" -o -name "*.history" -o -name "*.gz" \) -mtime +$DAYS_TO_KEEP -delete 2>/dev/null
                 else
                     echo -e "${YELLOW}操作已取消${NC}"
                     return 0
@@ -812,23 +833,19 @@ auto_cleanup_config() {
     # 备份配置文件
     cp "$PG_DATA_DIR/postgresql.conf" "$PG_DATA_DIR/postgresql.conf.backup.$(date +%Y%m%d_%H%M%S)"
     
-    # 配置归档参数
-    sed -i.bak "s/#wal_level = minimal/wal_level = replica/" "$PG_DATA_DIR/postgresql.conf"
-    sed -i.bak "s/#archive_mode = off/archive_mode = on/" "$PG_DATA_DIR/postgresql.conf"
-    sed -i.bak "s|#archive_command = ''|archive_command = 'cp %p $PG_ARCHIVE_DIR/%f'|" "$PG_DATA_DIR/postgresql.conf"
-    sed -i.bak "s|#archive_cleanup_command = ''|archive_cleanup_command = '$PG_INSTALL_DIR/bin/pg_archivecleanup $PG_ARCHIVE_DIR %r'|" "$PG_DATA_DIR/postgresql.conf"
+    # 配置归档参数（PG14+ 默认值为 "#wal_level = replica"，需正则匹配注释行）
+    sed -i.bak -E "s/^[#[:space:]]*wal_level[[:space:]]*=.*/wal_level = replica/" "$PG_DATA_DIR/postgresql.conf"
+    sed -i.bak -E "s/^[#[:space:]]*archive_mode[[:space:]]*=.*/archive_mode = on/" "$PG_DATA_DIR/postgresql.conf"
+    sed -i.bak -E "s|^[#[:space:]]*archive_command[[:space:]]*=.*|archive_command = 'cp %p $PG_ARCHIVE_DIR/%f'|" "$PG_DATA_DIR/postgresql.conf"
+    sed -i.bak -E "s|^[#[:space:]]*archive_cleanup_command[[:space:]]*=.*|archive_cleanup_command = '$PG_INSTALL_DIR/bin/pg_archivecleanup $PG_ARCHIVE_DIR %r'|" "$PG_DATA_DIR/postgresql.conf"
+    # sed 无匹配时也返回 0，参数完全不存在时需用 grep 检测后追加兜底
+    grep -qE "^wal_level[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "wal_level = replica" >> "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^archive_mode[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "archive_mode = on" >> "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^archive_command[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "archive_command = 'cp %p $PG_ARCHIVE_DIR/%f'" >> "$PG_DATA_DIR/postgresql.conf"
+    grep -qE "^archive_cleanup_command[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "archive_cleanup_command = '$PG_INSTALL_DIR/bin/pg_archivecleanup $PG_ARCHIVE_DIR %r'" >> "$PG_DATA_DIR/postgresql.conf"
     
-    # 添加WAL配置
-    cat >> "$PG_DATA_DIR/postgresql.conf" << EOF
-
-# WAL Archive Settings (自动清理模式)
-max_wal_size = 1GB
-min_wal_size = 80MB
-checkpoint_completion_target = 0.9
-wal_buffers = 16MB
-wal_writer_delay = 200ms
-archive_timeout = 30min
-EOF
+    # archive_timeout 控制WAL切换频率（幂等追加，不硬编码覆盖其他参数）
+    grep -qE "^archive_timeout[[:space:]]*=" "$PG_DATA_DIR/postgresql.conf" || echo "archive_timeout = 30min" >> "$PG_DATA_DIR/postgresql.conf"
     
     [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}自动清理模式配置完成${NC}"
     
@@ -858,7 +875,7 @@ cron_cleanup_config() {
     fi
     
     # 创建清理脚本
-    local cleanup_script="$PG_HOME/wal_cleanup.sh"
+    local cleanup_script="$(dirname "$PG_INSTALL_DIR")/wal_cleanup.sh"
     
     cat > "$cleanup_script" << EOF
 #!/bin/bash
@@ -883,11 +900,11 @@ if [[ ! -d "\$PG_ARCHIVE_DIR" ]]; then
 fi
 
 # 查找可以删除的文件
-old_files=\$(find "\$PG_ARCHIVE_DIR" -type f -name "*.gz" -o -name "*.backup" -o -name "000*" -mtime +\$DAYS_TO_KEEP 2>/dev/null)
+old_files=\$(find "\$PG_ARCHIVE_DIR" -type f \( -name "000*" -o -name "*.backup" -o -name "*.history" -o -name "*.gz" \) -mtime +\$DAYS_TO_KEEP 2>/dev/null)
 
 if [[ -n "\$old_files" ]]; then
     echo "找到 \$(echo "\$old_files" | wc -l) 个文件需要清理"
-    find "\$PG_ARCHIVE_DIR" -type f -name "*.gz" -o -name "*.backup" -o -name "000*" -mtime +\$DAYS_TO_KEEP -delete 2>/dev/null
+    find "\$PG_ARCHIVE_DIR" -type f \( -name "000*" -o -name "*.backup" -o -name "*.history" -o -name "*.gz" \) -mtime +\$DAYS_TO_KEEP -delete 2>/dev/null
     echo "清理完成"
 else
     echo "没有找到需要清理的文件"
@@ -911,7 +928,7 @@ EOF
     # 检查是否已存在清理任务
     if ! grep -q "wal_cleanup.sh" /tmp/postgres_cron.txt 2>/dev/null; then
         # 添加每周日凌晨2点执行清理任务
-        echo "0 2 * * 0 LC_ALL=C LANG=C $cleanup_script >> $PG_HOME/wal_cleanup.log 2>&1" >> /tmp/postgres_cron.txt
+        echo "0 2 * * 0 LC_ALL=C LANG=C $cleanup_script >> $(dirname "$PG_INSTALL_DIR")/wal_cleanup.log 2>&1" >> /tmp/postgres_cron.txt
         
         # 安装新的crontab
         if [[ $EUID -eq 0 ]]; then
@@ -950,29 +967,29 @@ smart_cleanup() {
         return 1
     fi
     
-    # 查找15天之前的所有日志，判断是否存在未完成归档日志
-    local old_files=$(find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +15 2>/dev/null | grep "$redo_wal_file")
+    # 查找保留天数之前的WAL文件，判断是否存在未完成归档的文件
+    local old_files=$(find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +$DAYS_TO_KEEP 2>/dev/null | grep "$redo_wal_file")
     
     if [[ -n "$old_files" ]]; then
         echo -e "${RED}存在未完成归档的日志，不能删除${NC}"
         echo "$old_files"
         return 1
     else
-        # 清理15天以前的归档日志
-        [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}清理15天前的归档日志...${NC}"
+        # 清理${DAYS_TO_KEEP}天以前的归档日志
+        [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}清理${DAYS_TO_KEEP}天前的归档日志...${NC}"
         
-        local files_to_delete=$(find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +15 2>/dev/null)
+        local files_to_delete=$(find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +$DAYS_TO_KEEP 2>/dev/null)
         
         if [[ -n "$files_to_delete" ]]; then
             if [[ "$FORCE_MODE" == "true" ]]; then
-                find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +15 -delete 2>/dev/null
+                find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +$DAYS_TO_KEEP -delete 2>/dev/null
                 [[ "$QUIET_MODE" != "true" ]] && echo -e "${GREEN}智能清理完成，删除了$(echo "$files_to_delete" | wc -l)个文件${NC}"
             else
                 echo -e "${YELLOW}将要删除以下文件:${NC}"
                 echo "$files_to_delete"
                 read -p "确认删除? [y/N]: " confirm
                 if [[ $confirm =~ ^[Yy]$ ]]; then
-                    find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +15 -delete 2>/dev/null
+                    find "$PG_ARCHIVE_DIR" -type f -name "000*" -mtime +$DAYS_TO_KEEP -delete 2>/dev/null
                     echo -e "${GREEN}智能清理完成${NC}"
                 else
                     echo -e "${YELLOW}操作已取消${NC}"
@@ -1008,8 +1025,8 @@ show_archive_status() {
     if [[ -f "$PG_DATA_DIR/postgresql.conf" ]]; then
         local wal_level=$(grep -E "^wal_level\s*=" "$PG_DATA_DIR/postgresql.conf" | awk '{print $3}')
         local archive_mode=$(grep -E "^archive_mode\s*=" "$PG_DATA_DIR/postgresql.conf" | awk '{print $3}')
-        local archive_command=$(grep -E "^archive_command\s*=" "$PG_DATA_DIR/postgresql.conf" | cut -d'"' -f2)
-        local archive_cleanup_command=$(grep -E "^archive_cleanup_command\s*=" "$PG_DATA_DIR/postgresql.conf" | cut -d'"' -f2)
+        local archive_command=$(grep -E "^archive_command\s*=" "$PG_DATA_DIR/postgresql.conf" | cut -d"'" -f2)
+        local archive_cleanup_command=$(grep -E "^archive_cleanup_command\s*=" "$PG_DATA_DIR/postgresql.conf" | cut -d"'" -f2)
         
         echo -e "WAL级别: ${GREEN}${wal_level:-未设置}${NC}"
         echo -e "归档模式: ${GREEN}${archive_mode:-未设置}${NC}"
@@ -1230,7 +1247,7 @@ safe_psql() {
     local quiet_mode="$3"
     
     # 构建完整的命令
-    local cmd="psql -t -c \"$sql_command\""
+    local cmd="$PG_INSTALL_DIR/bin/psql -t -c \"$sql_command\""
     
     # 如果是root用户，需要切换到postgres用户
     if [[ $EUID -eq 0 ]]; then
@@ -1354,6 +1371,9 @@ main() {
     
     # 解析命令行参数
     parse_args "$@"
+
+    # 从profile文件/环境变量中探测PostgreSQL配置（结果存入DEFAULT_*变量，供后续回退使用）
+    read_pg_profile
     
     # 检查是否为root用户（某些模式需要）
     if [[ "$MODE" == "setup" || "$MODE" == "auto" || "$MODE" == "cron" ]]; then
@@ -1364,16 +1384,21 @@ main() {
     fi
     
     # 检查环境变量是否设置
-    if [[ -z "$PG_INSTALL_DIR" && -z "$PG_INSTALL_DIR" && -n "$PG_HOME" ]]; then
+    if [[ -z "$PG_INSTALL_DIR" && -n "$PG_HOME" ]]; then
         PG_INSTALL_DIR="$PG_HOME"
         [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}从环境变量 PG_HOME 获取安装目录: $PG_HOME${NC}"
     fi
     
-    if [[ -z "$PG_DATA_DIR" && -z "$PG_DATA_DIR" && -n "$PGDATA" ]]; then
+    if [[ -z "$PG_DATA_DIR" && -n "$PGDATA" ]]; then
         PG_DATA_DIR="$PGDATA"
         [[ "$QUIET_MODE" != "true" ]] && echo -e "${YELLOW}从环境变量 PGDATA 获取数据目录: $PGDATA${NC}"
     fi
     
+    # 应用profile探测到的默认配置（命令行参数/环境变量优先，已在前面赋值）
+    PG_INSTALL_DIR=${PG_INSTALL_DIR:-$DEFAULT_PG_INSTALL_DIR}
+    PG_DATA_DIR=${PG_DATA_DIR:-$DEFAULT_PG_DATA_DIR}
+    PG_HOME=${PG_HOME:-$DEFAULT_PG_HOME}
+
     # 如果仍然没有找到配置，提示用户设置环境变量
     if [[ -z "$PG_INSTALL_DIR" || -z "$PG_DATA_DIR" ]]; then
         echo -e "${RED}错误: 无法找到PostgreSQL配置${NC}"
@@ -1385,11 +1410,8 @@ main() {
         exit 1
     fi
     
-    # 设置默认值
-    PG_INSTALL_DIR=${PG_INSTALL_DIR:-$DEFAULT_PG_INSTALL_DIR}
-    PG_DATA_DIR=${PG_DATA_DIR:-$DEFAULT_PG_DATA_DIR}
+    # 归档目录默认与数据目录同级
     PG_ARCHIVE_DIR=${PG_ARCHIVE_DIR:-$(dirname "$PG_DATA_DIR")/archive}
-    PG_HOME=${PG_HOME:-$DEFAULT_PG_HOME}
     
     # 根据模式执行相应操作
     case $MODE in

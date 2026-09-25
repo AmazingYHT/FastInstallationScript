@@ -109,6 +109,44 @@ remove_systemd() {
     rm -f /etc/systemd/system/redis@.service
     rm -f /etc/systemd/system/redis-sentinel@.service
     systemctl daemon-reload
+
+    # 清理指向本次安装目录的全局命令软链接（只删指向 $REDIS_INSTALL_DIR/bin 的，
+    # 避免误删机器上其它 Redis 版本手动建立的链接）
+    local link target
+    for link in /usr/local/bin/redis-server /usr/local/bin/redis-cli \
+                /usr/local/bin/redis-benchmark /usr/local/bin/redis-check-aof \
+                /usr/local/bin/redis-check-rdb /usr/local/bin/redis-sentinel; do
+        if [ -L "$link" ]; then
+            target=$(readlink -f "$link" 2>/dev/null)
+            case "$target" in
+                "$REDIS_INSTALL_DIR"/bin/*)
+                    rm -f "$link"
+                    info "已移除软链接: $link"
+                    ;;
+            esac
+        fi
+    done
+}
+
+# 清理 Redis 环境变量：删除独立 profile.d 文件，并清理老版本写入 /etc/profile 的历史段
+remove_environment() {
+    # 新版：独立文件，直接删除
+    if [ -f /etc/profile.d/redis.sh ]; then
+        info "删除 /etc/profile.d/redis.sh ..."
+        rm -f /etc/profile.d/redis.sh
+    fi
+
+    # 老版本：/etc/profile 中的 Redis 段/孤儿行（带备份、幂等）
+    if [ -f /etc/profile ] && grep -qE "Redis Environment|REDIS_HOME|^[[:space:]]*export[[:space:]]+[\$/]" /etc/profile 2>/dev/null; then
+        info "清理 /etc/profile 中的历史 Redis 环境变量..."
+        # 备份文件名含纳秒，避免同一秒内连续卸载/安装多个组件时备份互相覆盖
+        cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S_%N)
+        sed -i 's/\r$//' /etc/profile
+        sed -i -E '/# Redis Environment[[:space:]]*$/,/# End Redis Environment[[:space:]]*$/d' /etc/profile
+        sed -i -E '\#(^|[^A-Za-z0-9_])REDIS_HOME#d' /etc/profile
+        sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
+        info "已清理（备份文件: /etc/profile.backup.*）"
+    fi
 }
 
 # 主卸载流程
@@ -126,6 +164,7 @@ main() {
 
     stop_all_services
     remove_systemd
+    remove_environment
 
     # 删除安装文件
     if [ -d "$REDIS_INSTALL_DIR" ]; then

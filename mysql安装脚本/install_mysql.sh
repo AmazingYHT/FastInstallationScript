@@ -800,31 +800,71 @@ EOF
 
 # ======================== 配置环境变量 ========================
 
+# 环境变量统一写到独立文件 /etc/profile.d/mysql.sh（标准 /etc/profile 会自动
+# source /etc/profile.d/*.sh），各组件一个文件、安装写入/卸载删除，互不影响；
+# 对老版本脚本写进 /etc/profile 的历史段做一次性迁移清理。
+MYSQL_PROFILE_D="/etc/profile.d/mysql.sh"
+
+# 清理 /etc/profile 中的历史 MySQL 段/孤儿行（幂等，无残留则不动文件）
+_mysql_clean_legacy_profile() {
+    [ -f /etc/profile ] || return 0
+    grep -qE "MySQL Environment|MYSQL_HOME|^[[:space:]]*export[[:space:]]+[\$/]" /etc/profile 2>/dev/null || return 0
+    # 备份文件名含纳秒，避免同一秒内连续安装/卸载多个组件时备份互相覆盖
+    cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S_%N)
+    sed -i 's/\r$//' /etc/profile
+    # 两种历史标记段（新版带结束标记；更早的 "# MySQL Environment Variables" 到空行结束）
+    sed -i -E \
+        -e '/# MySQL Environment Variables[[:space:]]*$/,/^[[:space:]]*$/d' \
+        -e '/# MySQL Environment[[:space:]]*$/,/# End MySQL Environment[[:space:]]*$/d' \
+        /etc/profile
+    # 段外残留的 MYSQL_HOME 孤儿行 + 通用畸形 export 行
+    sed -i -E '\#(^|[^A-Za-z0-9_])MYSQL_HOME#d' /etc/profile
+    sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
+}
+
+# 常用客户端工具软链接到 /usr/local/bin（非登录 shell 也能直接使用）
+_mysql_setup_symlinks() {
+    mkdir -p /usr/local/bin 2>/dev/null || return 0
+    local c linked=()
+    for c in mysql mysqldump mysqladmin mysqlcheck mysqlshow mysqlimport \
+             mysqlbinlog mysqldumpslow mysqlslap mysql_config_editor mysqlpump; do
+        if [ -x "$MYSQL_INSTALL_DIR/bin/$c" ]; then
+            ln -sf "$MYSQL_INSTALL_DIR/bin/$c" "/usr/local/bin/$c"
+            linked+=("$c")
+        fi
+    done
+    [ ${#linked[@]} -gt 0 ] && echo -e "${GREEN}已创建全局命令软链接（/usr/local/bin）: ${linked[*]}${NC}"
+}
+
 setup_environment() {
     echo -e "${YELLOW}配置环境变量...${NC}"
 
-    # 备份并清理旧配置
-    if grep -q "# MySQL Environment" /etc/profile 2>/dev/null; then
-        cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S)
-        sed -i '/# MySQL Environment/,/# End MySQL Environment/d' /etc/profile
-    fi
+    # 1) 迁移清理老版本写入 /etc/profile 的段落（带备份）
+    _mysql_clean_legacy_profile
 
-    # 添加新配置
-    cat >> /etc/profile << EOF
-
-# MySQL Environment
+    # 2) 原子写入独立 profile.d 文件
+    mkdir -p /etc/profile.d
+    local tmpf
+    tmpf=$(mktemp /etc/profile.d/.mysql.XXXXXX 2>/dev/null || echo "/etc/profile.d/.mysql.$$")
+    cat > "$tmpf" << EOF
+# MySQL Environment —— 由 install_mysql.sh 自动管理，卸载时自动删除，请勿手动编辑
 export MYSQL_HOME=$MYSQL_INSTALL_DIR
-export PATH=\$MYSQL_HOME/bin:\$PATH
-# End MySQL Environment
+# case 守卫：重复加载不重复叠加 PATH
+case ":\$PATH:" in *":\$MYSQL_HOME/bin:"*) ;; *) export PATH="\$MYSQL_HOME/bin:\$PATH" ;; esac
 EOF
+    mv -f "$tmpf" "$MYSQL_PROFILE_D"
+    chmod 644 "$MYSQL_PROFILE_D"
 
-    # 立即生效
+    # 3) 当前 shell 立即生效（不 source 整个 /etc/profile，避免触发历史坏段）
     export MYSQL_HOME="$MYSQL_INSTALL_DIR"
-    export PATH="$MYSQL_INSTALL_DIR/bin:$PATH"
+    case ":$PATH:" in *":$MYSQL_HOME/bin:"*) ;; *) export PATH="$MYSQL_INSTALL_DIR/bin:$PATH" ;; esac
 
-    echo -e "${GREEN}环境变量配置完成${NC}"
+    # 4) 全局命令软链接
+    _mysql_setup_symlinks
+
+    echo -e "${GREEN}环境变量配置完成: $MYSQL_PROFILE_D${NC}"
     echo -e "${CYAN}  MYSQL_HOME=$MYSQL_INSTALL_DIR${NC}"
-    echo -e "${CYAN}  PATH已包含: $MYSQL_INSTALL_DIR/bin${NC}"
+    echo -e "${CYAN}  PATH已包含: $MYSQL_INSTALL_DIR/bin（新登录终端自动生效；当前终端 source $MYSQL_PROFILE_D）${NC}"
 }
 
 # ======================== 初始化数据库 ========================
@@ -1468,14 +1508,12 @@ show_installation_info() {
         mysql_version=$($MYSQL_INSTALL_DIR/bin/mysql --version 2>/dev/null)
     fi
 
-    # 自动执行 source /etc/profile 使环境变量在当前会话生效
-    echo -e "${YELLOW}执行 source /etc/profile 使环境变量生效...${NC}"
-    source /etc/profile > /dev/null 2>&1
-    # 同时创建 mysql 命令软链接（确保可以直接使用 mysql 命令）
+    # 环境变量已由 setup_environment() 写入 /etc/profile.d/mysql.sh 并在当前 shell 导出，
+    # 这里不再 source 整个 /etc/profile（历史坏段会导致整个 profile 加载报错）
     if [ ! -f "/usr/bin/mysql" ]; then
         ln -sf $MYSQL_INSTALL_DIR/bin/mysql /usr/bin/mysql
     fi
-    echo -e "${GREEN}✓ 环境变量已生效，当前会话可直接使用 mysql 命令${NC}"
+    echo -e "${GREEN}✓ 环境变量已生效（/etc/profile.d/mysql.sh），新终端可直接使用 mysql 命令${NC}"
 
     # 获取服务器IP
     local server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')

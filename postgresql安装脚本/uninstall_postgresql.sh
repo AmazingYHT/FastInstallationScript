@@ -45,15 +45,22 @@ auto_search_postgresql() {
     echo -e "${YELLOW}搜索系统中的PostgreSQL安装...${NC}"
     echo ""
     
-    # 尝试从 /etc/profile 读取 PostgreSQL 环境变量
+    # 读取 PostgreSQL 环境变量：优先新版 /etc/profile.d/postgresql.sh，
+    # 其次老版本写入 /etc/profile 的段落
     local profile_pghome=""
     local profile_pgdata=""
-    
-    if [ -f /etc/profile ]; then
-        echo -e "${CYAN}从 /etc/profile 读取 PostgreSQL 环境变量...${NC}"
+    local _env_files=(/etc/profile.d/postgresql.sh /etc/profile)
+    local _ef
+
+    for _ef in "${_env_files[@]}"; do
+        [ -f "$_ef" ] || continue
+        echo -e "${CYAN}从 $_ef 读取 PostgreSQL 环境变量...${NC}"
         # 支持 PG_HOME 或 PGHOME 两种命名
-        profile_pghome=$(grep -E "^export\s+PG_HOME=|^PG_HOME=|^export\s+PGHOME=|^PGHOME=" /etc/profile 2>/dev/null | head -1 | sed -E 's/^export\s+PG_HOME=|^PG_HOME=|^export\s+PGHOME=|^PGHOME=//' | sed 's/"//g' | sed "s/'//g" | tr -d ' ')
-        profile_pgdata=$(grep -E "^export\s+PGDATA=|^PGDATA=" /etc/profile 2>/dev/null | head -1 | sed -E 's/^export\s+PGDATA=|^PGDATA=//' | sed 's/"//g' | sed "s/'//g" | tr -d ' ')
+        [ -z "$profile_pghome" ] && profile_pghome=$(grep -E "^export[[:space:]]+PG_HOME=|^PG_HOME=|^export[[:space:]]+PGHOME=|^PGHOME=" "$_ef" 2>/dev/null | head -1 | sed -E 's/^export[[:space:]]+PG_HOME=|^PG_HOME=|^export[[:space:]]+PGHOME=|^PGHOME=//' | sed 's/"//g' | sed "s/'//g" | tr -d ' ')
+        [ -z "$profile_pgdata" ] && profile_pgdata=$(grep -E "^export[[:space:]]+PGDATA=|^PGDATA=" "$_ef" 2>/dev/null | head -1 | sed -E 's/^export[[:space:]]+PGDATA=|^PGDATA=//' | sed 's/"//g' | sed "s/'//g" | tr -d ' ')
+    done
+
+    if [ -f /etc/profile ] || [ -f /etc/profile.d/postgresql.sh ]; then
         
         if [ -n "$profile_pghome" ]; then
             echo -e "${GREEN}  找到 PG_HOME: $profile_pghome${NC}"
@@ -127,7 +134,7 @@ auto_search_postgresql() {
     
     local found_installations=()
     
-    # 构建搜索路径列表（优先使用从 /etc/profile 读取的路径）
+    # 构建搜索路径列表（优先使用从 profile.d / /etc/profile 读取的路径）
     local search_paths=()
     
     # 如果从 /etc/profile 找到了 PG_HOME（或 PGHOME），优先使用它
@@ -455,8 +462,11 @@ show_removal_list() {
     done
     
     # 查找环境变量
-    if grep -q "PGHOME\|PGDATA" /etc/profile 2>/dev/null; then
-        echo -e "${RED}环境变量配置:${NC} /etc/profile (包含PostgreSQL配置)"
+    if [ -f /etc/profile.d/postgresql.sh ]; then
+        echo -e "${RED}环境变量配置:${NC} /etc/profile.d/postgresql.sh"
+    fi
+    if [ -f /etc/profile ] && grep -qE "PGHOME|PGDATA|PostgreSQL Environment" /etc/profile 2>/dev/null; then
+        echo -e "${RED}环境变量配置:${NC} /etc/profile (包含历史PostgreSQL配置)"
     fi
     
     echo "----------------------------------------"
@@ -944,16 +954,49 @@ remove_configs() {
         fi
     done
     
-    # 清理/etc/profile中的PostgreSQL配置
-    if grep -q "PGHOME\|PGDATA" /etc/profile 2>/dev/null; then
-        echo -e "${YELLOW}清理/etc/profile中的PostgreSQL配置${NC}"
+    # profile.d 独立文件已在上面的 config_files 中删除；
+    # 再清理 /etc/profile 中的历史 PostgreSQL 段（老版本脚本遗留，兼容旧A段/新B段/孤儿行/畸形行）
+    if [ -f /etc/profile ] && grep -qE "PostgreSQL Environment|PG_?HOME|^[[:space:]]*export[[:space:]]+[\$/]" /etc/profile 2>/dev/null; then
+        echo -e "${YELLOW}清理 /etc/profile 中的历史 PostgreSQL 配置${NC}"
         if [ "$DRY_RUN" = false ]; then
-            # 备份原文件
-            cp /etc/profile /etc/profile.bak
-            # 删除PostgreSQL相关行
-            sed -i '/# PostgreSQL Environment Variables/,/^$/d' /etc/profile
+            cp /etc/profile /etc/profile.bak.$(date +%Y%m%d_%H%M%S_%N)
+            sed -i 's/\r$//' /etc/profile
+            sed -i -E \
+                -e '/# PostgreSQL Environment Variables[[:space:]]*$/,/^[[:space:]]*$/d' \
+                -e '/# PostgreSQL Environment[[:space:]]*$/,/# End PostgreSQL Environment[[:space:]]*$/d' \
+                /etc/profile
+            # 段外残留的 PG_HOME/PGHOME 孤儿行
+            sed -i -E '\#(^|[^A-Za-z0-9_])PG_?HOME#d' /etc/profile
+            # 畸形行：export 后直接跟 $ 或 /
+            sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
         fi
     fi
+}
+
+# 删除指向本次安装目录的全局命令软链接（只删指向 $PG_INSTALL_DIR/bin 的，
+# 不影响机器上其他 PG 版本或用户手工建立的链接）
+remove_pg_symlinks() {
+    echo -e "${YELLOW}检查全局命令软链接...${NC}"
+    local link target removed=0
+    for link in /usr/local/bin/psql /usr/local/bin/pg_dump /usr/local/bin/pg_dumpall \
+                /usr/local/bin/pg_restore /usr/local/bin/pg_ctl /usr/local/bin/initdb \
+                /usr/local/bin/pg_isready /usr/local/bin/pg_config /usr/local/bin/createdb \
+                /usr/local/bin/createuser /usr/local/bin/dropdb /usr/local/bin/dropuser \
+                /usr/local/bin/vacuumdb /usr/local/bin/reindexdb /usr/local/bin/clusterdb \
+                /usr/local/bin/pg_basebackup; do
+        [ -L "$link" ] || continue
+        target=$(readlink -f "$link" 2>/dev/null)
+        case "$target" in
+            "$PG_INSTALL_DIR"/bin/*)
+                if [ "$DRY_RUN" = false ]; then
+                    rm -f "$link"
+                fi
+                echo -e "${YELLOW}  删除软链接: $link -> $target${NC}"
+                removed=1
+                ;;
+        esac
+    done
+    [ "$removed" -eq 0 ] && echo -e "  无指向 $PG_INSTALL_DIR 的软链接"
 }
 
 # 删除用户和组
@@ -1283,9 +1326,9 @@ show_completion() {
     
     if [ "$DRY_RUN" = false ]; then
         echo -e "${YELLOW}注意:${NC}"
-        echo "1. 如果修改了/etc/profile，请重新加载或重新登录"
+        echo "1. 已删除 /etc/profile.d/postgresql.sh 并清理 /etc/profile 历史段，请重新登录使环境变量失效"
         echo "2. 如果有其他应用依赖PostgreSQL，请重新配置"
-        echo "3. 备份文件已保存为 /etc/profile.bak（如果存在）"
+        echo "3. 若本次清理修改了 /etc/profile，备份文件为 /etc/profile.bak.*"
     fi
 }
 
@@ -1339,8 +1382,9 @@ main() {
     fi
     echo ""
     
-    # 步骤3: 删除文件目录
+    # 步骤3: 删除文件目录（先清理指向安装目录的全局软链接，再删目录）
     echo -e "${CYAN}[3/6] 删除PostgreSQL文件和目录...${NC}"
+    remove_pg_symlinks
     remove_files
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✓ 文件目录已删除${NC}"

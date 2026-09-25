@@ -346,6 +346,67 @@ deploy_redis() {
 
     chown -R redis:redis "$REDIS_INSTALL_DIR"
     success "Redis 二进制部署完成: $REDIS_INSTALL_DIR"
+
+    # 创建全局命令软链接到 /usr/local/bin（该目录默认在所有用户的 PATH 中，
+    # 软链接立即生效、无需重新登录；ln -sf 保证多实例/多版本重复执行时幂等，
+    # 最终指向最后一次安装的版本）
+    mkdir -p /usr/local/bin
+    local cmd linked=()
+    for cmd in redis-server redis-cli redis-benchmark redis-check-aof redis-check-rdb redis-sentinel; do
+        if [ -x "$REDIS_INSTALL_DIR/bin/$cmd" ]; then
+            ln -sf "$REDIS_INSTALL_DIR/bin/$cmd" "/usr/local/bin/$cmd"
+            linked+=("$cmd")
+        fi
+    done
+    if [ ${#linked[@]} -gt 0 ]; then
+        success "已创建全局命令软链接（/usr/local/bin）: ${linked[*]}"
+    fi
+}
+
+# 环境变量统一写到独立文件 /etc/profile.d/redis.sh（标准 /etc/profile 会自动
+# source /etc/profile.d/*.sh），各组件一个文件、安装写入/卸载删除，互不影响；
+# 对老版本脚本写进 /etc/profile 的历史段做一次性迁移清理。
+REDIS_PROFILE_D="/etc/profile.d/redis.sh"
+
+# 清理 /etc/profile 中的历史 Redis 段/孤儿行（幂等，无残留则不动文件）
+_redis_clean_legacy_profile() {
+    [ -f /etc/profile ] || return 0
+    grep -qE "Redis Environment|REDIS_HOME|^[[:space:]]*export[[:space:]]+[\$/]" /etc/profile 2>/dev/null || return 0
+    # 备份文件名含纳秒，避免同一秒内连续安装/卸载多个组件时备份互相覆盖
+    cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S_%N)
+    sed -i 's/\r$//' /etc/profile
+    sed -i -E '/# Redis Environment[[:space:]]*$/,/# End Redis Environment[[:space:]]*$/d' /etc/profile
+    # 段外残留的 REDIS_HOME 孤儿行 + 通用畸形 export 行
+    sed -i -E '\#(^|[^A-Za-z0-9_])REDIS_HOME#d' /etc/profile
+    sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
+}
+
+setup_environment() {
+    info "配置环境变量..."
+
+    # 1) 迁移清理老版本写入 /etc/profile 的段落（带备份）
+    _redis_clean_legacy_profile
+
+    # 2) 原子写入独立 profile.d 文件
+    mkdir -p /etc/profile.d
+    local tmpf
+    tmpf=$(mktemp /etc/profile.d/.redis.XXXXXX 2>/dev/null || echo "/etc/profile.d/.redis.$$")
+    cat > "$tmpf" << EOF
+# Redis Environment —— 由 install_redis.sh 自动管理，卸载时自动删除，请勿手动编辑
+export REDIS_HOME=$REDIS_INSTALL_DIR
+# case 守卫：重复加载不重复叠加 PATH
+case ":\$PATH:" in *":\$REDIS_HOME/bin:"*) ;; *) export PATH="\$REDIS_HOME/bin:\$PATH" ;; esac
+EOF
+    mv -f "$tmpf" "$REDIS_PROFILE_D"
+    chmod 644 "$REDIS_PROFILE_D"
+
+    # 3) 当前 shell 立即生效（不 source 整个 /etc/profile，避免触发历史坏段）
+    export REDIS_HOME="$REDIS_INSTALL_DIR"
+    case ":$PATH:" in *":$REDIS_HOME/bin:"*) ;; *) export PATH="$REDIS_INSTALL_DIR/bin:$PATH" ;; esac
+
+    success "环境变量配置完成: $REDIS_PROFILE_D"
+    info "  REDIS_HOME=$REDIS_INSTALL_DIR"
+    info "  PATH 已包含: $REDIS_INSTALL_DIR/bin（新终端自动生效；当前终端执行 source $REDIS_PROFILE_D）"
 }
 
 # 打包已编译安装目录，供 scp 到远程
@@ -774,6 +835,7 @@ batch_install_flow() {
     fi
 
     deploy_redis
+    setup_environment
 
     if [ "$DEPLOY_MODE" = "standalone" ]; then
         generate_standalone_config
@@ -807,6 +869,7 @@ main() {
     install_dependencies
     create_user_and_dirs
     deploy_redis
+    setup_environment
     if [ "$DEPLOY_MODE" = "standalone" ]; then
         generate_standalone_config
     elif [ "$DEPLOY_MODE" = "cluster" ]; then
@@ -824,6 +887,7 @@ main() {
     success "安装目录: $REDIS_INSTALL_DIR"
     success "配置目录: $REDIS_CONF_DIR"
     success "数据目录: $REDIS_DATA_DIR"
+    success "环境变量: 已写入 /etc/profile.d/redis.sh（新终端可直接用 redis-cli；当前终端执行 source /etc/profile.d/redis.sh）"
     if [ "$DEPLOY_MODE" = "standalone" ]; then
         success "服务名称: redis"
         success "管理命令: systemctl {start|stop|restart|status} redis"

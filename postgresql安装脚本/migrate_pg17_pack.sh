@@ -40,7 +40,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AUTO_PG_HOME=""
 AUTO_PGDATA=""
 
-# ① 优先读 /etc/profile 等写入的 PG_HOME / PGDATA 环境变量
+# ① 优先读环境变量（新版在 /etc/profile.d/postgresql.sh，老版本在 /etc/profile）
+[ -z "${PG_HOME:-}" ] && [ -f /etc/profile.d/postgresql.sh ] && . /etc/profile.d/postgresql.sh 2>/dev/null || true
 if [ -n "${PG_HOME:-}" ] && [ -x "$PG_HOME/bin/postgres" ]; then
   AUTO_PG_HOME=$PG_HOME
 fi

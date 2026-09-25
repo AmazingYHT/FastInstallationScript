@@ -2598,49 +2598,82 @@ compile_install() {
     return 0
 }
 
-# 配置环境变量
+# 环境变量统一写到独立文件 /etc/profile.d/postgresql.sh（标准 /etc/profile 会自动
+# source /etc/profile.d/*.sh）。各组件一个文件、安装写入/卸载删除，互不影响，不再
+# 修改 /etc/profile 本体；对老版本脚本写进 /etc/profile 的历史段做一次性迁移清理。
+PG_PROFILE_D="/etc/profile.d/postgresql.sh"
+
+# 清理 /etc/profile 中的历史 PostgreSQL 段/孤儿行（幂等，无残留则不动文件）
+_pg_clean_legacy_profile() {
+    [ -f /etc/profile ] || return 0
+    # 本组件历史段/变量，或任意来源的畸形 export 行（如旧 PG 脚本产生的 "export $PGHOME/..." 坏行）
+    grep -qE "PostgreSQL Environment|PG_?HOME|^[[:space:]]*export[[:space:]]+[\$/]" /etc/profile 2>/dev/null || return 0
+    # 备份文件名含纳秒，避免同一秒内连续安装/卸载多个组件时备份互相覆盖
+    cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S_%N)
+    # 统一去掉 Windows 换行符，避免锚点失配
+    sed -i 's/\r$//' /etc/profile
+    # 两种历史标记段（锚点容忍行尾空白；旧A段无结束标记、到第一个空行结束）
+    sed -i -E \
+        -e '/# PostgreSQL Environment Variables[[:space:]]*$/,/^[[:space:]]*$/d' \
+        -e '/# PostgreSQL Environment[[:space:]]*$/,/# End PostgreSQL Environment[[:space:]]*$/d' \
+        /etc/profile
+    # 段外残留的 PG 孤儿行（PG_HOME/PGHOME，含旧 sed 误删后留下的半截 PATH 行）
+    sed -i -E '\#(^|[^A-Za-z0-9_])PG_?HOME#d' /etc/profile
+    # 通用畸形行：export 后直接跟 $ 或 /（如 "export $PGHOME/bin:$PATH"）
+    sed -i -E '\#^[[:space:]]*export[[:space:]]+[\$/]#d' /etc/profile
+}
+
+# 常用客户端/工具软链接到 /usr/local/bin（该目录默认在 PATH 中，非登录 shell 也可用）
+_pg_setup_symlinks() {
+    mkdir -p /usr/local/bin 2>/dev/null || return 0
+    local c linked=()
+    for c in psql pg_dump pg_dumpall pg_restore pg_ctl initdb pg_isready pg_config \
+             createdb createuser dropdb dropuser vacuumdb reindexdb clusterdb pg_basebackup; do
+        if [ -x "$PG_INSTALL_DIR/bin/$c" ]; then
+            ln -sf "$PG_INSTALL_DIR/bin/$c" "/usr/local/bin/$c"
+            linked+=("$c")
+        fi
+    done
+    [ ${#linked[@]} -gt 0 ] && echo -e "${GREEN}已创建全局命令软链接（/usr/local/bin）: ${linked[*]}${NC}"
+}
+
+# 配置环境变量（全脚本唯一的环境变量写入点；show_installation_info 只打印提示）
 setup_environment() {
     echo -e "${YELLOW}配置环境变量...${NC}"
-    
-    # 检查是否已经存在PostgreSQL环境变量配置
-    if grep -q "# PostgreSQL Environment Variables" /etc/profile; then
-        echo -e "${YELLOW}PostgreSQL环境变量已存在，更新配置...${NC}"
-        # 备份原配置
-        cp /etc/profile /etc/profile.backup.$(date +%Y%m%d_%H%M%S)
-        # 删除旧的PostgreSQL配置
-        sed -i '/# PostgreSQL Environment Variables/,/^$/d' /etc/profile
-    fi
-    
-    # 添加新的环境变量配置
-    cat >> /etc/profile << EOF
 
-# PostgreSQL Environment Variables
-export PGHOME=$PG_INSTALL_DIR
+    # 1) 迁移清理老版本写入 /etc/profile 的段落（带备份）
+    _pg_clean_legacy_profile
+
+    # 2) 原子写入独立 profile.d 文件（先写临时文件再 mv，避免半成品被加载）
+    mkdir -p /etc/profile.d
+    local tmpf
+    tmpf=$(mktemp /etc/profile.d/.postgresql.XXXXXX 2>/dev/null || echo "/etc/profile.d/.postgresql.$$")
+    cat > "$tmpf" << EOF
+# PostgreSQL Environment —— 由 install_postgresql.sh 自动管理，卸载时自动删除，请勿手动编辑
+export PG_HOME=$PG_INSTALL_DIR
 export PGDATA=$PG_DATA_DIR
-export PATH=\$PGHOME/bin:\$PATH
-export LANG=en_US.utf8
-export LD_LIBRARY_PATH=\$PGHOME/lib:\$LD_LIBRARY_PATH
+# case 守卫：重复加载不重复叠加 PATH/MANPATH/LD_LIBRARY_PATH
+case ":\$PATH:" in *":\$PG_HOME/bin:"*) ;; *) export PATH="\$PG_HOME/bin:\$PATH" ;; esac
+case ":\$MANPATH:" in *":\$PG_HOME/share/man:"*) ;; *) export MANPATH="\$PG_HOME/share/man:\$MANPATH" ;; esac
+case ":\$LD_LIBRARY_PATH:" in *":\$PG_HOME/lib:"*) ;; *) export LD_LIBRARY_PATH="\$PG_HOME/lib:\$LD_LIBRARY_PATH" ;; esac
 EOF
+    mv -f "$tmpf" "$PG_PROFILE_D"
+    chmod 644 "$PG_PROFILE_D"
 
-    # 立即在当前会话中生效
-    echo -e "${YELLOW}使环境变量在当前会话中生效...${NC}"
-    export PGHOME="$PG_INSTALL_DIR"
+    # 3) 当前 shell 立即生效（不 source 整个 /etc/profile，避免触发其他脚本的历史坏段）
+    export PG_HOME="$PG_INSTALL_DIR"
     export PGDATA="$PG_DATA_DIR"
-    export PATH="$PG_INSTALL_DIR/bin:$PATH"
-    export LANG="en_US.utf8"
-    export LD_LIBRARY_PATH="$PG_INSTALL_DIR/lib:$LD_LIBRARY_PATH"
-    
-    # 同时source /etc/profile以确保其他环境变量也生效
-    source /etc/profile > /dev/null 2>&1
-    
-    echo -e "${GREEN}环境变量配置完成并已生效${NC}"
-    echo -e "${CYAN}当前PostgreSQL环境变量:${NC}"
-    echo "  PGHOME: $PGHOME"
-    echo "  PGDATA: $PGDATA"
-    echo "  PATH已包含: $PG_INSTALL_DIR/bin"
-    if [ -n "$LD_LIBRARY_PATH" ]; then
-        echo "  LD_LIBRARY_PATH已包含: $PG_INSTALL_DIR/lib"
-    fi
+    case ":$PATH:" in *":$PG_HOME/bin:"*) ;; *) export PATH="$PG_HOME/bin:$PATH" ;; esac
+    case ":$MANPATH:" in *":$PG_HOME/share/man:"*) ;; *) export MANPATH="$PG_HOME/share/man:$MANPATH" ;; esac
+    case ":$LD_LIBRARY_PATH:" in *":$PG_HOME/lib:"*) ;; *) export LD_LIBRARY_PATH="$PG_HOME/lib:$LD_LIBRARY_PATH" ;; esac
+
+    # 4) 全局命令软链接
+    _pg_setup_symlinks
+
+    echo -e "${GREEN}环境变量配置完成: $PG_PROFILE_D${NC}"
+    echo -e "${CYAN}  PG_HOME: $PG_HOME${NC}"
+    echo -e "${CYAN}  PGDATA: $PGDATA${NC}"
+    echo -e "${CYAN}  PATH已包含: $PG_INSTALL_DIR/bin（新登录终端自动生效；当前终端 source $PG_PROFILE_D）${NC}"
 }
 
 # 初始化数据库
@@ -6947,55 +6980,8 @@ show_installation_info() {
     echo -e "sudo -u $PG_USER $PG_INSTALL_DIR/bin/pg_ctl start -D $PG_DATA_DIR"
     echo -e ""
     
-    # 添加PostgreSQL路径到/etc/profile
-    echo -e "${YELLOW}配置系统环境变量...${NC}"
-    
-    # 检查/etc/profile是否已存在PostgreSQL配置
-    if grep -q "PostgreSQL" /etc/profile 2>/dev/null; then
-        echo -e "${YELLOW}检测到/etc/profile中已存在PostgreSQL配置${NC}"
-        
-        # 备份原有配置
-        cp /etc/profile /etc/profile.backup
-        echo -e "${GREEN}✓ 已备份/etc/profile到/etc/profile.backup${NC}"
-        
-        # 移除旧的PostgreSQL配置
-        sed -i '/# PostgreSQL Environment/,/# End PostgreSQL Environment/d' /etc/profile
-        echo -e "${GREEN}✓ 已移除旧的PostgreSQL环境配置${NC}"
-    fi
-    
-    # 添加新的PostgreSQL环境配置到/etc/profile
-    cat >> /etc/profile << 'EOF'
-
-# PostgreSQL Environment
-export PG_HOME=/mnt/data/postgresql
-export PGDATA=/mnt/data/postgresql/data
-export PATH=$PG_HOME/bin:$PATH
-export MANPATH=$PG_HOME/share/man:$MANPATH
-# End PostgreSQL Environment
-EOF
-    
-    # 替换为实际的路径
-    sed -i "s|export PG_HOME=.*|export PG_HOME=$PG_INSTALL_DIR|g" /etc/profile
-    sed -i "s|export PGDATA=.*|export PGDATA=$PG_DATA_DIR|g" /etc/profile
-
-    echo -e "${GREEN}✓ 已将PostgreSQL路径添加到/etc/profile${NC}"
-    echo -e "${CYAN}添加的环境变量:${NC}"
-    echo "  PG_HOME=$PG_INSTALL_DIR"
-    echo "  PGDATA=$PG_DATA_DIR"
-    echo "  PATH=\$PG_HOME/bin:\$PATH"
-    echo "  MANPATH=\$PG_HOME/share/man:\$MANPATH"
-    echo ""
-    echo -e "${YELLOW}请执行以下命令使环境变量生效:${NC}"
-    echo -e "${CYAN}source /etc/profile${NC}"
-    echo -e "${YELLOW}或者重新登录系统${NC}"
-    echo ""
-    
-    # 立即使当前会话的环境变量生效
-    export PG_HOME="$PG_INSTALL_DIR"
-    export PGDATA="$PG_DATA_DIR"
-    export PATH="$PG_INSTALL_DIR/bin:$PATH"
-    export MANPATH="$PG_INSTALL_DIR/share/man:$MANPATH"
-    echo -e "${GREEN}✓ 当前会话环境变量已生效${NC}"
+    # 环境变量已由 setup_environment() 统一写入 /etc/profile.d/postgresql.sh
+    echo -e "${CYAN}环境变量: PG_HOME=$PG_INSTALL_DIR 已写入 /etc/profile.d/postgresql.sh（新终端自动生效，当前终端执行 source /etc/profile.d/postgresql.sh）${NC}"
 
     echo -e "${GREEN}=====================================${NC}"
 
@@ -7623,12 +7609,12 @@ main() {
                 # 询问是否继续配置
                 read -p "是否继续配置PostgreSQL服务? [y/N]: " continue_config
                 if [[ $continue_config =~ ^[Yy]$ ]]; then
-                    # 设置环境变量
-                    export PGHOME=$PG_INSTALL_DIR
+                    # 设置当前脚本进程的环境变量（变量名与 profile.d 保持一致：PG_HOME）
+                    export PG_HOME=$PG_INSTALL_DIR
                     export PGDATA=$PG_DATA_DIR
-                    export PATH=$PGHOME/bin:$PATH
+                    case ":$PATH:" in *":$PG_HOME/bin:"*) ;; *) export PATH="$PG_HOME/bin:$PATH" ;; esac
                     export LANG=en_US.utf8
-                    
+
                     configure_postgresql
                     create_systemd_service
                     set_password
