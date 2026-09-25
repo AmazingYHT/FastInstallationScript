@@ -731,6 +731,58 @@ sudo ./postgresql_wal_archive_manager.sh test
 | wal_buffers | 16MB | WAL 缓冲区 |
 | wal_writer_delay | 200ms | WAL 写入延迟 |
 
+#### 配置探测优先级
+
+脚本启动时自动探测 PostgreSQL 路径，无需手动输入。探测优先级（高 → 低）：
+
+```
+当前环境变量 PG_HOME / PGDATA
+    ↓
+/etc/profile.d/postgresql.sh      ← 安装脚本写入的标准位置，优先读取
+    ↓（仅当主文件未提供完整路径时回退）
+其他 profile 文件（/etc/profile、~/.bashrc 等）
+    ↓
+常见安装路径兜底（/usr/local/pgsql 等）
+```
+
+- 主文件中 `PG_HOME` = 编译/安装目录（含 `bin/postgres`），`PGDATA` = 数据目录
+- 命令行参数 `-p` / `-D` 显式指定时优先级最高
+- 确认界面会显示探测到的实际路径，直接回车（y）即采用探测值，不会覆盖为空
+
+#### 如何选择模式
+
+| 场景 | 推荐模式 | 说明 |
+|------|---------|------|
+| 单机主库，首次开启归档 | `setup` → `test` | 完整配置后用 test 验证归档是否正常落盘 |
+| 单机主库，日常清理 | `manual -d 7` | 按需手动清理，保留天数自定 |
+| 单机主库，磁盘紧张 | `setup` + `cron -d 7` | 配置归档后加每周定时清理，防归档目录爆盘 |
+| 流复制**从库** | `auto` | 配置 `archive_cleanup_command`，随恢复进度自动清理（该参数只在恢复场景生效，主库配置了也不会执行） |
+| 主库已有归档，想加自动清理 | `cron -d 7` | 不改动归档配置，仅追加定时清理任务 |
+| 拿不准保留哪些文件 | `smart -d 7` | 基于 `pg_controldata` 的 REDO WAL 位置清理，绝不误删恢复所需文件（最安全） |
+| 只想看看现状 | `status` | 只读，不改任何配置 |
+| 改完配置验证 | `test` | 检查归档参数、目录权限，并触发一次 WAL 切换验证落盘 |
+
+**典型使用流程（单机主库）**：
+
+```bash
+# 1. 完整配置归档（自动探测路径，确认界面直接回车即可）
+sudo ./postgresql_wal_archive_manager.sh setup
+
+# 2. 验证归档是否正常工作
+sudo ./postgresql_wal_archive_manager.sh test
+
+# 3. 日常查看状态
+sudo ./postgresql_wal_archive_manager.sh status
+
+# 4. 磁盘紧张时清理（或改用 cron 模式定期自动清理）
+sudo ./postgresql_wal_archive_manager.sh manual -d 7
+```
+
+> ⚠️ **注意事项**：
+> - `auto` 模式的 `archive_cleanup_command` **只在从库恢复时生效**，主库不要依赖它清理
+> - `setup` / `cron` 会修改配置或 crontab，需要 root；`status` / `test` 为只读操作
+> - 脚本自动从 `/etc/profile.d/postgresql.sh` 探测安装路径，确认界面显示的路径直接回车采用即可
+
 ---
 
 ## 🗑️ 卸载脚本
