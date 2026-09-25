@@ -68,11 +68,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #       8.8.3 → https://mirrors.ustc.edu.cn/redis/redis-8.8.3.tar.gz
 REDIS_VERSION="7.2.4"
 REDIS_TGZ="$SCRIPT_DIR/package/redis-${REDIS_VERSION}.tar.gz"
-REDIS_INSTALL_DIR="/usr/local/redis"
-REDIS_DATA_DIR="/var/lib/redis"
+
+# 安装根目录（与 install_mysql.sh 的 MYSQL_HOME 规划一致）：
+#   二进制安装目录 = $REDIS_HOME/redis-$REDIS_VERSION（如 /mnt/data/redis/redis-7.2.4）
+#   数据目录       = $REDIS_HOME/data（如 /mnt/data/redis/data）
+# REDIS_INSTALL_DIR / REDIS_DATA_DIR 默认由 finalize_paths 按根目录+版本派生；
+# 也可用 --install-dir / --data-dir 显式指定（显式指定不被派生覆盖）。
+DEFAULT_REDIS_HOME="/mnt/data/redis"
+REDIS_HOME="$DEFAULT_REDIS_HOME"
+REDIS_INSTALL_DIR=""
+REDIS_DATA_DIR=""
 REDIS_LOG_DIR="/var/log/redis"
 REDIS_CONF_DIR="/etc/redis"
 REDIS_RUN_DIR="/run/redis"
+# 标记 --install-dir / --data-dir / --version 是否被显式指定（避免自动检测/派生覆盖）
+REDIS_INSTALL_DIR_EXPLICIT=""
+REDIS_DATA_DIR_EXPLICIT=""
+REDIS_VERSION_EXPLICIT=""
 
 # 默认端口和绑定地址
 REDIS_PORT="6379"
@@ -143,6 +155,124 @@ install_dependencies() {
         apt-get update -y
     fi
     sys_pkg_install "wget tar gcc make"
+}
+
+# 从安装包文件名提取 Redis 版本号（与 install_mysql.sh 离线包从文件名取版本同理）：
+#   redis-7.2.4.tar.gz、redis-8.8.3.tar.gz                      → 7.2.4 / 8.8.3
+#   redis-7.2.4-linux-x86_64.tar.gz（--pack 打包的预编译产物）  → 7.2.4
+_redis_ver_from_name() {
+    basename "$1" | sed -n -E 's/^redis-([0-9]+\.[0-9]+\.[0-9]+).*\.tar\.gz$/\1/p'
+}
+
+# 扫描本地安装包自动确定版本（避免脚本内置默认版本与实际放入的 redis-8.8.3.tar.gz 不一致）。
+# 扫描位置：脚本根目录 $SCRIPT_DIR 与 $SCRIPT_DIR/package/（maxdepth 1，用户放哪都能识别）。
+# 优先级：--version 显式指定 > --tgz 指定文件的版本 > 本地扫描 > 内置默认版本。
+#   - 只检测到一个版本：自动采用；
+#   - 交互模式检测到多个版本：列编号让用户选（同 MySQL 离线包选择）；
+#   - 非交互（--batch/哨兵/Cluster 远程安装）检测到多个版本：自动取版本号最高者。
+detect_local_package() {
+    # ① 已通过 --tgz 显式指定包：路径不变，仅按文件名校正版本（--version 优先级更高）
+    if [ -n "$REDIS_TGZ_EXPLICIT" ]; then
+        if [ -z "$REDIS_VERSION_EXPLICIT" ]; then
+            local v
+            v=$(_redis_ver_from_name "$REDIS_TGZ")
+            if [ -n "$v" ] && [ "$v" != "$REDIS_VERSION" ]; then
+                REDIS_VERSION="$v"
+                info "根据安装包文件名确定 Redis 版本: $REDIS_VERSION（$(basename "$REDIS_TGZ")）"
+            fi
+        fi
+        return 0
+    fi
+
+    # ② 扫描脚本根目录与 package/ 下的 redis-*.tar.gz
+    local found
+    found=$( {
+        find "$SCRIPT_DIR" -maxdepth 1 -type f -name 'redis-*.tar.gz' 2>/dev/null
+        find "$SCRIPT_DIR/package" -maxdepth 1 -type f -name 'redis-*.tar.gz' 2>/dev/null
+    } | sort -u )
+    [ -z "$found" ] && return 0
+
+    # 过滤出文件名含合法 X.Y.Z 版本号的包
+    local packs=() vers=() f v
+    while IFS= read -r f; do
+        v=$(_redis_ver_from_name "$f")
+        [ -n "$v" ] || continue
+        packs+=("$f"); vers+=("$v")
+    done <<< "$found"
+    [ ${#packs[@]} -eq 0 ] && return 0
+
+    # ③ --version 显式指定：只挑版本匹配的本地包，挑不到则保持原路径（后续走下载逻辑）
+    if [ -n "$REDIS_VERSION_EXPLICIT" ]; then
+        local i
+        for i in "${!packs[@]}"; do
+            if [ "${vers[$i]}" = "$REDIS_VERSION" ]; then
+                REDIS_TGZ="${packs[$i]}"
+                REDIS_TGZ_EXPLICIT=1
+                info "使用本地安装包: $REDIS_TGZ"
+                return 0
+            fi
+        done
+        return 0
+    fi
+
+    # ④ 汇总去重版本
+    local uniq_vers=() seen=" "
+    for v in "${vers[@]}"; do
+        case "$seen" in
+            *" $v "*) ;;
+            *) uniq_vers+=("$v"); seen="$seen$v " ;;
+        esac
+    done
+
+    local chosen_ver
+    if [ ${#uniq_vers[@]} -eq 1 ]; then
+        chosen_ver="${uniq_vers[0]}"
+    elif [ "$BATCH_MODE" != "1" ] && [ -t 0 ]; then
+        # 交互模式多版本：编号选择
+        echo
+        echo -e "${CYAN}检测到多个 Redis 本地安装包，请选择版本：${NC}"
+        local idx=1
+        for v in "${uniq_vers[@]}"; do
+            echo "  $idx) $v"
+            idx=$((idx + 1))
+        done
+        local choice
+        read -p "请选择编号 [1-${#uniq_vers[@]}，默认 1]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#uniq_vers[@]} ]; then
+            chosen_ver="${uniq_vers[$((choice - 1))]}"
+        else
+            chosen_ver="${uniq_vers[0]}"
+        fi
+    else
+        # 非交互：取版本号最高者
+        chosen_ver=$(printf '%s\n' "${uniq_vers[@]}" | sort -V | tail -1)
+    fi
+
+    # 取该版本扫描到的第一个包（顺序：脚本根目录 → package/）
+    local i
+    for i in "${!packs[@]}"; do
+        if [ "${vers[$i]}" = "$chosen_ver" ]; then
+            REDIS_VERSION="$chosen_ver"
+            REDIS_TGZ="${packs[$i]}"
+            info "检测到本地 Redis 安装包，使用版本 $REDIS_VERSION: $REDIS_TGZ"
+            return 0
+        fi
+    done
+}
+
+# 按 REDIS_HOME + 版本派生默认路径（MySQL 风格）。
+# 必须在版本确定（含 --version 解析）之后、实际安装前调用：
+#   REDIS_INSTALL_DIR = $REDIS_HOME/redis-$REDIS_VERSION
+#   REDIS_DATA_DIR    = $REDIS_HOME/data
+# 通过 --install-dir / --data-dir（或哨兵/Cluster 脚本显式传参）指定的路径不覆盖。
+finalize_paths() {
+    REDIS_HOME="${REDIS_HOME:-$DEFAULT_REDIS_HOME}"
+    if [ -z "$REDIS_INSTALL_DIR_EXPLICIT" ]; then
+        REDIS_INSTALL_DIR="${REDIS_HOME}/redis-${REDIS_VERSION}"
+    fi
+    if [ -z "$REDIS_DATA_DIR_EXPLICIT" ]; then
+        REDIS_DATA_DIR="${REDIS_HOME}/data"
+    fi
 }
 
 # 创建用户和目录
@@ -408,11 +538,10 @@ interactive_config() {
             ;;
     esac
 
-    read -p "请输入 Redis 安装目录 [默认: $REDIS_INSTALL_DIR]: " input
-    if [ -n "$input" ]; then REDIS_INSTALL_DIR=$input; fi
-
-    read -p "请输入 Redis 数据目录 [默认: $REDIS_DATA_DIR]: " input
-    if [ -n "$input" ]; then REDIS_DATA_DIR=$input; fi
+    # 只询问安装根目录（与 MySQL 一致），二进制与数据目录按根目录自动派生：
+    #   <根目录>/redis-<版本>  放二进制；<根目录>/data  放数据
+    read -p "请输入 Redis 安装根目录 [默认: $REDIS_HOME]: " input
+    if [ -n "$input" ]; then REDIS_HOME="$input"; fi
 
     read -p "请输入 Redis 端口 [默认: $REDIS_PORT]: " input
     if [ -n "$input" ]; then REDIS_PORT=$input; fi
@@ -420,10 +549,16 @@ interactive_config() {
     read -p "请输入 Redis 密码 (留空表示不设置): " input
     if [ -n "$input" ]; then REDIS_PASSWORD=$input; fi
 
+    # 按根目录 + 版本派生最终安装/数据目录
+    finalize_paths
+
     echo
     info "配置汇总:"
     info "  部署模式: $DEPLOY_MODE"
-    info "  安装目录: $REDIS_INSTALL_DIR"
+    info "  Redis 版本: $REDIS_VERSION"
+    info "  安装包: $REDIS_TGZ"
+    info "  安装根目录: $REDIS_HOME"
+    info "  安装目录(二进制): $REDIS_INSTALL_DIR"
     info "  数据目录: $REDIS_DATA_DIR"
     info "  端口: $REDIS_PORT"
     info "  密码: ${REDIS_PASSWORD:-(未设置)}"
@@ -441,6 +576,7 @@ save_config() {
 # Redis 安装配置 - 由 install_redis.sh 生成
 # Generated: $(date)
 REDIS_VERSION=$REDIS_VERSION
+REDIS_HOME=$REDIS_HOME
 REDIS_INSTALL_DIR=$REDIS_INSTALL_DIR
 REDIS_DATA_DIR=$REDIS_DATA_DIR
 REDIS_LOG_DIR=$REDIS_LOG_DIR
@@ -524,6 +660,7 @@ parse_batch_args() {
                 ;;
             --version)
                 REDIS_VERSION="${2:-}"
+                REDIS_VERSION_EXPLICIT=1
                 # 若未显式指定 tgz，则按新版本重算默认包名
                 if [[ -z "$REDIS_TGZ_EXPLICIT" ]]; then
                     REDIS_TGZ="$SCRIPT_DIR/package/redis-${REDIS_VERSION}.tar.gz"
@@ -535,12 +672,19 @@ parse_batch_args() {
                 REDIS_TGZ_EXPLICIT=1
                 shift 2
                 ;;
+            --home)
+                # 安装根目录：二进制装到 <home>/redis-<版本>，数据放到 <home>/data
+                REDIS_HOME="${2:-}"
+                shift 2
+                ;;
             --install-dir)
                 REDIS_INSTALL_DIR="${2:-}"
+                REDIS_INSTALL_DIR_EXPLICIT=1
                 shift 2
                 ;;
             --data-dir)
                 REDIS_DATA_DIR="${2:-}"
+                REDIS_DATA_DIR_EXPLICIT=1
                 shift 2
                 ;;
             --port)
@@ -583,9 +727,12 @@ Redis 安装脚本参数
       --port 6379 --password 'xxx' --skip-start
 
 可选:
-  --version VER              Redis 版本（默认 7.2.4）
-  --install-dir DIR          安装目录（默认 /usr/local/redis）
-  --data-dir DIR             数据目录（默认 /var/lib/redis）
+  --version VER              Redis 版本（默认 7.2.4；脚本目录/package 下有本地
+                             redis-*.tar.gz 时自动按包文件名识别版本）
+  --home DIR                 安装根目录（默认 /mnt/data/redis），二进制装到
+                             <DIR>/redis-<版本>，数据放到 <DIR>/data
+  --install-dir DIR          显式指定二进制安装目录（不用则按 --home 派生）
+  --data-dir DIR             显式指定数据目录（不用则按 --home 派生为 <home>/data）
   --bind ADDR                绑定地址（默认 0.0.0.0）
   --cluster                  Cluster 模式（cluster-enabled yes）
   --cluster-node-timeout MS  集群节点超时毫秒（默认 5000）
@@ -603,10 +750,14 @@ HELP
 
 batch_install_flow() {
     BATCH_MODE=1
+    # 参数解析完毕（版本此时才最终确定），按根目录+版本派生安装/数据目录
+    finalize_paths
     info "========== Redis 无人值守安装 =========="
     info "模式: $DEPLOY_MODE"
     info "版本: $REDIS_VERSION"
+    info "安装根目录: $REDIS_HOME"
     info "安装目录: $REDIS_INSTALL_DIR"
+    info "数据目录: $REDIS_DATA_DIR"
     info "端口: $REDIS_PORT"
     info "包: $REDIS_TGZ"
     info "跳过启动: $SKIP_START"
@@ -641,6 +792,10 @@ batch_install_flow() {
 # 主安装流程
 main() {
     parse_batch_args "$@"
+
+    # 参数解析后先扫描本地安装包确定版本（如目录中放入 redis-8.8.3.tar.gz 则自动用 8.8.3），
+    # 必须在 finalize_paths（路径派生依赖版本）之前完成
+    detect_local_package
 
     if [ "$BATCH_MODE" = "1" ]; then
         batch_install_flow

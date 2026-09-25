@@ -66,14 +66,17 @@ if [ -f "$INSTALL_CONFIG" ]; then
     . "$INSTALL_CONFIG"
 fi
 
-: "${REDIS_INSTALL_DIR:=/usr/local/redis}"
-: "${REDIS_DATA_DIR:=/var/lib/redis}"
+# 默认目录规划与 install_redis.sh 一致：根目录 /mnt/data/redis，
+# 二进制在 <根目录>/redis-<版本>，数据在 <根目录>/data（/etc/redis_install.conf 中已有值则优先使用）
+: "${REDIS_HOME:=/mnt/data/redis}"
+: "${REDIS_VERSION:=7.2.4}"
+: "${REDIS_INSTALL_DIR:=${REDIS_HOME}/redis-${REDIS_VERSION}}"
+: "${REDIS_DATA_DIR:=${REDIS_HOME}/data}"
 : "${REDIS_LOG_DIR:=/var/log/redis}"
 : "${REDIS_CONF_DIR:=/etc/redis}"
 : "${REDIS_RUN_DIR:=/run/redis}"
 : "${REDIS_PORT:=6379}"
 : "${REDIS_PASSWORD:=}"
-: "${REDIS_VERSION:=7.2.4}"
 : "${REDIS_BIND:=0.0.0.0}"
 
 # 集群角色
@@ -339,6 +342,7 @@ install_local_redis() {
     # 哨兵集群场景先不启动单机服务，后面按角色配置
     local cmd=(bash "$INSTALL_SCRIPT" --batch --sentinel \
         --install-dir "$REDIS_INSTALL_DIR" \
+        --data-dir "$REDIS_DATA_DIR" \
         --port "$REDIS_PORT" \
         --skip-start)
 
@@ -346,9 +350,12 @@ install_local_redis() {
         cmd+=(--password "$REDIS_PASSWORD")
     fi
 
-    # 若 package 下有包则指定
+    # 扫描脚本根目录与 package/ 下的安装包（与 install_redis.sh 的检测位置一致），多版本取最高
     local local_tgz
-    local_tgz=$(find "$SCRIPT_DIR/package" -maxdepth 1 -type f -name 'redis-*.tar.gz' 2>/dev/null | head -1)
+    local_tgz=$( {
+        find "$SCRIPT_DIR" -maxdepth 1 -type f -name 'redis-*.tar.gz' 2>/dev/null
+        find "$SCRIPT_DIR/package" -maxdepth 1 -type f -name 'redis-*.tar.gz' 2>/dev/null
+    } | sort -u -V 2>/dev/null | tail -1)
     if [ -n "$local_tgz" ]; then
         cmd+=(--tgz "$local_tgz")
     fi
@@ -779,6 +786,7 @@ remote_install_redis() {
     local tgz_name
     tgz_name=$(basename "$REDIS_PACK_TGZ")
     local remote_install_dir="${REDIS_INSTALL_DIR}"
+    local remote_data_dir="${REDIS_DATA_DIR}"
 
     info "[1/3] 上传安装脚本..."
     ssh_cmd "$host" "mkdir -p /tmp/redis_remote_install" || true
@@ -794,7 +802,7 @@ remote_install_redis() {
     }
 
     info "[3/3] 远程无人值守安装..."
-    local remote_cmd="bash /tmp/redis_remote_install/install_redis.sh --batch --sentinel --tgz /tmp/${tgz_name} --install-dir '${remote_install_dir}' --port '${rport}' --skip-start"
+    local remote_cmd="bash /tmp/redis_remote_install/install_redis.sh --batch --sentinel --tgz /tmp/${tgz_name} --install-dir '${remote_install_dir}' --data-dir '${remote_data_dir}' --port '${rport}' --skip-start"
     if [ -n "$rpass" ]; then
         remote_cmd="${remote_cmd} --password '${rpass}'"
     fi

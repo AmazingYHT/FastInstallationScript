@@ -2773,6 +2773,28 @@ init_database() {
     fi
 }
 
+# 按 PostgreSQL 大版本选择 pg_hba.conf 的密码认证方式：
+#   PG >= 14 → scram-sha-256：PG14 起 password_encryption 默认改为 scram-sha-256，
+#               新设密码均以 SCRAM 哈希存储，hba 配合写 scram-sha-256 最安全；
+#   PG <= 13 → md5：老版本（如 PG12）默认就是 md5 存储，hba 写 md5 与之一致；
+#               且即使 hba 写 md5，以 SCRAM 格式存储的密码认证时也会自动升级为
+#               SCRAM 质询交换，因此老版本写 md5 是兼容且正确的，并非"不安全写法"。
+# 版本来源：优先取安装流程已知的 $PG_VERSION；取不到时（事后配置已装实例的场景）
+# 从 $PG_INSTALL_DIR/bin/pg_config 探测。
+_pg_hba_auth_method() {
+    local major=""
+    if [ -n "$PG_VERSION" ]; then
+        major="${PG_VERSION%%.*}"
+    elif [ -x "$PG_INSTALL_DIR/bin/pg_config" ]; then
+        major=$("$PG_INSTALL_DIR/bin/pg_config" --version 2>/dev/null | sed -n 's/^PostgreSQL[[:space:]]\+\([0-9]\+\).*/\1/p')
+    fi
+    if [ -n "$major" ] && [ "$major" -ge 14 ] 2>/dev/null; then
+        echo "scram-sha-256"
+    else
+        echo "md5"
+    fi
+}
+
 # 配置PostgreSQL
 configure_postgresql() {
     echo -e "${YELLOW}配置PostgreSQL...${NC}"
@@ -2868,15 +2890,18 @@ configure_postgresql() {
     fi
     
     # 检查并添加远程连接配置
-    # 先删除已存在的相同配置，避免重复
-    sed -i '/^host    all             all             0.0.0.0\/0               md5$/d' "$PG_DATA_DIR/pg_hba.conf" 2>/dev/null
+    # 密码认证方式按版本选择：PG≥14 用 scram-sha-256，PG≤13（如 PG12）用 md5（详见 _pg_hba_auth_method 注释）
+    local auth_method
+    auth_method=$(_pg_hba_auth_method)
+    # 先删除已存在的相同配置（两种认证方式都清），避免重复
+    sed -i '/^host    all             all             0.0.0.0\/0               \(md5\|scram-sha-256\)$/d' "$PG_DATA_DIR/pg_hba.conf" 2>/dev/null
 
     # 确保文件以换行结尾，避免新规则与最后一行拼接导致 pg_hba.conf 解析失败
     [ -n "$(tail -c1 "$PG_DATA_DIR/pg_hba.conf" 2>/dev/null)" ] && printf '\n' >> "$PG_DATA_DIR/pg_hba.conf"
 
     # 添加远程连接配置
-    echo "host    all             all             0.0.0.0/0               md5" >> "$PG_DATA_DIR/pg_hba.conf"
-    echo -e "${GREEN}✓ 已添加远程连接md5认证${NC}"
+    echo "host    all             all             0.0.0.0/0               $auth_method" >> "$PG_DATA_DIR/pg_hba.conf"
+    echo -e "${GREEN}✓ 已添加远程连接密码认证（$auth_method：PG≥14 默认 scram-sha-256，PG≤13 用 md5）${NC}"
     
     # 显示最终配置
     echo -e "${CYAN}当前pg_hba.conf认证配置:${NC}"
@@ -3114,12 +3139,16 @@ EOF
                 if [ "$password_set" = true ]; then
                     echo -e "${YELLOW}步骤4: 恢复安全认证方式...${NC}"
 
+                    # 密码认证方式按版本选择：PG≥14 用 scram-sha-256，PG≤13（如 PG12）用 md5（详见 _pg_hba_auth_method 注释）
+                    local auth_method
+                    auth_method=$(_pg_hba_auth_method)
+
                     # 先删除所有 local all all 的配置，避免重复
                     sed -i '/^local.*all.*all.*\(trust\|md5\|peer\|scram-sha-256\)$/d' "$hba_file" 2>/dev/null
 
-                    # 添加一条新的 md5 认证配置
-                    sed -i "1i local   all             all                                     md5" "$hba_file"
-                    echo -e "${GREEN}✓ 已添加local连接md5认证${NC}"
+                    # 添加一条新的密码认证配置
+                    sed -i "1i local   all             all                                     $auth_method" "$hba_file"
+                    echo -e "${GREEN}✓ 已添加local连接密码认证（$auth_method）${NC}"
 
                     # 再次重启服务
                     systemctl restart $service_name
@@ -3236,8 +3265,8 @@ EOF
             echo "ALTER USER postgres WITH PASSWORD '$new_password';"
             echo "\\q"
             echo "exit"
-            echo "# 4. 恢复安全认证"
-            echo "sed -i 's/^local.*all.*all.*trust/local   all             all                                     md5/' $PG_DATA_DIR/pg_hba.conf"
+            echo "# 4. 恢复安全认证（认证方式按版本选择：PG≥14 用 scram-sha-256，PG≤13 用 md5）"
+            echo "sed -i 's/^local.*all.*all.*trust/local   all             all                                     $(_pg_hba_auth_method)/' $PG_DATA_DIR/pg_hba.conf"
             echo "systemctl restart $service_name"
             echo ""
             echo "# 方法2: 直接使用psql"
@@ -3266,8 +3295,11 @@ EOF
         # 用与写入时完全一致的固定行匹配，避免宽松正则误伤 host 行
         local _hba="$PG_DATA_DIR/pg_hba.conf"
         if [ -f "$_hba" ] && grep -q '^local   all             all                                     trust' "$_hba"; then
-            sed -i 's|^local   all             all                                     trust|local   all             all                                     md5|' "$_hba"
-            echo -e "${GREEN}✓ 已恢复 local 连接为密码认证（md5/scram 自动协商）${NC}"
+            # 认证方式按版本选择：PG≥14 用 scram-sha-256，PG≤13（如 PG12）用 md5（详见 _pg_hba_auth_method 注释）
+            local auth_method
+            auth_method=$(_pg_hba_auth_method)
+            sed -i "s|^local   all             all                                     trust|local   all             all                                     $auth_method|" "$_hba"
+            echo -e "${GREEN}✓ 已恢复 local 连接为密码认证（$auth_method；SCRAM 存储的密码在 md5 条目下也会自动升级为 SCRAM 交换）${NC}"
             [ -n "$service_name" ] && systemctl restart "$service_name" 2>/dev/null
         fi
 
@@ -3657,20 +3689,25 @@ configure_remote_access() {
     # 2. 配置pg_hba.conf允许远程连接
     echo -e "${YELLOW}步骤2: 配置pg_hba.conf...${NC}"
     
+    # 密码认证方式按版本选择：PG≥14 用 scram-sha-256，PG≤13（如 PG12）用 md5（详见 _pg_hba_auth_method 注释）
+    # 本函数可能针对已安装实例运行，版本优先取 $PG_VERSION，取不到时自动从 pg_config 探测
+    local auth_method
+    auth_method=$(_pg_hba_auth_method)
+
     # 添加远程连接配置（IPv4）
-    # 先删除已存在的相同配置，避免重复
-    sed -i '/^host    all             all             0.0.0.0\/0               md5$/d' "$hba_file" 2>/dev/null
+    # 先删除已存在的相同配置（两种认证方式都清），避免重复
+    sed -i '/^host    all             all             0.0.0.0\/0               \(md5\|scram-sha-256\)$/d' "$hba_file" 2>/dev/null
     # 确保文件以换行结尾，避免追加时与上一行拼接
     [ -n "$(tail -c1 "$hba_file" 2>/dev/null)" ] && printf '\n' >> "$hba_file"
-    echo "host    all             all             0.0.0.0/0               md5" >> "$hba_file"
-    echo -e "${GREEN}✓ 已添加IPv4远程访问配置${NC}"
+    echo "host    all             all             0.0.0.0/0               $auth_method" >> "$hba_file"
+    echo -e "${GREEN}✓ 已添加IPv4远程访问配置（$auth_method）${NC}"
 
     # 添加远程连接配置（IPv6）
-    # 先删除已存在的相同配置，避免重复
-    sed -i '/^host    all             all             ::\/0                    md5$/d' "$hba_file" 2>/dev/null
+    # 先删除已存在的相同配置（两种认证方式都清），避免重复
+    sed -i '/^host    all             all             ::\/0                    \(md5\|scram-sha-256\)$/d' "$hba_file" 2>/dev/null
     [ -n "$(tail -c1 "$hba_file" 2>/dev/null)" ] && printf '\n' >> "$hba_file"
-    echo "host    all             all             ::/0                    md5" >> "$hba_file"
-    echo -e "${GREEN}✓ 已添加IPv6远程访问配置${NC}"
+    echo "host    all             all             ::/0                    $auth_method" >> "$hba_file"
+    echo -e "${GREEN}✓ 已添加IPv6远程访问配置（$auth_method）${NC}"
     
     # 3. 重启服务使配置生效
     echo -e "${YELLOW}步骤3: 重启PostgreSQL服务...${NC}"

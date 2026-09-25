@@ -29,10 +29,19 @@ fi
 INSTALL_CONFIG="/etc/redis_install.conf"
 if [ -f "$INSTALL_CONFIG" ]; then
     . "$INSTALL_CONFIG"
+    # 新版配置含 REDIS_HOME/REDIS_INSTALL_DIR/REDIS_DATA_DIR；旧版配置可能缺 REDIS_HOME
+    REDIS_HOME="${REDIS_HOME:-/mnt/data/redis}"
+    REDIS_VERSION="${REDIS_VERSION:-7.2.4}"
+    REDIS_INSTALL_DIR="${REDIS_INSTALL_DIR:-${REDIS_HOME}/redis-${REDIS_VERSION}}"
+    REDIS_DATA_DIR="${REDIS_DATA_DIR:-${REDIS_HOME}/data}"
+    REDIS_CONF_DIR="${REDIS_CONF_DIR:-/etc/redis}"
 else
-    # 默认路径
-    REDIS_INSTALL_DIR="/usr/local/redis"
-    REDIS_DATA_DIR="/var/lib/redis"
+    # 无安装配置时按新版默认路径兜底：
+    #   /mnt/data/redis/redis-<版本>（二进制）、/mnt/data/redis/data（数据）
+    REDIS_HOME="/mnt/data/redis"
+    REDIS_VERSION="7.2.4"
+    REDIS_INSTALL_DIR="${REDIS_HOME}/redis-${REDIS_VERSION}"
+    REDIS_DATA_DIR="${REDIS_HOME}/data"
     REDIS_CONF_DIR="/etc/redis"
 fi
 

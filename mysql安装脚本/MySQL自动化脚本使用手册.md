@@ -757,6 +757,8 @@ sudo rm -rf --no-preserve-root /path/to/dir
 
 ### 服务管理
 
+> ✅ 脚本安装完成后已自动执行 `systemctl start mysql` + `systemctl enable mysql`，**默认已开机自启**（非 systemd 的老系统如 CentOS 6 使用 `chkconfig mysql on` 注册）。
+
 ```bash
 # 启动服务
 systemctl start mysql
@@ -770,11 +772,24 @@ systemctl restart mysql
 # 查看状态
 systemctl status mysql
 
-# 开机自启
+# 开机自启（安装时已自动执行，仅在被禁用后手动恢复时需要）
 systemctl enable mysql
 
 # 禁用自启
 systemctl disable mysql
+
+# 验证是否已开机自启（输出 enabled 即已注册开机自启）
+systemctl is-enabled mysql
+
+# 验证当前是否正在运行（输出 active 即运行中）
+systemctl is-active mysql
+```
+
+```bash
+# 重启服务器后复查自启是否生效
+systemctl list-unit-files --type=service | grep '^mysql'
+# 或重启后直接查看运行状态
+systemctl status mysql
 ```
 
 ### 数据库连接

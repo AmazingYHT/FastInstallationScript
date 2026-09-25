@@ -23,7 +23,13 @@ mkdir -p package
 # 或安装目录打包: redis-x.x.x-linux-x86_64.tar.gz（内含 bin/redis-server）
 ```
 
-默认脚本期望路径：`package/redis-7.2.4.tar.gz`（与 `install_redis.sh` 中 `REDIS_VERSION` 一致）。
+**自动识别版本**：安装前脚本会扫描脚本根目录和 `package/` 下的 `redis-*.tar.gz`，从文件名自动提取版本号（与 MySQL 脚本一致），无需与内置默认版本 7.2.4 相同。例如放入 `redis-8.8.3.tar.gz` 就会安装 8.8.3，二进制目录随之派生为 `/mnt/data/redis/redis-8.8.3`。
+
+- 只检测到一个版本：自动采用；
+- 交互模式检测到多个版本：列出编号让用户选择；
+- 无人值守（`--batch`/哨兵/Cluster）检测到多个版本：自动取版本号最高者；
+- `--version` 显式指定时优先级最高（仅自动匹配同名本地包，匹配不到再走下载）；
+- 源码包 `redis-8.8.3.tar.gz` 与预编译包 `redis-8.8.3-linux-x86_64.tar.gz` 均能识别版本；放在脚本根目录或 `package/` 下均可。
 
 ### 源码/编译包下载地址
 
@@ -184,8 +190,8 @@ bash install_redis.sh --batch --standalone --port 6379
 # 查看状态
 systemctl status redis
 
-# 连接
-/usr/local/redis/bin/redis-cli -p 6379
+# 连接（默认安装目录为 /mnt/data/redis/redis-<版本>）
+/mnt/data/redis/redis-7.2.4/bin/redis-cli -p 6379
 ```
 
 ### 2. 一键主从 + Sentinel（推荐）
@@ -302,7 +308,7 @@ bash install_redis.sh --batch --cluster --port 6379 --password 'xxx' --skip-star
 # 远程离线安装（使用打包好的安装目录）
 bash install_redis.sh --batch --cluster \
   --tgz /tmp/redis-7.2.4-linux-x86_64.tar.gz \
-  --install-dir /usr/local/redis \
+  --home /mnt/data/redis \
   --port 6379 --password 'xxx' --skip-start
 ```
 
@@ -311,7 +317,9 @@ bash install_redis.sh --batch --cluster \
 | `--batch` | 无人值守 |
 | `--standalone` / `--sentinel` / `--cluster` | 部署模式 |
 | `--tgz` | 指定源码包或已编译目录打包 |
-| `--install-dir` | 安装目录 |
+| `--home DIR` | 安装根目录（默认 `/mnt/data/redis`）：二进制装到 `<DIR>/redis-<版本>`，数据放到 `<DIR>/data` |
+| `--install-dir DIR` | 显式指定二进制安装目录（不传则按 `--home` + 版本派生） |
+| `--data-dir DIR` | 显式指定数据目录（不传则派生为 `<home>/data`） |
 | `--port` / `--password` / `--bind` | 实例参数 |
 | `--cluster-node-timeout` | 集群节点超时 ms（默认 5000） |
 | `--skip-start` | 只安装不启动 |
@@ -321,30 +329,62 @@ bash install_redis.sh --batch --cluster \
 
 ## 目录结构
 
+交互式安装只询问**安装根目录**（默认 `/mnt/data/redis`，与 MySQL 脚本的目录规划一致），程序与数据目录按根目录自动派生：
+
 | 路径 | 说明 |
 |------|------|
-| `/usr/local/redis/` | 安装目录（二进制） |
+| `/mnt/data/redis/redis-<版本>/` | 安装目录（二进制，如 `redis-7.2.4/`，内含 `bin/redis-server`） |
+| `/mnt/data/redis/data/` | 数据目录（Cluster/多实例下为 `data/redis_<端口>/`） |
 | `/etc/redis/` | 配置目录 |
-| `/var/lib/redis/` | 数据目录 |
 | `/var/log/redis/` | 日志目录 |
 | `/run/redis/` | PID目录 |
 
+> 例如版本 7.2.4、根目录默认时：二进制安装到 `/mnt/data/redis/redis-7.2.4`，数据目录为 `/mnt/data/redis/data`。老版本脚本默认的 `/usr/local/redis`、`/var/lib/redis` 仍可通过 `--install-dir` / `--data-dir` 显式指定。
+
 ## 服务管理
+
+> ✅ 安装/编排完成后脚本已自动执行 `systemctl enable --now ...`，**单机、哨兵、Cluster 各实例默认均已开机自启**（`enable` 注册开机自启，`--now` 同时立即启动；服务文件含 `Restart=always`，进程异常退出会自动拉起）。
 
 ### 单机模式
 
 ```bash
-systemctl {start|stop|restart|status|enable|disable} redis
+# 日常管理
+systemctl {start|stop|restart|status} redis
+
+# 手动开关开机自启（安装时已自动 enable）
+systemctl enable redis
+systemctl disable redis
+
+# 验证开机自启（输出 enabled）与运行状态（输出 active）
+systemctl is-enabled redis
+systemctl is-active redis
+
+# 重启服务器后复查
+systemctl list-unit-files --type=service | grep '^redis'
 ```
 
 ### 哨兵模式多实例
 
 ```bash
 # Redis实例（端口 6379 为例）
-systemctl {start|stop|restart} redis@6379
+systemctl {start|stop|restart|status} redis@6379
 
 # Sentinel实例（端口 26379 为例）
-systemctl {start|stop|restart} redis-sentinel@26379
+systemctl {start|stop|restart|status} redis-sentinel@26379
+
+# 验证开机自启（编排完成后均已自动 enable）
+systemctl is-enabled redis@6379
+systemctl is-enabled redis-sentinel@26379
+```
+
+### Cluster 模式
+
+```bash
+# 每个节点一个实例（端口 6379 为例）
+systemctl {start|stop|restart|status} redis@6379
+
+# 查看本机所有 Cluster 节点的自启/运行状态
+systemctl list-units --type=service | grep 'redis@'
 ```
 
 ## 配置说明

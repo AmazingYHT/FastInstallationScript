@@ -952,7 +952,7 @@ port = 5432
 # 2. 编辑 pg_hba.conf
 vi /mnt/data/postgresql/data/pg_hba.conf
 
-# 添加允许连接的网段：
+# 添加允许连接的网段（认证方式按版本选择：PG≥14 建议 scram-sha-256，PG≤13 如 PG12 用 md5）：
 host    all             all             0.0.0.0/0               md5
 # 或指定网段：
 host    all             all             192.168.1.0/24          md5
@@ -1106,6 +1106,8 @@ cmake --version                  # 需 >= 3.15
 >
 > 安装结束后脚本会自动探测并展示实际服务名，以下以 17 为例：
 
+> ✅ 脚本安装完成后已自动执行 `systemctl start postgresql<主版本号>` + `systemctl enable postgresql<主版本号>`，**默认已开机自启**（如 PG17 即 `postgresql17`）。
+
 ```bash
 # 启动服务
 systemctl start postgresql17
@@ -1119,11 +1121,24 @@ systemctl restart postgresql17
 # 查看状态
 systemctl status postgresql17
 
-# 开机自启
+# 开机自启（安装时已自动执行，仅在被禁用后手动恢复时需要）
 systemctl enable postgresql17
 
 # 禁用自启
 systemctl disable postgresql17
+
+# 验证是否已开机自启（输出 enabled 即已注册开机自启）
+systemctl is-enabled postgresql17
+
+# 验证当前是否正在运行（输出 active 即运行中）
+systemctl is-active postgresql17
+```
+
+```bash
+# 重启服务器后复查自启是否生效（服务名带主版本号，如 postgresql17）
+systemctl list-unit-files --type=service | grep postgresql
+# 或重启后直接查看运行状态
+systemctl status postgresql17
 ```
 
 > 💡 不确定服务名时，可查询：
@@ -1229,6 +1244,7 @@ psql -U postgres -c "SELECT version();"
 - **离线/失败提示文件名与本地扫描规则对齐**：`_pg_ext_prepare_source` 离线提示的建议保存名改为从各扩展自己的扫描 glob 派生（glob 中的 `*` 替换为 `src`），修复原先统一提示 `<扩展名>-src.tar.gz` 与部分扩展 glob 不匹配、用户按提示放置后仍扫描不到的问题；pg_textsearch 源码准备失败的手动下载提示同步改为 GitHub archive 真实命名 `pg_textsearch-<版本>.tar.gz`（**无 v**，用 `-O` 指定，否则默认存为 `v<版本>.tar.gz` 无法被扫描识别）
 - **补全 `/tmp/pg_textsearch_build` 临时目录清理**：完整安装流程的 `cleanup_temp_files` 与外部插件向导结尾的清理列表原先只覆盖 pgvector/postgis/timescaledb，pg_textsearch 的构建目录（含 prebuilt 解压子目录与下载的 tar 包）会残留，现已纳入两处清理
 - **预编译已解压目录扫描加固**：已解压目录按 `pg_textsearch.so` 探测时，不再命中第一个 `.so` 就下结论——源码编译树 `make` 后同样会产出 `pg_textsearch.so`（同目录含 `Makefile`），现改为遍历所有 `.so` 命中、逐个校验"同目录有 `pg_textsearch.control` 且无 `Makefile`"，避免首个命中是源码树时漏掉同目录树下真正的预编译解压目录
+- **pg_hba.conf 密码认证方式按版本区分**：新增 `_pg_hba_auth_method`，写入 `pg_hba.conf` 密码认证行（远程 IPv4/IPv6、改密后恢复 local 认证、手动命令提示）时按大版本自动选择——**PG≥14 写 `scram-sha-256`**（PG14 起 `password_encryption` 默认 scram，新密码以 SCRAM 哈希存储），**PG≤13（如 PG12）写 `md5`**（老版本默认 md5 存储；且即使 hba 写 md5，SCRAM 存储的密码认证时也会自动升级为 SCRAM 交换，老版本写 md5 是兼容且正确的）；版本优先取 `$PG_VERSION`，取不到时（事后配置已装实例）从 `pg_config --version` 探测，均不可得时兜底 md5，并在写入处输出所选方式避免误会
 
 ### v2.2.0
 
