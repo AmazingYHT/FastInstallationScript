@@ -64,14 +64,14 @@ if [ -f "$INSTALL_CONFIG" ]; then
 fi
 
 # 默认目录规划与 install_redis.sh 一致：根目录 /mnt/data/redis，
-# 二进制在 <根目录>/redis-<版本>，数据在 <根目录>/data（/etc/redis_install.conf 中已有值则优先使用）
+# 二进制在 <根目录>/redis-<版本>，数据在 <根目录>/data，配置/PID/日志在 <根目录>/conf、<根目录>/run、<根目录>/log（/etc/redis_install.conf 中已有值则优先使用）
 : "${REDIS_HOME:=/mnt/data/redis}"
 : "${REDIS_VERSION:=7.2.4}"
 : "${REDIS_INSTALL_DIR:=${REDIS_HOME}/redis-${REDIS_VERSION}}"
 : "${REDIS_DATA_DIR:=${REDIS_HOME}/data}"
-: "${REDIS_LOG_DIR:=/var/log/redis}"
-: "${REDIS_CONF_DIR:=/etc/redis}"
-: "${REDIS_RUN_DIR:=/run/redis}"
+: "${REDIS_LOG_DIR:=${REDIS_HOME}/log}"
+: "${REDIS_CONF_DIR:=${REDIS_HOME}/conf}"
+: "${REDIS_RUN_DIR:=${REDIS_HOME}/run}"
 : "${REDIS_PORT:=6379}"
 : "${REDIS_PASSWORD:=}"
 : "${REDIS_BIND:=0.0.0.0}"
@@ -243,6 +243,56 @@ disable_remote_selinux() {
     return 0
 }
 
+# 在本机放行指定 TCP 端口（幂等）
+# 参数：port [port...]
+open_local_ports() {
+    local plist="$*"
+    [ -z "$plist" ] && return 0
+    local opens="" p spec
+    for p in $plist; do opens="${opens} ${p}/tcp"; done
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        for spec in $opens; do
+            firewall-cmd --query-port="$spec" >/dev/null 2>&1 || firewall-cmd --permanent --add-port="$spec" >/dev/null
+        done
+        firewall-cmd --reload >/dev/null 2>&1
+        success "本机 firewalld 已放行:${plist}"
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        for spec in $opens; do ufw status | grep -q "$spec" || ufw allow "$spec" >/dev/null; done
+        success "本机 ufw 已放行:${plist}"
+    else
+        info "本机未检测到活动防火墙，跳过"
+    fi
+}
+
+# 在远程节点放行指定 TCP 端口（幂等）；自动识别 firewalld / ufw
+# 参数：host port [port...]
+open_remote_ports() {
+    local host="$1"; shift
+    local plist="$*"
+    [ -z "$plist" ] && return 0
+
+    local rsh='opens=""
+for p in '"$plist"'; do opens="${opens} ${p}/tcp"; done
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for spec in $opens; do firewall-cmd --query-port="$spec" >/dev/null 2>&1 || firewall-cmd --permanent --add-port="$spec" >/dev/null; done
+    firewall-cmd --reload >/dev/null 2>&1
+    echo FIREWALL_DONE
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    for spec in $opens; do ufw status | grep -q "$spec" || ufw allow "$spec" >/dev/null; done
+    echo FIREWALL_DONE
+else
+    echo FIREWALL_SKIP
+fi'
+
+    local out
+    out=$(ssh_cmd "$host" "$rsh")
+    case "$out" in
+        *FIREWALL_DONE*) success "${host} 防火墙已放行:${plist}" ;;
+        *)               info "${host} 未检测到活动防火墙，跳过" ;;
+    esac
+}
+
 # ======================== 安装包 ========================
 
 check_redis_installed() {
@@ -392,6 +442,7 @@ configure_local_cluster_node() {
     sleep 2
     if systemctl is-active --quiet "redis@${LOCAL_NODE_PORT}"; then
         success "本机 redis@${LOCAL_NODE_PORT} 已启动（cluster-enabled）"
+        open_local_ports "$LOCAL_NODE_PORT" "$((LOCAL_NODE_PORT + 10000))"
     else
         warn "启动失败: journalctl -u redis@${LOCAL_NODE_PORT} -n 30"
         return 1
@@ -669,6 +720,7 @@ remote_install_cluster_node() {
 
     if ssh_cmd "$host" "$cmd"; then
         success "${host} 安装完成"
+        open_remote_ports "$host" "$rport" "$((rport + 10000))"
         ssh_cmd "$host" "rm -f /tmp/${tgz_name}" >/dev/null 2>&1 || true
         SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
         return 0
@@ -697,10 +749,10 @@ remote_start_cluster_node() {
     remote_run_dir=$(echo "$remote_state" | grep '^REDIS_RUN_DIR=' | cut -d= -f2-)
 
     remote_install_dir=${remote_install_dir:-$REDIS_INSTALL_DIR}
-    remote_conf_dir=${remote_conf_dir:-/etc/redis}
+    remote_conf_dir=${remote_conf_dir:-${REDIS_HOME}/conf}
     remote_data_dir=${remote_data_dir:-/var/lib/redis}
-    remote_log_dir=${remote_log_dir:-/var/log/redis}
-    remote_run_dir=${remote_run_dir:-/run/redis}
+    remote_log_dir=${remote_log_dir:-${REDIS_HOME}/log}
+    remote_run_dir=${remote_run_dir:-${REDIS_HOME}/run}
 
     # announce 使用连接用的 host（若是 IP 则原样；主机名可能需解析）
     local announce_ip="$host"

@@ -34,15 +34,20 @@ if [ -f "$INSTALL_CONFIG" ]; then
     REDIS_VERSION="${REDIS_VERSION:-7.2.4}"
     REDIS_INSTALL_DIR="${REDIS_INSTALL_DIR:-${REDIS_HOME}/redis-${REDIS_VERSION}}"
     REDIS_DATA_DIR="${REDIS_DATA_DIR:-${REDIS_HOME}/data}"
-    REDIS_CONF_DIR="${REDIS_CONF_DIR:-/etc/redis}"
+    REDIS_CONF_DIR="${REDIS_CONF_DIR:-${REDIS_HOME}/conf}"
+    REDIS_RUN_DIR="${REDIS_RUN_DIR:-${REDIS_HOME}/run}"
+    REDIS_LOG_DIR="${REDIS_LOG_DIR:-${REDIS_HOME}/log}"
 else
     # 无安装配置时按新版默认路径兜底：
-    #   /mnt/data/redis/redis-<版本>（二进制）、/mnt/data/redis/data（数据）
+    #   /mnt/data/redis/redis-<版本>（二进制）、/mnt/data/redis/data（数据）、
+    #   /mnt/data/redis/conf（配置）、/mnt/data/redis/run（运行/PID）、/mnt/data/redis/log（日志）
     REDIS_HOME="/mnt/data/redis"
     REDIS_VERSION="7.2.4"
     REDIS_INSTALL_DIR="${REDIS_HOME}/redis-${REDIS_VERSION}"
     REDIS_DATA_DIR="${REDIS_HOME}/data"
-    REDIS_CONF_DIR="/etc/redis"
+    REDIS_CONF_DIR="${REDIS_HOME}/conf"
+    REDIS_RUN_DIR="${REDIS_HOME}/run"
+    REDIS_LOG_DIR="${REDIS_HOME}/log"
 fi
 
 # ======================== 函数定义 ========================
@@ -190,15 +195,15 @@ main() {
     fi
 
     # 删除日志
-    if [ -d "/var/log/redis" ]; then
-        rm -rf "/var/log/redis"
-        info "已删除日志目录: /var/log/redis"
+    if [ -d "$REDIS_LOG_DIR" ]; then
+        rm -rf "$REDIS_LOG_DIR"
+        info "已删除日志目录: $REDIS_LOG_DIR"
     fi
 
     # 删除运行目录
-    if [ -d "/run/redis" ]; then
-        rm -rf "/run/redis"
-        info "已删除运行目录: /run/redis"
+    if [ -d "$REDIS_RUN_DIR" ]; then
+        rm -rf "$REDIS_RUN_DIR"
+        info "已删除运行目录: $REDIS_RUN_DIR"
     fi
 
     echo

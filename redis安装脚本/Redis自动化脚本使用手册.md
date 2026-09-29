@@ -373,11 +373,22 @@ bash install_redis.sh --batch --cluster \
 |------|------|
 | `/mnt/data/redis/redis-<版本>/` | 安装目录（二进制，如 `redis-7.2.4/`，内含 `bin/redis-server`） |
 | `/mnt/data/redis/data/` | 数据目录（Cluster/多实例下为 `data/redis_<端口>/`） |
-| `/etc/redis/` | 配置目录 |
-| `/var/log/redis/` | 日志目录 |
-| `/run/redis/` | PID目录 |
+| `/mnt/data/redis/conf/` | 配置目录（与版本目录、`data` 同级） |
+| `/mnt/data/redis/log/` | 日志目录（与版本目录、`data`、`conf`、`run` 同级） |
+| `/mnt/data/redis/run/` | PID目录（与版本目录、`data`、`conf` 同级） |
 
 > 例如版本 7.2.4、根目录默认时：二进制安装到 `/mnt/data/redis/redis-7.2.4`，数据目录为 `/mnt/data/redis/data`。老版本脚本默认的 `/usr/local/redis`、`/var/lib/redis` 仍可通过 `--install-dir` / `--data-dir` 显式指定。
+
+### 自包含目录规划
+
+程序、数据、配置、PID、日志全部收敛在 `REDIS_HOME`（默认 `/mnt/data/redis`）下，整机迁移只需拷贝这一个目录；不依赖 `/etc`、`/var`、`/run` 下的散落文件。
+
+> **注意：配置/数据/日志/PID 都不放进版本目录 `redis-<版本>/` 内**——版本目录会随升级整体替换，放在里面的配置和数据会丢失。同级的 `conf/`、`data/`、`log/`、`run/` 在升级后可继续复用。
+
+- **PID 文件（`run/redis_<端口>.pid`）**：内容只有一行进程号。Redis 以 `daemonize yes` 后台启动后写入，供 systemd（`Type=forking`）和管理脚本定位进程；进程退出后自动删除。
+- 多实例/集群/哨兵下 `run/`、`log/` 中会出现多个文件（如 `redis_6379.pid`、`redis_6380.pid`、`sentinel_26379.pid`），因此统一用子目录收纳而非散落在根目录。
+- `run/`、`log/`、`data/` 属主均为 `redis`，确保进程有写权限。
+
 
 ## 服务管理
 
@@ -486,3 +497,26 @@ slave = sentinel.slave_for('mymaster', socket_timeout=0.1)
 **Q: 可以在一台机器上部署全栈测试吗？**
 
 A: 可以，只要端口不冲突，同一机器可以运行多个redis和多个sentinel。
+
+**Q: `systemctl start redis` 一直卡住（约 90 秒才返回），但 Redis 其实已经能连接？**
+
+A: 这是 `Type=forking` 下 **unit 的 `PIDFile` 路径与 `redis.conf` 的 `pidfile` 不一致**导致。systemd 启动后会一直等待它在 `PIDFile=` 指定的文件出现；Redis 实际把进程号写在了 conf `pidfile` 指向的另一个路径，于是 systemd 等不到、卡到超时，而 Redis 进程早已正常启动。
+
+逐项核对，三处必须一致且 redis 用户可写：
+
+```bash
+grep -i '^pidfile' /mnt/data/redis/conf/redis.conf       # conf 实际写入路径
+systemctl cat redis | grep -i pidfile                   # systemd 等待路径
+journalctl -u redis -n 30 --no-pager                    # 启动日志
+```
+
+常见原因：手工编辑 service 文件时只改了其中一处路径，或路径中混入多余字符（如 vim 保存误输入 `:wq`，变成 `run:wq/...`）。修复时两边统一并重启：
+
+```bash
+sed -i 's#^pidfile .*#pidfile /mnt/data/redis/run/redis_6379.pid#' /mnt/data/redis/conf/redis.conf
+sed -i 's#^PIDFile=.*#PIDFile=/mnt/data/redis/run/redis_6379.pid#' /etc/systemd/system/redis.service
+systemctl daemon-reload
+systemctl restart redis
+```
+
+多实例/哨兵分别对应 `redis_<端口>.pid`、`sentinel_<端口>.pid`。脚本自动生成时两处本就一致（均为 `$REDIS_HOME/run/...`），该问题只在手工改动路径时出现。

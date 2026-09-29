@@ -67,14 +67,14 @@ if [ -f "$INSTALL_CONFIG" ]; then
 fi
 
 # 默认目录规划与 install_redis.sh 一致：根目录 /mnt/data/redis，
-# 二进制在 <根目录>/redis-<版本>，数据在 <根目录>/data（/etc/redis_install.conf 中已有值则优先使用）
+# 二进制在 <根目录>/redis-<版本>，数据在 <根目录>/data，配置/PID/日志在 <根目录>/conf、<根目录>/run、<根目录>/log（/etc/redis_install.conf 中已有值则优先使用）
 : "${REDIS_HOME:=/mnt/data/redis}"
 : "${REDIS_VERSION:=7.2.4}"
 : "${REDIS_INSTALL_DIR:=${REDIS_HOME}/redis-${REDIS_VERSION}}"
 : "${REDIS_DATA_DIR:=${REDIS_HOME}/data}"
-: "${REDIS_LOG_DIR:=/var/log/redis}"
-: "${REDIS_CONF_DIR:=/etc/redis}"
-: "${REDIS_RUN_DIR:=/run/redis}"
+: "${REDIS_LOG_DIR:=${REDIS_HOME}/log}"
+: "${REDIS_CONF_DIR:=${REDIS_HOME}/conf}"
+: "${REDIS_RUN_DIR:=${REDIS_HOME}/run}"
 : "${REDIS_PORT:=6379}"
 : "${REDIS_PASSWORD:=}"
 : "${REDIS_BIND:=0.0.0.0}"
@@ -262,6 +262,56 @@ disable_remote_selinux() {
             ;;
     esac
     return 0
+}
+
+# 在本机放行指定 TCP 端口（幂等）
+# 参数：port [port...]
+open_local_ports() {
+    local plist="$*"
+    [ -z "$plist" ] && return 0
+    local opens="" p spec
+    for p in $plist; do opens="${opens} ${p}/tcp"; done
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        for spec in $opens; do
+            firewall-cmd --query-port="$spec" >/dev/null 2>&1 || firewall-cmd --permanent --add-port="$spec" >/dev/null
+        done
+        firewall-cmd --reload >/dev/null 2>&1
+        success "本机 firewalld 已放行:${plist}"
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        for spec in $opens; do ufw status | grep -q "$spec" || ufw allow "$spec" >/dev/null; done
+        success "本机 ufw 已放行:${plist}"
+    else
+        info "本机未检测到活动防火墙，跳过"
+    fi
+}
+
+# 在远程节点放行指定 TCP 端口（幂等）；自动识别 firewalld / ufw
+# 参数：host port [port...]
+open_remote_ports() {
+    local host="$1"; shift
+    local plist="$*"
+    [ -z "$plist" ] && return 0
+
+    local rsh='opens=""
+for p in '"$plist"'; do opens="${opens} ${p}/tcp"; done
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for spec in $opens; do firewall-cmd --query-port="$spec" >/dev/null 2>&1 || firewall-cmd --permanent --add-port="$spec" >/dev/null; done
+    firewall-cmd --reload >/dev/null 2>&1
+    echo FIREWALL_DONE
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    for spec in $opens; do ufw status | grep -q "$spec" || ufw allow "$spec" >/dev/null; done
+    echo FIREWALL_DONE
+else
+    echo FIREWALL_SKIP
+fi'
+
+    local out
+    out=$(ssh_cmd "$host" "$rsh")
+    case "$out" in
+        *FIREWALL_DONE*) success "${host} 防火墙已放行:${plist}" ;;
+        *)               info "${host} 未检测到活动防火墙，跳过" ;;
+    esac
 }
 
 # ======================== 检测/打包 ========================
@@ -582,6 +632,7 @@ configure_local_master() {
     ensure_redis_dirs
     generate_redis_conf "master"
     start_redis_instance "$REDIS_PORT" || return 1
+    open_local_ports "$REDIS_PORT"
 
     # 更新安装状态中的密码
     if [ -f "$INSTALL_CONFIG" ]; then
@@ -843,10 +894,10 @@ apply_remote_role() {
     remote_run_dir=$(echo "$remote_state" | grep '^REDIS_RUN_DIR=' | cut -d= -f2-)
 
     remote_install_dir=${remote_install_dir:-$REDIS_INSTALL_DIR}
-    remote_conf_dir=${remote_conf_dir:-/etc/redis}
+    remote_conf_dir=${remote_conf_dir:-${REDIS_HOME}/conf}
     remote_data_dir=${remote_data_dir:-/var/lib/redis}
-    remote_log_dir=${remote_log_dir:-/var/log/redis}
-    remote_run_dir=${remote_run_dir:-/run/redis}
+    remote_log_dir=${remote_log_dir:-${REDIS_HOME}/log}
+    remote_run_dir=${remote_run_dir:-${REDIS_HOME}/run}
 
     local master_host="${MASTER_HOST}"
     local master_port="${MASTER_PORT}"
@@ -936,6 +987,7 @@ REMOTE
             return 1
         fi
         success "远程 slave ${host}:${rport} 配置完成"
+        open_remote_ports "$host" "$rport"
 
     elif [ "$role" = "sentinel" ]; then
         local sconf_name="sentinel_${sentinel_port}.conf"
@@ -1006,6 +1058,7 @@ REMOTE
             return 1
         fi
         success "远程 sentinel ${host}:${sentinel_port} 配置完成"
+        open_remote_ports "$host" "$rport" "$sentinel_port"
     fi
 
     SSH_PORT="$old_port"; SSH_USER="$old_user"; SSH_PASSWORD="$old_pass"
@@ -1105,6 +1158,7 @@ one_click_deploy() {
         ensure_redis_dirs
         generate_sentinel_conf
         start_sentinel_instance "$SENTINEL_PORT" || warn "本机 sentinel 启动失败"
+        open_local_ports "$REDIS_PORT" "$SENTINEL_PORT"
 
         idx=1
         for item in "${SENTINEL_NODES[@]}"; do

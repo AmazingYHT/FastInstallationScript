@@ -72,15 +72,18 @@ REDIS_TGZ="$SCRIPT_DIR/package/redis-${REDIS_VERSION}.tar.gz"
 # 安装根目录（与 install_mysql.sh 的 MYSQL_HOME 规划一致）：
 #   二进制安装目录 = $REDIS_HOME/redis-$REDIS_VERSION（如 /mnt/data/redis/redis-7.2.4）
 #   数据目录       = $REDIS_HOME/data（如 /mnt/data/redis/data）
+#   配置目录       = $REDIS_HOME/conf（如 /mnt/data/redis/conf，与版本目录、data 同级）
+#   运行/PID目录   = $REDIS_HOME/run（如 /mnt/data/redis/run）
+#   日志目录       = $REDIS_HOME/log（如 /mnt/data/redis/log）
 # REDIS_INSTALL_DIR / REDIS_DATA_DIR 默认由 finalize_paths 按根目录+版本派生；
 # 也可用 --install-dir / --data-dir 显式指定（显式指定不被派生覆盖）。
 DEFAULT_REDIS_HOME="/mnt/data/redis"
 REDIS_HOME="$DEFAULT_REDIS_HOME"
 REDIS_INSTALL_DIR=""
 REDIS_DATA_DIR=""
-REDIS_LOG_DIR="/var/log/redis"
-REDIS_CONF_DIR="/etc/redis"
-REDIS_RUN_DIR="/run/redis"
+REDIS_LOG_DIR=""
+REDIS_CONF_DIR=""
+REDIS_RUN_DIR=""
 # 标记 --install-dir / --data-dir / --version 是否被显式指定（避免自动检测/派生覆盖）
 REDIS_INSTALL_DIR_EXPLICIT=""
 REDIS_DATA_DIR_EXPLICIT=""
@@ -264,6 +267,9 @@ detect_local_package() {
 # 必须在版本确定（含 --version 解析）之后、实际安装前调用：
 #   REDIS_INSTALL_DIR = $REDIS_HOME/redis-$REDIS_VERSION
 #   REDIS_DATA_DIR    = $REDIS_HOME/data
+#   REDIS_CONF_DIR    = $REDIS_HOME/conf
+#   REDIS_RUN_DIR     = $REDIS_HOME/run
+#   REDIS_LOG_DIR     = $REDIS_HOME/log
 # 通过 --install-dir / --data-dir（或哨兵/Cluster 脚本显式传参）指定的路径不覆盖。
 finalize_paths() {
     REDIS_HOME="${REDIS_HOME:-$DEFAULT_REDIS_HOME}"
@@ -273,6 +279,12 @@ finalize_paths() {
     if [ -z "$REDIS_DATA_DIR_EXPLICIT" ]; then
         REDIS_DATA_DIR="${REDIS_HOME}/data"
     fi
+    # 配置目录与版本目录、data 同级（放在版本目录内会随升级丢失配置）
+    REDIS_CONF_DIR="${REDIS_HOME}/conf"
+    # 运行/PID 目录同样收敛到 HOME 下，自包含且重启后仍在持久盘
+    REDIS_RUN_DIR="${REDIS_HOME}/run"
+    # 日志目录同样收敛到 HOME 下
+    REDIS_LOG_DIR="${REDIS_HOME}/log"
 }
 
 # 创建用户和目录
@@ -501,28 +513,8 @@ EOF
 generate_systemd_service() {
     info "生成 systemd 服务文件..."
 
-    local service_file="/etc/systemd/system/redis@.service"
-    cat > "$service_file" << EOF
-[Unit]
-Description=Redis In-Memory Data Store (port %i)
-After=network.target
-
-[Service]
-Type=forking
-User=redis
-Group=redis
-PIDFile=$REDIS_RUN_DIR/redis_%i.pid
-ExecStart=$REDIS_INSTALL_DIR/bin/redis-server $REDIS_CONF_DIR/redis_%i.conf
-ExecStop=$REDIS_INSTALL_DIR/bin/redis-cli -p %i shutdown
-Restart=always
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # 如果是单机模式，创建默认服务
     if [ "$DEPLOY_MODE" = "standalone" ]; then
+        # 单机：固定服务 redis.service
         cat > /etc/systemd/system/redis.service << EOF
 [Unit]
 Description=Redis In-Memory Data Store
@@ -535,6 +527,28 @@ Group=redis
 PIDFile=$REDIS_RUN_DIR/redis_$REDIS_PORT.pid
 ExecStart=$REDIS_INSTALL_DIR/bin/redis-server $REDIS_CONF_DIR/redis.conf
 ExecStop=$REDIS_INSTALL_DIR/bin/redis-cli -p $REDIS_PORT shutdown
+Restart=always
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        # 清理旧版本脚本在单机模式下遗留的模板文件（确定为脚本产物）
+        rm -f /etc/systemd/system/redis@.service
+    else
+        # 多实例（cluster / sentinel）：模板服务 redis@.service
+        cat > /etc/systemd/system/redis@.service << EOF
+[Unit]
+Description=Redis In-Memory Data Store (port %i)
+After=network.target
+
+[Service]
+Type=forking
+User=redis
+Group=redis
+PIDFile=$REDIS_RUN_DIR/redis_%i.pid
+ExecStart=$REDIS_INSTALL_DIR/bin/redis-server $REDIS_CONF_DIR/redis_%i.conf
+ExecStop=$REDIS_INSTALL_DIR/bin/redis-cli -p %i shutdown
 Restart=always
 LimitNOFILE=65536
 
@@ -690,6 +704,43 @@ check_selinux() {
     echo -e "\033[0;32mSELinux 已临时关闭（Permissive），并已配置重启后永久禁用\033[0m"
 }
 
+# 放行防火墙 TCP 端口（幂等）；自动识别 firewalld / ufw，未启用防火墙则静默跳过
+open_firewall_ports() {
+    local ports=("$@")
+    [ ${#ports[@]} -eq 0 ] && return 0
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        local p
+        for p in "${ports[@]}"; do
+            if firewall-cmd --query-port="${p}/tcp" >/dev/null 2>&1; then
+                info "firewalld 已放行 ${p}/tcp"
+            else
+                firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null && \
+                info "firewalld 已放行 ${p}/tcp（永久）"
+            fi
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        local p
+        for p in "${ports[@]}"; do
+            ufw status | grep -q "${p}/tcp" && { info "ufw 已放行 ${p}/tcp"; continue; }
+            ufw allow "${p}/tcp" >/dev/null && info "ufw 已放行 ${p}/tcp"
+        done
+    else
+        info "未检测到活动的 firewalld/ufw，跳过防火墙放行"
+    fi
+}
+
+# 按部署模式收集需放行的端口并放行
+configure_firewall() {
+    local ports=("$REDIS_PORT")
+    if [ "$DEPLOY_MODE" = "cluster" ]; then
+        # Cluster 节点间 Gossip 总线端口 = 数据端口 + 10000
+        ports+=("$((REDIS_PORT + 10000))")
+    fi
+    open_firewall_ports "${ports[@]}"
+}
+
 # ======================== 无人值守安装 ========================
 
 parse_batch_args() {
@@ -791,7 +842,7 @@ Redis 安装脚本参数
   --version VER              Redis 版本（默认 7.2.4；脚本目录/package 下有本地
                              redis-*.tar.gz 时自动按包文件名识别版本）
   --home DIR                 安装根目录（默认 /mnt/data/redis），二进制装到
-                             <DIR>/redis-<版本>，数据放到 <DIR>/data
+                             <DIR>/redis-<版本>，数据放到 <DIR>/data，配置放到 <DIR>/conf，PID/日志放到 <DIR>/run、<DIR>/log
   --install-dir DIR          显式指定二进制安装目录（不用则按 --home 派生）
   --data-dir DIR             显式指定数据目录（不用则按 --home 派生为 <home>/data）
   --bind ADDR                绑定地址（默认 0.0.0.0）
@@ -843,6 +894,7 @@ batch_install_flow() {
         CLUSTER_ENABLED="yes"
         generate_cluster_instance_config
     fi
+    configure_firewall
     generate_systemd_service
     start_standalone_service
     save_config
@@ -877,6 +929,7 @@ main() {
         generate_cluster_instance_config
     fi
     check_selinux
+    configure_firewall
     generate_systemd_service
     start_standalone_service
     save_config
